@@ -32,6 +32,7 @@ from email.header import Header
 from email.mime.text import MIMEText
 
 from poss_client import (
+    BASE,
     BookingNotCalibrated,
     LoginFailed,
     PossClient,
@@ -93,6 +94,7 @@ DEFAULT_BOOKING = {
     "search_date_format": "%Y-%m-%d",
     "curl_file": "booking.curl",     # 抓包导入的预订请求模板（首选）
     "curl": "",                      # 也可直接把整段 cURL 写进配置（不推荐，含凭据）
+    "steps": [],                     # 多步预订：每步一个 {"curl_file": "...", "extract": {...}}
     "endpoint": "",                  # 遗留路径：手工填端点（未用 cURL 时）
     "params": {},                    # 遗留路径：手工填表单模板
     "success_keywords": ["success", "successful", "成功", "已确认"],
@@ -164,10 +166,17 @@ def _validate_config(cfg: dict):
     unknown = [g for g in b["gyms"] if g not in names]
     if unknown:
         bad(f"booking.gyms 里有未定义的馆名: {unknown}（可选: {sorted(names)}）")
-    if b["enabled"] and not load_booking_curl(b):
-        print("[warn] 预订模板未配置 —— 抢位将无法执行（仅蹲守提醒）。"
-              "请抓取手动预订那条「提交」请求的 cURL，"
-              "运行 `python3 calibrate.py --import <文件>` 生成 booking.curl。")
+
+    steps = load_booking_steps(b)
+    if b["enabled"]:
+        missing = []
+        for i, step in enumerate(steps):
+            if not load_step_curl(step, b, i):
+                missing.append(i + 1)
+        if missing:
+            print(f"[warn] 预订模板未配置完整（缺步骤 {missing}）—— 抢位将无法执行（仅蹲守提醒）。"
+                  "请抓取手动预订那条「提交」请求的 cURL，"
+                  "运行 `python3 calibrate.py --import <文件>` 生成 booking.curl。")
 
     if cfg["fallback"].get("enabled", True) and cfg["fallback"].get("targets"):
         _validate_targets(cfg["fallback"]["targets"], where="fallback.targets")
@@ -214,6 +223,35 @@ def load_booking_curl(b: dict):
     if (b.get("curl") or "").strip():
         return b["curl"].strip()
     path = os.environ.get("BOOKING_CURL_FILE") or b.get("curl_file") or BOOKING_CURL_FILE
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    return None
+
+
+def load_booking_steps(b: dict) -> list:
+    """返回预订步骤列表。配置了 steps 就用 steps；否则退化成单步（curl_file / curl）。"""
+    steps = b.get("steps")
+    if isinstance(steps, list) and steps:
+        return steps
+    return [{}]
+
+
+def load_step_curl(step: dict, b: dict, idx: int = 0) -> str | None:
+    """取某一步的 cURL 模板。
+
+    优先级：step.curl 内联 > BOOKING_CURL_STEP{n} Secret > BOOKING_CURL_FILE_STEP{n} 文件路径 >
+    step.curl_file / b.curl_file / booking.curl 文件。
+    """
+    text = (step.get("curl") or "").strip()
+    if text:
+        return text
+    text = os.environ.get(f"BOOKING_CURL_STEP{idx + 1}", "").strip()
+    if text:
+        return text
+    path = os.environ.get(f"BOOKING_CURL_FILE_STEP{idx + 1}", "")
+    if not path:
+        path = step.get("curl_file") or b.get("curl_file") or BOOKING_CURL_FILE
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             return f.read().strip()
@@ -510,6 +548,97 @@ def pick_best(slots, b):
     return sorted(pool, key=lambda s: (_parse_date(s["date"]), _parse_hm(s["start"]) or ""))[0]
 
 
+def _follow_redirects(client, url, headers, max_hops: int = 3):
+    """中间步骤若返回 302，按 Location 跟进（最多 max_hops 次）。"""
+    for _ in range(max_hops):
+        r = client.s.get(url, headers=headers, allow_redirects=False, timeout=30)
+        if r.status_code not in (301, 302):
+            return r
+        loc = r.headers.get("Location", "")
+        if not loc:
+            return r
+        if "login" in loc.lower() or "loginhome" in loc.lower():
+            raise SessionExpired(f"跟进确认页时被踢到登录页（302 → {loc}）")
+        url = loc if loc.startswith("http") else BASE + loc
+    return r
+
+
+def run_booking_steps(client, b: dict, steps: list, ctx: dict, dry_book: bool = False,
+                      success_keywords: list | None = None):
+    """按顺序执行预订步骤。返回最后一步的 BookingResult。
+
+    中间步骤的响应可配置 extract 正则，把捕获值写回 ctx 供后续步骤使用。
+    """
+    from poss_client import BookingResult
+
+    last_req = None
+    for idx, step in enumerate(steps):
+        step_no = idx + 1
+        curl_text = load_step_curl(step, b, idx)
+        if not curl_text:
+            raise BookingNotCalibrated(f"步骤 {step_no} 缺少 cURL 模板")
+        req = client.build_booking_request(curl_text, ctx)
+        leftover = find_unresolved(req["url"])
+        if "json" not in (req["content_type"] or "").lower():
+            leftover += find_unresolved(req["body"])
+        if leftover:
+            raise BookingNotCalibrated(
+                f"步骤 {step_no} 模板里有取不到值的占位符: {', '.join(leftover)}"
+            )
+
+        if dry_book:
+            print(f"[dry-book] --- 步骤 {step_no}/{len(steps)} ---")
+            print(f"[dry-book] {req['method']} {mask_secrets(req['url'], ctx)}")
+            for k, v in req["headers"].items():
+                print(f"[dry-book]   {k}: {mask_secrets(v, ctx)}")
+            if req["body"]:
+                print(f"[dry-book] body: {mask_secrets(req['body'], ctx)}")
+            if leftover:
+                print(f"[dry-book] ❌ 占位符缺值: {leftover}")
+            else:
+                print(f"[dry-book] ✓ 占位符齐全")
+            last_req = req
+            continue
+
+        r = client.s.post(
+            req["url"], data=req["body"], headers=req["headers"],
+            allow_redirects=False, timeout=30,
+        )
+
+        if r.status_code in (301, 302):
+            loc = r.headers.get("Location", "")
+            if "login" in loc.lower() or "loginhome" in loc.lower():
+                raise SessionExpired(f"步骤 {step_no} 被重定向到登录页（302 → {loc}）")
+            if idx == len(steps) - 1:
+                # 最后一步出现非登录 302：结果不明，绝不再试
+                return BookingResult(
+                    False, f"HTTP 302 → {loc}（结果不明，请人工确认）",
+                    (r.text or "")[:2000], inconclusive=True,
+                )
+            # 中间步骤：跟进到确认页
+            url = loc if loc.startswith("http") else BASE + loc
+            r = _follow_redirects(client, url, req["headers"])
+
+        # 从当前响应提取字段给下一步用
+        for key, pattern in step.get("extract", {}).items():
+            m = re.search(pattern, r.text or "")
+            if m:
+                ctx[key] = m.group(1)
+                print(f"[booking] 步骤 {step_no} 提取 {key} = {m.group(1)[:20]}...")
+
+        if idx == len(steps) - 1:
+            text = r.text or ""
+            ok = r.status_code == 200 and any(k.lower() in text.lower() for k in (success_keywords or []))
+            msg = "预订成功" if ok else f"HTTP {r.status_code} 未匹配成功标志: {text[:200]}"
+            return BookingResult(ok, msg, text[:2000])
+
+    if dry_book:
+        # 演练只打印，不返回真实结果
+        return BookingResult(False, "dry-book", "")
+    # 正常流程不会到达这里（最后一步已返回）
+    return BookingResult(False, "步骤执行异常", "")
+
+
 def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
     """爆发式抢位。返回 True = 有结果（抢到 / 已提交待确认），False = 完全没抢到。"""
     b = cfg["booking"]
@@ -521,26 +650,25 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
         print(f"[booking] {today_key} 已处理过（{note}），跳过（防重复扣费）")
         return True
 
-    curl_text = load_booking_curl(b)
-    if not curl_text and not b["endpoint"]:
-        raise BookingNotCalibrated(
-            "预订模板尚未校准：把 POSS 手动预订时那条「提交」请求的 cURL 存成 booking.curl "
-            "（或设 BOOKING_CURL 环境变量），运行 `python3 calibrate.py --import <文件>` 验证。"
-        )
+    steps = load_booking_steps(b)
+    for i, step in enumerate(steps):
+        if not load_step_curl(step, b, i):
+            raise BookingNotCalibrated(
+                f"预订模板不完整：步骤 {i + 1} 缺少 cURL。"
+                "请把 POSS 手动预订那条「提交」请求的 cURL 用 calibrate.py 导入。"
+            )
 
     gym_names = b["gyms"] or [g["name"] for g in cfg["gyms"]]
     target = now.date() + timedelta(days=b["lead_days"])
     date_str = target.strftime(b["search_date_format"])
     window = [{"days": [target.weekday()], "from": b["from"], "to": b["to"]}]
+    mode_desc = f"{len(steps)} 步 cURL 模板" if len(steps) > 1 else "cURL 模板"
     print(f"[booking] 目标：{date_str}（周{'一二三四五六日'[target.weekday()]}）"
-          f" {b['from']}-{b['to']}，馆顺序 {gym_names}"
-          f"，提交方式 {'cURL 模板' if curl_text else 'endpoint+params'}")
+          f" {b['from']}-{b['to']}，馆顺序 {gym_names}，提交方式 {mode_desc}")
 
     deadline = time.time() + (0 if dry_book else b["burst_seconds"])
     attempts = 0
     session_failures = 0
-    # 连续会话失效的次数上限：真环境里若一直「重登→再提交」地循环，
-    # 等于对着学校登录接口高频轰炸，容易触发风控甚至锁号。宁可放弃并报警。
     max_session_failures = 3
     while True:
         attempts += 1
@@ -552,8 +680,7 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
                 session_failures += 1
                 if session_failures > max_session_failures:
                     raise SessionExpired(
-                        f"连续 {session_failures} 次会话失效，已放弃本轮抢位"
-                        f"（继续重登会触发风控）"
+                        f"连续 {session_failures} 次会话失效，已放弃本轮抢位（继续重登会触发风控）"
                     )
                 print(f"[booking] 查询时会话失效 → 重新登录（第 {session_failures} 次）")
                 client.login()
@@ -569,17 +696,11 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
             if dry_book:
                 print(f"[dry-book] 候选: {gym_name} {best['date']} {best['start']}-{best['end']} "
                       f"(剩 {best['left']})")
-                _print_dry_request(client, b, curl_text, ctx, best, gym_name, ctr, target)
+                run_booking_steps(client, b, steps, ctx, dry_book=True)
                 return False
 
             try:
-                if curl_text:
-                    res = client.book_via_curl(curl_text, ctx,
-                                               success_keywords=b["success_keywords"])
-                else:
-                    res = client.book(build_booking_payload(b, best, gym_name, ctr, target, ctx),
-                                      endpoint=b["endpoint"],
-                                      success_keywords=b["success_keywords"])
+                res = run_booking_steps(client, b, steps, ctx, success_keywords=b["success_keywords"])
             except SessionExpired as e:
                 session_failures += 1
                 if session_failures > max_session_failures:
@@ -608,7 +729,6 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
                 return True
 
             if res.inconclusive:
-                # 可能已经下单成功了。宁可让你去看一眼，也绝不重试第二次。
                 booked[today_key] = {
                     "gym": gym_name, "date": best["date"], "start": best["start"],
                     "at": int(time.time()), "status": "inconclusive",
@@ -626,30 +746,6 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
         time.sleep(b["retry_interval"])
     print(f"[booking] 爆发 {attempts} 轮未抢到")
     return False
-
-
-def _print_dry_request(client, b, curl_text, ctx, best, gym_name, ctr, target):
-    """演练：打印脚本真正会发出去的那条请求（token 已打码）。"""
-    print(f"[dry-book] 目标日期: {target.strftime(b['search_date_format'])}")
-    if curl_text:
-        req = client.build_booking_request(curl_text, ctx)
-        print(f"[dry-book] {req['method']} {mask_secrets(req['url'], ctx)}")
-        for k, v in req["headers"].items():
-            print(f"[dry-book]   {k}: {mask_secrets(v, ctx)}")
-        if req["body"]:
-            print(f"[dry-book] body: {mask_secrets(req['body'], ctx)}")
-        leftover = find_unresolved(req["url"])
-        if "json" not in (req["content_type"] or "").lower():
-            leftover += find_unresolved(req["body"])
-        if leftover:
-            print(f"[dry-book] ❌ 这些占位符取不到值，真跑起来会被拦下: {leftover}")
-            print("[dry-book]    → 多半是 timetable 没返回该字段，先跑 --dump 看结构")
-        else:
-            print("[dry-book] ✓ 所有占位符都能取到值，请求可发")
-        return
-    payload = build_booking_payload(b, best, gym_name, ctr, target, ctx)
-    print(f"[dry-book] 将提交到: {b['endpoint'] or '(未配置 endpoint)'}")
-    print(f"[dry-book] 表单: {json.dumps(payload, ensure_ascii=False)}")
 
 
 # ==================== 蹲守提醒 ====================
@@ -729,7 +825,7 @@ def build_client():
     return PossClient(netid, password, fb_user_id)
 
 
-def _report_template_gaps(client, cfg, curl_text, dumped: dict):
+def _report_template_gaps(client, cfg, steps: list, dumped: dict):
     """--dump 收尾：核对预订模板需要的占位符，真实时间表数据能否填上。"""
     b = cfg["booking"]
     target = hk_now().date() + timedelta(days=b["lead_days"])
@@ -744,16 +840,25 @@ def _report_template_gaps(client, cfg, curl_text, dumped: dict):
             print(f"  {gym['name']}: ❌ {e}")
             continue
         slot = slots[0]
+        ctx = build_booking_context(client, b, slot, gym["name"], gym["ctrId"], target)
+        all_leftover = []
         try:
-            ctx = build_booking_context(client, b, slot, gym["name"], gym["ctrId"], target)
-            req = client.build_booking_request(curl_text, ctx)
+            for idx, step in enumerate(steps):
+                curl_text = load_step_curl(step, b, idx)
+                if not curl_text:
+                    all_leftover.append(f"步骤{idx + 1}无模板")
+                    continue
+                req = client.build_booking_request(curl_text, ctx)
+                leftover = find_unresolved(req["url"])
+                if "json" not in (req["content_type"] or "").lower():
+                    leftover += find_unresolved(req["body"])
+                if leftover:
+                    all_leftover.append(f"步骤{idx + 1}: {', '.join(leftover)}")
+                # 模拟从当前响应提取（没有真实响应，所以不覆盖 ctx）
         except Exception as e:  # noqa: BLE001
             print(f"  {gym['name']}: ❌ 模板渲染失败: {e}")
             continue
-        leftover = find_unresolved(req["url"])
-        if "json" not in (req["content_type"] or "").lower():
-            leftover += find_unresolved(req["body"])
-        verdict = "✓ 占位符全部可填，可上线" if not leftover else "❌ 缺: " + ", ".join(leftover)
+        verdict = "✓ 占位符全部可填，可上线" if not all_leftover else "❌ " + "; ".join(all_leftover)
         print(f"  {gym['name']}: 解析到 {len(slots)} 个时段 → {verdict}")
         print(f"    数据样本字段: {sorted(slot['raw'].keys())[:14]}")
     print("[calibrate] 若字段名与预期不符，把 dumps/ 里的 JSON 发给开发者校准解析器。")
@@ -786,11 +891,11 @@ def run(args):
         print(f"[dump] {DUMP_DIR}/make_book.html ({len(r.text)} bytes)")
 
         # 顺带核对：预订模板要的占位符，真实时间表数据给不给得起
-        curl_text = load_booking_curl(cfg["booking"])
-        if curl_text:
-            _report_template_gaps(client, cfg, curl_text, dumped)
+        steps = load_booking_steps(cfg["booking"])
+        if all(load_step_curl(s, cfg["booking"], i) for i, s in enumerate(steps)):
+            _report_template_gaps(client, cfg, steps, dumped)
         else:
-            print("[calibrate] 还没有 booking.curl，"
+            print("[calibrate] 还没有完整 booking 模板，"
                   "抓一条「提交预订」请求后跑 calibrate.py --import")
         return
 

@@ -47,6 +47,51 @@ OVERRIDABLE = set(DEFAULT_BODY)
 UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
 
+def _decode_ansic(s: str) -> str:
+    r"""把 shell 的 $'...' ANSI-C 引号解码成真实字符（\r \n \xHH 等）。"""
+    if s.startswith("$'") and s.endswith("'"):
+        inner = s[2:-1]
+        try:
+            return inner.encode("latin1").decode("unicode_escape")
+        except UnicodeDecodeError:
+            pass
+    return s
+
+
+def _decode_ansic_loose(token: str) -> str:
+    """shlex 会把 $'...' 的外层单引号剥掉只剩 $body\\r\\n，这里做兜底解码。"""
+    if not token.startswith("$"):
+        return token
+    body = token[1:]
+    if not any(seq in body for seq in ("\\r", "\\n", "\\t", "\\x", "\\0")):
+        return token
+    try:
+        return body.encode("latin1").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return token
+
+
+def _ansic_escape(s: str) -> str:
+    """把含换行/控制字符的字符串编码成 $'...' 形式，便于写回 cURL 文件。"""
+    out = []
+    for ch in s:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == "'":
+            out.append("\\'")
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 32 or ord(ch) > 126:
+            out.append("\\x%02x" % ord(ch))
+        else:
+            out.append(ch)
+    return "$'" + "".join(out) + "'"
+
+
 # ==================== cURL 解析与模板渲染 ====================
 # 用途：浏览器「Copy as cURL」导出的原始请求 → 结构化请求要素 → 占位符模板，
 # 这样校准预订接口时只需粘贴一次，无需人工映射字段名。
@@ -142,8 +187,12 @@ def parse_curl(text: str) -> dict:
 
     if not url:
         raise ValueError("cURL 文本里找不到 URL（请确认整条命令都复制全了）")
-    data = "&".join(datas)
     content_type = next((v for k, v in headers.items() if k.lower() == "content-type"), "")
+    decoded = [_decode_ansic_loose(_decode_ansic(d)) for d in datas]
+    if decoded and "multipart/form-data" in content_type.lower():
+        data = "".join(decoded)
+    else:
+        data = "&".join(decoded)
     if method is None:
         method = "POST" if data else "GET"
     return {
@@ -220,7 +269,11 @@ def to_curl(method: str, url: str, headers: dict, data: str = "") -> str:
     for k, v in headers.items():
         parts.append("-H " + q(f"{k}: {v}"))
     if data:
-        parts.append("--data-raw " + q(data))
+        # multipart 请求体含换行和 boundary，普通单引号包不住，写成 $'...'
+        if "\n" in data or "\r" in data or "'" in data or any(ord(c) < 32 for c in data):
+            parts.append("--data-raw " + _ansic_escape(data))
+        else:
+            parts.append("--data-raw " + q(data))
     return " \\\n  ".join(parts)
 
 

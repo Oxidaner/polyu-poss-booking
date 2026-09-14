@@ -18,6 +18,10 @@
     "to": "17:30",
     "search_date_format": "%Y-%m-%d",
     "curl_file": "booking.curl",
+    "steps": [
+      {"curl_file": "booking_step1.curl", "extract": {"csrf": "name=\"CSRFToken\"\\s+value=\"([0-9a-f-]{36})\""}},
+      {"curl_file": "booking.curl"}
+    ],
     "endpoint": "",
     "params": {},
     "success_keywords": ["success", "successful", "成功", "已确认"]

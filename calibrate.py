@@ -165,28 +165,32 @@ def _restore_braces(text: str) -> str:
                   text, flags=re.I)
 
 
-def template_encoded_query(enc_query: str, src: str, notes: list | None = None):
-    """处理「已编码」的查询串，返回 (新串, 记录表)。
+def template_query_string(text: str, encoded: bool, src: str):
+    """处理查询串（已编码或明文），返回 (新串, 记录表)。
 
-    在编码文本上按 & 和 = 切分是安全的：编码后的值里不会出现裸的 & 或 =。
-    未被识别的字段原字节保留，不会引入任何编码差异。
+    encoded=True 时按 URL 编码处理；False 时保持明文（multipart 里的嵌套串）。
     """
-    notes = [] if notes is None else notes
+    notes = []
     out = []
-    for pair in enc_query.split("&"):
+    for pair in text.split("&"):
         if "=" not in pair:
             out.append(pair)
             continue
         k_enc, _, v_enc = pair.partition("=")
-        # 值要用 unquote_plus：form 编码里空格是 '+'，unquote 解不出来
-        k, v = unquote_plus(k_enc), unquote_plus(v_enc)
+        if encoded:
+            k, v = unquote_plus(k_enc), unquote_plus(v_enc)
+        else:
+            k, v = k_enc, v_enc
         if not v.strip():
             out.append(pair)
             continue
 
-        if _looks_like_query(v):  # 值里还嵌着一串参数 → 递归处理
-            nested, _ = template_encoded_query(v, src, notes)
-            out.append(f"{k_enc}={_restore_braces(quote_plus(nested))}")
+        if _looks_like_query(v):
+            nested, _ = template_query_string(v, encoded, src)
+            if encoded:
+                out.append(f"{k_enc}={_restore_braces(quote_plus(nested))}")
+            else:
+                out.append(f"{k}={nested}")
             continue
 
         nv, note = template_value(k, v)
@@ -195,13 +199,22 @@ def template_encoded_query(enc_query: str, src: str, notes: list | None = None):
             out.append(pair)
             continue
         if note:
-            if v_enc != v:  # 原值在文中是被编码过的 → 替换值也必须编码
-                nv = _add_url_spec(nv)
+            if encoded:
+                # 原值被编码过 → 占位符也得编码；{} 被 quote_plus 编码后还原
+                if v_enc != v:
+                    nv = _add_url_spec(nv)
+                out.append(f"{k_enc}={_restore_braces(quote_plus(nv))}")
+            else:
+                out.append(f"{k}={nv}")
             notes.append({"src": src, "k": k, "v": v, "nv": nv, "note": note})
-            out.append(f"{k_enc}={nv}")
             continue
         out.append(pair)
     return "&".join(out), notes
+
+
+def template_encoded_query(enc_query: str, src: str):
+    """已 URL 编码的 form body（application/x-www-form-urlencoded）。"""
+    return template_query_string(enc_query, True, src)
 
 
 def template_json(node, prefix="", notes=None):
@@ -220,17 +233,86 @@ def template_json(node, prefix="", notes=None):
     return node, notes
 
 
+def _multipart_boundary(content_type: str) -> str | None:
+    m = re.search(r'boundary=(?:"([^"]+)"|([^;\s]+))', content_type)
+    if not m:
+        return None
+    return (m.group(1) or m.group(2)).strip()
+
+
+def template_multipart(body: str, content_type: str, src: str = "body"):
+    """处理 multipart/form-data：按 part 解析，只动每个 part 的值，不动 boundary。"""
+    boundary = _multipart_boundary(content_type)
+    if not boundary:
+        return body, []
+    b_re = re.escape(boundary)
+    # 从每个 boundary 行开始匹配，到下一个 boundary/final boundary 之前结束
+    part_re = re.compile(
+        r"(?:^|\r\n)--" + b_re + r"\r\n"
+        r"(.*?)\r\n\r\n"
+        r"(.*?)"
+        r"(?=(?:\r\n--" + b_re + r"(?:--)?\r\n)|$)",
+        re.DOTALL,
+    )
+    matches = list(part_re.finditer(body))
+    if not matches:
+        return body, []
+
+    final_marker = f"\r\n--{boundary}--\r\n"
+    parts = []
+    for m in matches:
+        headers, value = m.group(1), m.group(2)
+        final = body[m.end():].startswith(final_marker)
+        parts.append((headers, value, final))
+
+    notes = []
+    out = body[:matches[0].start()]  # preamble（通常为空）
+    for headers, value, final in parts:
+        name = ""
+        nm = re.search(r'name="([^"]+)"', headers)
+        if nm:
+            name = nm.group(1)
+
+        new_value = value
+        if name and value:
+            if _looks_like_query(value):
+                new_value, subnotes = template_query_string(value, False, src)
+                notes.extend(subnotes)
+            else:
+                nv, note = template_value(name, value)
+                if note:
+                    if note.startswith(WARN):
+                        notes.append({"src": src, "k": name, "v": value, "nv": value, "note": note})
+                    else:
+                        notes.append({"src": src, "k": name, "v": value, "nv": nv, "note": note})
+                        new_value = nv
+
+        # 如果前面有 preamble 且不以 CRLF 结尾，需要补一个 CRLF 再接 boundary；
+        # 否则上一个 part 结束时的 \r\n 已经足够。
+        prefix = "" if (not out or out.endswith("\r\n")) else "\r\n"
+        out += f"{prefix}--{boundary}\r\n{headers}\r\n\r\n{new_value}"
+        if final:
+            out += f"\r\n--{boundary}--\r\n"
+        else:
+            out += "\r\n"
+    return out, notes
+
+
 def template_body(body: str, content_type: str):
     body = body or ""
     if not body:
         return body, [], "empty"
-    if "json" in (content_type or "").lower() or body.lstrip()[:1] in ("{", "["):
+    ct = (content_type or "").lower()
+    if "json" in ct or body.lstrip()[:1] in ("{", "["):
         try:
             obj = json.loads(body)
         except json.JSONDecodeError:
             return body, [], "raw"
         new, notes = template_json(obj)
         return json.dumps(new, ensure_ascii=False, separators=(",", ":")), notes, "json"
+    if "multipart/form-data" in ct:
+        new, notes = template_multipart(body, content_type, "body")
+        return new, notes, "multipart"
     new, notes = template_encoded_query(body, "body")
     return new, notes, "form"
 
@@ -272,7 +354,9 @@ def _short(s, n=46):
 
 def _unknown_fields(raw_data: str, mode: str):
     """找出「疑似该模板化但没识别」的字段。"""
-    if mode != "form" or not raw_data:
+    if mode == "multipart" or not raw_data:
+        return []
+    if mode != "form":
         return []
     out = []
     for k, v in parse_qsl(raw_data, keep_blank_values=True):
@@ -341,8 +425,13 @@ def show_template(path: str) -> int:
     print(f"地址：{info['url']}")
     print(f"头部：{', '.join(info['headers']) or '(无)'}")
     print("请求体：")
-    for pair in (info["data"] or "(空)").split("&"):
-        print(f"       {pair}")
+    if info["mode"] == "multipart":
+        # multipart 直接按行打印可读，避免按 & 切碎
+        for line in (info["data"] or "").splitlines():
+            print(f"       {line}")
+    else:
+        for pair in (info["data"] or "(空)").split("&"):
+            print(f"       {pair}")
     ph = sorted(set(re.findall(r"\{([A-Za-z_][\w-]*)[:}]", info["url"] + "&" + info["data"])))
     print(f"\n占位符：{', '.join('{' + p + '}' for p in ph) or '(无 —— 静态请求)'}")
     return 0

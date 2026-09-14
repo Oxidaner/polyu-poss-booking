@@ -21,9 +21,10 @@
 | 文件 | 作用 |
 |---|---|
 | `config.json` | **抢位时间/目标时段/馆列表/蹲守目标 全部可配** |
-| `booking.curl` | **预订请求模板**（由 `calibrate.py` 从抓包生成，已 gitignore） |
+| `booking_step1.curl` | 第一步请求模板：选时段 → 进入确认页（已 gitignore） |
+| `booking.curl` | 第二步请求模板：勾选 declare → 最终提交（已 gitignore） |
 | `calibrate.py` | cURL 导入器：抓包 → 自动模板化 → 逐字段审查表 |
-| `poss_client.py` | 自动登录 + 抓时间表 + 提交预订 |
+| `poss_client.py` | 自动登录 + 抓时间表 + 提交预订（支持 form / multipart） |
 | `monitor.py` | 主程序（抢位引擎 + 蹲守提醒 + 校准模式） |
 | `.github/workflows/monitor.yml` | GitHub Actions 定时任务 |
 | `state.json` / `session.json` | 运行状态与会话缓存（Actions 自动回写） |
@@ -51,6 +52,11 @@
     "to": "17:30",
     "search_date_format": "%Y-%m-%d",
     "curl_file": "booking.curl",
+    "steps": [
+      {"curl_file": "booking_step1.curl",
+       "extract": {"csrf": "name=\"CSRFToken\"\\s+value=\"([0-9a-f-]{36})\""}},
+      {"curl_file": "booking.curl"}
+    ],
     "endpoint": "",
     "params": {},
     "success_keywords": ["success", "successful", "成功", "已确认"]
@@ -78,44 +84,50 @@
 | `burst_seconds` / `retry_interval` | 爆发时长 / 每轮间隔秒数 |
 | `warmup_minutes` | 提前多少分钟到达就原地等待（默认 6 分钟） |
 | `grace_minutes` | 开抢后多少分钟内仍积极尝试（默认 30 分钟） |
-| `curl_file` | 预订请求模板文件（默认 `booking.curl`，见下节） |
+| `steps` | 多步预订流程。POSS 是「选时段 → 确认页 → 最终提交」两步，每步一个 `curl_file`；<br>中间步骤可用 `extract` 从响应 HTML 提取字段（如确认页的新 CSRFToken） |
+| `curl_file` | 单步预订模板文件（默认 `booking.curl`，若配置了 `steps` 则仅作为各步骤的默认回退） |
 | `success_keywords` | 判定「预订成功」的响应关键词（默认含 `success`/`成功`） |
 | `endpoint` / `params` | 遗留路径：不用 cURL 模板时手填端点与表单 |
 
 **蹲守部分：** `fallback.targets` 不配则自动由 booking 派生（触发日 + 目标时段）。
 
-## ⚠️ 必做：校准预订接口（一条命令）
+## ⚠️ 必做：校准预订接口
 
 查询时间表可以自己攒，但**提交预订必须照抄真实请求**——凭空猜一个会扣押金的
 POST 端点是不负责任的。所以拿不到真实抓包时，代码会拒绝抢位（只做蹲守提醒）并推送警报。
 
-**你只需要做两件事：**
+POSS 的实际流程是**两步**：
+1. 选中时段后点击提交 → POST `make_book.do` → 返回「确认页」（带 declare 复选框）
+2. 勾选 declare 后再点击提交 → POST `make_book_submit.do` → 真正扣押金下单
 
-**① 抓包**：登录 POSS → 操作到「提交预订」那一步 → F12 → Network →
-找到点击提交后的那条请求 → 右键 **Copy as cURL**。
+所以你需要**抓两条** cURL，并分别导入成两个模板：
 
-**② 导入**（不用手填任何字段）：
 ```bash
-pbpaste | python3 calibrate.py --import -        # macOS，直接从剪贴板读
-# 或：python3 calibrate.py --import booking_raw.txt
+# 第 1 步：选时段进入确认页
+pbpaste | python3 calibrate.py --import - --out booking_step1.curl
+
+# 第 2 步：勾选 declare 后的最终提交
+pbpaste | python3 calibrate.py --import - --out booking.curl
 ```
-它会打印一张逐字段审查表，并写出 `booking.curl`。识别规则：
+
+`calibrate.py` 会打印逐字段审查表，并自动识别：
 
 | 值长什么样 | 替换成 |
 |---|---|
 | 会话令牌 / 用户 ID / 场馆编号 / 设施编号 / 时段编号 | `{csrf}` `{fbUserId}` `{ctrId}` `{facilityId}` `{slotId}` |
-| 日期、时间、日期时间（含 `18 Sep 2026 14:30` 这种） | `{date}` `{startTime}` `{startDateTime:url:%d %b %Y %H:%M}` |
+| 日期、时间、日期时间（含 `18 Sep 2026 14:30` 这种） | `{date}` `{startTime}` `{startDateTime}` |
 | 其余字段（`bookType`、`actvId` …） | 原样保留 |
 
-两个设计细节，都不是可选项：
+几个设计细节：
+- **multipart/form-data**（最终提交）已完整支持：boundary 不动，只替换每个 part 里的值。
 - **不做「解码→重编码」**：`searchFormString` 这类字段的值内部本身含 `&`、`=`，
   解码后重新解析会把字段切碎。所以只做纯文本替换，浏览器原来的编码字节原样保留；
   需要编码的占位符会自动写成 `{key:url}`。
 - **字段名带 `Facilities` 的日期时间字段**（如 `boMakeBookFacilities[0].startDateTime`）
   先按「值像不像日期时间」判定，再看字段名 —— 否则会被误判成 `{facilityId}`。
 
-**③ 验证**：`python3 monitor.py --dry-book` —— 打印脚本**真正会发出去**的那条请求
-（token 已打码），并检查每个占位符能否取到值。与抓包逐字段核对一致即可上线。
+**验证**：`python3 monitor.py --dry-book` 会按顺序打印每一步**真正会发出去**的请求
+（token 已打码），并检查占位符能否取到值。与抓包逐字段核对一致即可上线。
 若提示某些占位符取不到值（典型是 `{facilityId}`），说明时间表数据里没这个字段，
 先跑 `--dump` 看结构。
 
@@ -124,9 +136,11 @@ pbpaste | python3 calibrate.py --import -        # macOS，直接从剪贴板读
 ```bash
 cp .env.example .env      # 填入 POSS_NETID / POSS_PASSWORD（只写本地，别贴聊天）
 pip3 install -r requirements.txt
-python3 calibrate.py --import -   # 粘贴预订请求 cURL → 生成 booking.curl
+# 抓两条 cURL 分别导入：
+python3 calibrate.py --import - --out booking_step1.curl   # 选时段进入确认页
+python3 calibrate.py --import - --out booking.curl         # 勾选 declare 最终提交
 python3 monitor.py --dump         # 抓真实时间表结构 → dumps/，并检查占位符能否填满
-python3 monitor.py --dry-book     # 演练抢位并打印真实请求，不真提交
+python3 monitor.py --dry-book     # 演练两步流程并打印真实请求，不真提交
 ```
 
 ## 第二步：配置通知渠道
@@ -142,9 +156,14 @@ python3 monitor.py --dry-book     # 演练抢位并打印真实请求，不真�
 2. Settings → Secrets and variables → Actions：
    **Secrets**：`POSS_NETID`、`POSS_PASSWORD`、`PUSHPLUS_TOKEN`、
    `SMTP_HOST`、`SMTP_USER`、`SMTP_PASS`、`MAIL_TO`
-   **`BOOKING_CURL`**：把 `booking.curl` 的**全文**粘进去（预订模板走 Secret 而不是
-   提交进仓库，避免会话凭据痕迹入库）
-   **Variables**（可选）：`POSS_FB_USER_ID`（默认 657032）、`POSS_CONFIG`（整段 JSON，在线覆盖配置）
+   **Secrets**：
+   - `POSS_NETID`、`POSS_PASSWORD`
+   - `BOOKING_CURL_STEP1`：把 `booking_step1.curl` 的**全文**粘进去
+   - `BOOKING_CURL_STEP2`：把 `booking.curl` 的**全文**粘进去（两步流程）
+   - 如果你只配了单步模板，用 `BOOKING_CURL` 即可
+   - `PUSHPLUS_TOKEN`、`SERVERCHAN_KEY`、`SMTP_HOST`、`SMTP_USER`、`SMTP_PASS`、`MAIL_TO`
+   **Variables**（可选）：`POSS_FB_USER_ID`（默认 657032）、`POSS_CONFIG`（整段 JSON，在线覆盖配置）、
+   `BOOKING_CURL_FILE_STEP1` / `BOOKING_CURL_FILE_STEP2`（用文件路径而非 Secret 全文）
 3. Actions 页启用 workflow。定时任务（UTC，香港时间 = UTC+8）：
    - `*/5 * * * *` 常规轮询（蹲守提醒）
    - `29 0 * * *` = 香港 08:29 预热，准点 08:30:00 开火
