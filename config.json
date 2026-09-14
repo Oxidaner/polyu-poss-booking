@@ -17,9 +17,10 @@
     "from": "16:30",
     "to": "17:30",
     "search_date_format": "%Y-%m-%d",
+    "curl_file": "booking.curl",
     "endpoint": "",
     "params": {},
-    "success_keywords": ["success", "successful", "success", "成功", "已确认"]
+    "success_keywords": ["success", "successful", "成功", "已确认"]
   },
 
   "fallback": {

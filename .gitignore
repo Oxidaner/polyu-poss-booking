@@ -3,3 +3,6 @@ dumps/
 __pycache__/
 *.pyc
 /tmp/
+# 抓包导入的预订模板：含你的会话凭据痕迹，绝不入库
+booking.curl
+*.curl

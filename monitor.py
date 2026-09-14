@@ -21,6 +21,7 @@ POSS 抢位器 / 蹲位器 - 主程序
 
 import argparse
 import json
+import locale
 import os
 import re
 import smtplib
@@ -35,7 +36,17 @@ from poss_client import (
     LoginFailed,
     PossClient,
     SessionExpired,
+    find_unresolved,
+    mask_secrets,
+    render_template,
 )
+
+# %b（月份缩写）必须稳定输出英文 "Sep"：POSS 的 startDateTime 形如
+# "18 Sep 2026 14:30"，若跟随系统语言（zh_CN）会变成 "18 9月 2026" 而请求失败。
+try:
+    locale.setlocale(locale.LC_TIME, "C")
+except locale.Error:  # pragma: no cover
+    pass
 
 TZ = timezone(timedelta(hours=8))
 
@@ -43,6 +54,8 @@ STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 SESSION_FILE = os.environ.get("SESSION_FILE", "session.json")
 DUMP_DIR = os.environ.get("DUMP_DIR", "dumps")
 CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
+# 抓包导入的预订请求模板（calibrate.py 生成）
+BOOKING_CURL_FILE = os.environ.get("BOOKING_CURL_FILE", "booking.curl")
 
 POSS_BOOK_URL = "https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/make_book.do"
 
@@ -78,8 +91,10 @@ DEFAULT_BOOKING = {
     "from": "16:30",
     "to": "17:30",
     "search_date_format": "%Y-%m-%d",
-    "endpoint": "",                  # ⚠️ 预订提交接口（需抓包校准）
-    "params": {},                    # ⚠️ 预订表单模板（支持 {ctrId}/{date}/{startTime} 等占位符）
+    "curl_file": "booking.curl",     # 抓包导入的预订请求模板（首选）
+    "curl": "",                      # 也可直接把整段 cURL 写进配置（不推荐，含凭据）
+    "endpoint": "",                  # 遗留路径：手工填端点（未用 cURL 时）
+    "params": {},                    # 遗留路径：手工填表单模板
     "success_keywords": ["success", "successful", "成功", "已确认"],
 }
 
@@ -149,9 +164,10 @@ def _validate_config(cfg: dict):
     unknown = [g for g in b["gyms"] if g not in names]
     if unknown:
         bad(f"booking.gyms 里有未定义的馆名: {unknown}（可选: {sorted(names)}）")
-    if b["enabled"] and not b["endpoint"]:
-        print("[warn] booking.endpoint 未配置 —— 抢位将无法执行（仅蹲守提醒）。"
-              "请抓取手动预订的提交请求后填入。")
+    if b["enabled"] and not load_booking_curl(b):
+        print("[warn] 预订模板未配置 —— 抢位将无法执行（仅蹲守提醒）。"
+              "请抓取手动预订那条「提交」请求的 cURL，"
+              "运行 `python3 calibrate.py --import <文件>` 生成 booking.curl。")
 
     if cfg["fallback"].get("enabled", True) and cfg["fallback"].get("targets"):
         _validate_targets(cfg["fallback"]["targets"], where="fallback.targets")
@@ -188,6 +204,20 @@ def fallback_targets(cfg):
         return fb["targets"]
     b = cfg["booking"]
     return [{"days": list(b["trigger_days"]), "from": b["from"], "to": b["to"]}]
+
+
+def load_booking_curl(b: dict):
+    """取预订请求模板。优先级：环境变量 BOOKING_CURL > 配置内联 curl > curl_file 文件。"""
+    text = os.environ.get("BOOKING_CURL", "").strip()
+    if text:
+        return text
+    if (b.get("curl") or "").strip():
+        return b["curl"].strip()
+    path = os.environ.get("BOOKING_CURL_FILE") or b.get("curl_file") or BOOKING_CURL_FILE
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    return None
 
 
 # ==================== 时间 ====================
@@ -269,11 +299,18 @@ class ParseNeedsCalibration(Exception):
 
 
 def parse_timetable(data) -> list:
-    """返回 [{date, start, end, left, raw}]"""
+    """返回 [{date, start, end, left, raw}]。
+
+    遍历时**继承祖先节点的标量字段**：POSS 常把 facilityId / ctrId 这类信息挂在
+    分组节点上、时段挂在其下，只看叶子节点会漏掉它们，而预订模板正需要 facilityId。
+    继承来的字段不覆盖节点自身的同名字段。
+    """
     found = []
 
-    def walk(node):
+    def walk(node, inherited):
         if isinstance(node, dict):
+            own = {k: v for k, v in node.items() if isinstance(v, (str, int, float))}
+            merged = {**inherited, **own}
             date_v = _pick(node, DATE_KEYS)
             start_v = _pick(node, START_KEYS)
             if date_v and start_v:
@@ -282,15 +319,16 @@ def parse_timetable(data) -> list:
                     "start": str(start_v),
                     "end": str(_pick(node, END_KEYS) or ""),
                     "left": _pick_int(node, LEFT_HINTS),
-                    "raw": node,
+                    "raw": merged,
                 })
-            for item in node.values():
-                walk(item)
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v, merged)
         elif isinstance(node, list):
             for item in node:
-                walk(item)
+                walk(item, inherited)
 
-    walk(data)
+    walk(data, {})
     if not found:
         raise ParseNeedsCalibration(
             "启发式解析颗粒无收：timetable.json 结构未知，请先跑 `python3 monitor.py --dump` "
@@ -421,28 +459,44 @@ def save_state(state: dict):
 
 
 def safe_format(template: str, ctx: dict) -> str:
-    """占位符替换；未知占位符原样保留（便于发现配置写错）。"""
-    out = template
-    for k, v in ctx.items():
-        out = out.replace("{" + k + "}", str(v))
-    return out
+    """占位符替换（支持 {key} 与 {key:%d/%m/%Y}）；未知占位符原样保留。"""
+    return render_template(template, ctx)
 
 
-def build_booking_payload(slot, cfg, gym_name, ctr_id, target_date) -> dict:
-    """按 config.booking.params 模板 + 时段上下文组装提交表单。"""
-    b = cfg["booking"]
+def build_booking_context(client, b, slot, gym_name, ctr_id, target_date) -> dict:
+    """组装占位符上下文：场馆 / 时段 / 日期 + timetable 原始字段 + 会话令牌。
+
+    日期时间统一归一化成 ISO（"2026-09-18 14:30"），模板里用
+    {startDateTime:url:%d %b %Y %H:%M} 这样的写法来控制最终呈现格式 ——
+    格式只写在抓包模板里，不在代码里再搞一份，避免两处不一致。
+    """
+    d = _parse_date(slot["date"])
+    date_iso = d.strftime("%Y-%m-%d") if d else str(slot["date"])
+    start_iso = _parse_hm(slot["start"]) or str(slot["start"])
+    end_iso = _parse_hm(slot["end"]) or str(slot["end"] or slot["start"])
     ctx = {
         "gym": gym_name,
         "ctrId": str(ctr_id),
-        "date": slot["date"],
-        "startDate": slot["date"],
-        "startTime": slot["start"],
-        "endTime": slot["end"],
+        "date": date_iso,
+        "startDate": date_iso,
+        "rawDate": str(slot["date"]),
+        "startTime": start_iso,
+        "endTime": end_iso,
+        "startDateTime": f"{date_iso} {start_iso}",
+        "endDateTime": f"{date_iso} {end_iso}",
         "searchDate": target_date.strftime(b["search_date_format"]),
+        "fbUserId": getattr(client, "fb_user_id", "") or "",
+        "csrf": getattr(client, "api_csrf", "") or "",
     }
+    # timetable 返回的原始字段也注入（如 slotId/facilityId），供 {同名} 占位符使用
     for k, v in (slot.get("raw") or {}).items():
         if isinstance(v, (str, int, float)):
             ctx.setdefault(str(k), str(v))
+    return ctx
+
+
+def build_booking_payload(b, slot, gym_name, ctr_id, target_date, ctx) -> dict:
+    """遗留路径：按 config.booking.params 模板组装表单。"""
     return {
         k: (safe_format(v, ctx) if isinstance(v, str) else v)
         for k, v in (b.get("params") or {}).items()
@@ -457,25 +511,37 @@ def pick_best(slots, b):
 
 
 def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
-    """爆发式抢位。返回是否抢到。"""
+    """爆发式抢位。返回 True = 有结果（抢到 / 已提交待确认），False = 完全没抢到。"""
     b = cfg["booking"]
     today_key = now.date().isoformat()
     booked = state.setdefault("booked", {})
     if today_key in booked:
-        print(f"[booking] {today_key} 已抢到，跳过（防重复扣费）")
+        prev = booked[today_key]
+        note = prev.get("status") or f"{prev.get('gym', '?')} {prev.get('start', '?')}"
+        print(f"[booking] {today_key} 已处理过（{note}），跳过（防重复扣费）")
         return True
-    if not b["endpoint"]:
-        raise BookingNotCalibrated("booking.endpoint 未配置")
+
+    curl_text = load_booking_curl(b)
+    if not curl_text and not b["endpoint"]:
+        raise BookingNotCalibrated(
+            "预订模板尚未校准：把 POSS 手动预订时那条「提交」请求的 cURL 存成 booking.curl "
+            "（或设 BOOKING_CURL 环境变量），运行 `python3 calibrate.py --import <文件>` 验证。"
+        )
 
     gym_names = b["gyms"] or [g["name"] for g in cfg["gyms"]]
     target = now.date() + timedelta(days=b["lead_days"])
     date_str = target.strftime(b["search_date_format"])
     window = [{"days": [target.weekday()], "from": b["from"], "to": b["to"]}]
     print(f"[booking] 目标：{date_str}（周{'一二三四五六日'[target.weekday()]}）"
-          f" {b['from']}-{b['to']}，馆顺序 {gym_names}")
+          f" {b['from']}-{b['to']}，馆顺序 {gym_names}"
+          f"，提交方式 {'cURL 模板' if curl_text else 'endpoint+params'}")
 
     deadline = time.time() + (0 if dry_book else b["burst_seconds"])
     attempts = 0
+    session_failures = 0
+    # 连续会话失效的次数上限：真环境里若一直「重登→再提交」地循环，
+    # 等于对着学校登录接口高频轰炸，容易触发风控甚至锁号。宁可放弃并报警。
+    max_session_failures = 3
     while True:
         attempts += 1
         for gym_name in gym_names:
@@ -483,7 +549,13 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
             try:
                 raw = client.timetable(ctr, date_str, params=cfg["request"])
             except SessionExpired:
-                print("[booking] 查询时会话失效 → 重新登录")
+                session_failures += 1
+                if session_failures > max_session_failures:
+                    raise SessionExpired(
+                        f"连续 {session_failures} 次会话失效，已放弃本轮抢位"
+                        f"（继续重登会触发风控）"
+                    )
+                print(f"[booking] 查询时会话失效 → 重新登录（第 {session_failures} 次）")
                 client.login()
                 client.save_session(SESSION_FILE)
                 continue
@@ -492,25 +564,39 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
             if not cands:
                 continue
             best = pick_best(cands, b)
-            payload = build_booking_payload(best, cfg, gym_name, ctr, target)
+            ctx = build_booking_context(client, b, best, gym_name, ctr, target)
+
             if dry_book:
                 print(f"[dry-book] 候选: {gym_name} {best['date']} {best['start']}-{best['end']} "
                       f"(剩 {best['left']})")
-                print(f"[dry-book] 将提交到: {b['endpoint'] or '(未配置 endpoint)'}")
-                print(f"[dry-book] 表单: {json.dumps(payload, ensure_ascii=False)}")
+                _print_dry_request(client, b, curl_text, ctx, best, gym_name, ctr, target)
                 return False
+
             try:
-                res = client.book(payload, endpoint=b["endpoint"],
-                                  success_keywords=b["success_keywords"])
+                if curl_text:
+                    res = client.book_via_curl(curl_text, ctx,
+                                               success_keywords=b["success_keywords"])
+                else:
+                    res = client.book(build_booking_payload(b, best, gym_name, ctr, target, ctx),
+                                      endpoint=b["endpoint"],
+                                      success_keywords=b["success_keywords"])
             except SessionExpired as e:
-                print(f"[booking] 提交时会话失效: {e} → 重新登录")
+                session_failures += 1
+                if session_failures > max_session_failures:
+                    raise SessionExpired(
+                        f"提交预订连续 {session_failures} 次会话失效，已放弃本轮"
+                        f"（继续重登会触发风控）"
+                    ) from e
+                print(f"[booking] 提交时会话失效: {e} → 重新登录（第 {session_failures} 次）")
                 client.login()
                 continue
+            session_failures = 0
             print(f"[booking] 第 {attempts} 轮 {gym_name} {best['start']}: {res.message}")
+
             if res.ok:
                 booked[today_key] = {
                     "gym": gym_name, "date": best["date"], "start": best["start"],
-                    "end": best["end"], "at": int(time.time()),
+                    "end": best["end"], "at": int(time.time()), "status": "booked",
                 }
                 save_state(state)
                 notify_all(
@@ -520,11 +606,50 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
                     f"（{now.strftime('%m-%d %H:%M')} 自动抢位）",
                 )
                 return True
+
+            if res.inconclusive:
+                # 可能已经下单成功了。宁可让你去看一眼，也绝不重试第二次。
+                booked[today_key] = {
+                    "gym": gym_name, "date": best["date"], "start": best["start"],
+                    "at": int(time.time()), "status": "inconclusive",
+                }
+                save_state(state)
+                notify_all(
+                    "❓ POSS 抢位结果不明，请立刻确认",
+                    f"{gym_name} {best['date']} {best['start']}–{best['end']}\n"
+                    f"服务端返回：{res.message}\n"
+                    f"脚本已停止重试（避免重复扣费）。请马上去 POSS 看一眼订单状态。",
+                )
+                return True
         if dry_book or time.time() >= deadline:
             break
         time.sleep(b["retry_interval"])
     print(f"[booking] 爆发 {attempts} 轮未抢到")
     return False
+
+
+def _print_dry_request(client, b, curl_text, ctx, best, gym_name, ctr, target):
+    """演练：打印脚本真正会发出去的那条请求（token 已打码）。"""
+    print(f"[dry-book] 目标日期: {target.strftime(b['search_date_format'])}")
+    if curl_text:
+        req = client.build_booking_request(curl_text, ctx)
+        print(f"[dry-book] {req['method']} {mask_secrets(req['url'], ctx)}")
+        for k, v in req["headers"].items():
+            print(f"[dry-book]   {k}: {mask_secrets(v, ctx)}")
+        if req["body"]:
+            print(f"[dry-book] body: {mask_secrets(req['body'], ctx)}")
+        leftover = find_unresolved(req["url"])
+        if "json" not in (req["content_type"] or "").lower():
+            leftover += find_unresolved(req["body"])
+        if leftover:
+            print(f"[dry-book] ❌ 这些占位符取不到值，真跑起来会被拦下: {leftover}")
+            print("[dry-book]    → 多半是 timetable 没返回该字段，先跑 --dump 看结构")
+        else:
+            print("[dry-book] ✓ 所有占位符都能取到值，请求可发")
+        return
+    payload = build_booking_payload(b, best, gym_name, ctr, target, ctx)
+    print(f"[dry-book] 将提交到: {b['endpoint'] or '(未配置 endpoint)'}")
+    print(f"[dry-book] 表单: {json.dumps(payload, ensure_ascii=False)}")
 
 
 # ==================== 蹲守提醒 ====================
@@ -604,6 +729,36 @@ def build_client():
     return PossClient(netid, password, fb_user_id)
 
 
+def _report_template_gaps(client, cfg, curl_text, dumped: dict):
+    """--dump 收尾：核对预订模板需要的占位符，真实时间表数据能否填上。"""
+    b = cfg["booking"]
+    target = hk_now().date() + timedelta(days=b["lead_days"])
+    print("\n[calibrate] 预订模板占位符可用性检查")
+    for gym in cfg["gyms"]:
+        raw = dumped.get(gym["name"])
+        if raw is None:
+            continue
+        try:
+            slots = parse_timetable(raw)
+        except ParseNeedsCalibration as e:
+            print(f"  {gym['name']}: ❌ {e}")
+            continue
+        slot = slots[0]
+        try:
+            ctx = build_booking_context(client, b, slot, gym["name"], gym["ctrId"], target)
+            req = client.build_booking_request(curl_text, ctx)
+        except Exception as e:  # noqa: BLE001
+            print(f"  {gym['name']}: ❌ 模板渲染失败: {e}")
+            continue
+        leftover = find_unresolved(req["url"])
+        if "json" not in (req["content_type"] or "").lower():
+            leftover += find_unresolved(req["body"])
+        verdict = "✓ 占位符全部可填，可上线" if not leftover else "❌ 缺: " + ", ".join(leftover)
+        print(f"  {gym['name']}: 解析到 {len(slots)} 个时段 → {verdict}")
+        print(f"    数据样本字段: {sorted(slot['raw'].keys())[:14]}")
+    print("[calibrate] 若字段名与预期不符，把 dumps/ 里的 JSON 发给开发者校准解析器。")
+
+
 def run(args):
     cfg = load_config()
     now = hk_now()
@@ -614,10 +769,12 @@ def run(args):
         fetch_timetables(client, cfg)  # 登录 + 建会话
         os.makedirs(DUMP_DIR, exist_ok=True)
         dates = cfg["request"].get("searchDates") or [""]
+        dumped = {}
         for gym in cfg["gyms"]:
             safe = re.sub(r"[^\w-]", "_", gym["name"])
             for d in dates:
                 raw = client.timetable(gym["ctrId"], d, params=cfg["request"])
+                dumped[gym["name"]] = raw
                 suffix = "" if d == "" else f"@{d}"
                 p = os.path.join(DUMP_DIR, f"timetable_{safe}{suffix}.json")
                 with open(p, "w", encoding="utf-8") as f:
@@ -627,6 +784,14 @@ def run(args):
         with open(os.path.join(DUMP_DIR, "make_book.html"), "w", encoding="utf-8") as f:
             f.write(r.text)
         print(f"[dump] {DUMP_DIR}/make_book.html ({len(r.text)} bytes)")
+
+        # 顺带核对：预订模板要的占位符，真实时间表数据给不给得起
+        curl_text = load_booking_curl(cfg["booking"])
+        if curl_text:
+            _report_template_gaps(client, cfg, curl_text, dumped)
+        else:
+            print("[calibrate] 还没有 booking.curl，"
+                  "抓一条「提交预订」请求后跑 calibrate.py --import")
         return
 
     # ---- 抢位 ----

@@ -38,6 +38,8 @@ jobs:
           POSS_PASSWORD: ${{ secrets.POSS_PASSWORD }}
           POSS_FB_USER_ID: ${{ vars.POSS_FB_USER_ID }}
           POSS_CONFIG: ${{ vars.POSS_CONFIG }}
+          # 预订模板（calibrate.py 导入后的 booking.curl 全文），放 Secret 里
+          BOOKING_CURL: ${{ secrets.BOOKING_CURL }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
