@@ -52,6 +52,24 @@ class SessionExpired(Exception):
     """会话失效（302 / 登录页），需要重新登录。"""
 
 
+class BookingNotCalibrated(Exception):
+    """预订接口尚未校准（缺少真实抓包的 endpoint / params）。"""
+
+
+class BookingFailed(Exception):
+    """提交预订被服务端拒绝。"""
+
+
+class BookingResult:
+    def __init__(self, ok: bool, message: str, raw: str = ""):
+        self.ok = ok
+        self.message = message
+        self.raw = raw
+
+    def __repr__(self):
+        return f"BookingResult(ok={self.ok}, message={self.message!r})"
+
+
 class PossClient:
     def __init__(self, netid: str, password: str, fb_user_id: str = "657032"):
         if not netid or not password:
@@ -155,6 +173,50 @@ class PossClient:
             return r.json()
         except ValueError as e:
             raise SessionExpired(f"返回非 JSON（疑似登录页/错误页）: {str(e)[:100]}") from e
+
+    # ---------- 提交预订 ----------
+
+    def book(self, payload: dict, endpoint: str = "",
+             success_keywords: list | None = None) -> BookingResult:
+        """⑤ 提交预订。
+
+        ⚠️ 端点与字段必须先按真实抓包校准（config.booking.endpoint / params）。
+        凭猜测去 POST 一个会扣押金的接口是不负责任的，因此未校准时直接抛错。
+
+        payload 由 monitor 按 config.booking.params 模板 + 时段上下文组装。
+        """
+        if not endpoint:
+            raise BookingNotCalibrated(
+                "预订接口尚未校准：请在 POSS 手动预订一次并抓取那条提交请求的 cURL，"
+                "把 URL 路径填到 config.booking.endpoint，表单字段填到 config.booking.params。"
+            )
+        if not self.api_csrf:
+            raise SessionExpired("尚未登录（无接口 CSRFToken）")
+        body = dict(payload)
+        body.setdefault("CSRFToken", self.api_csrf)
+        url = endpoint if endpoint.startswith("http") else BASE + endpoint
+        r = self.s.post(
+            url,
+            data=body,
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": MAKE_BOOK,
+                "Origin": BASE,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            },
+            allow_redirects=False,
+            timeout=30,
+        )
+        if r.status_code == 302:
+            raise SessionExpired(f"提交预订被重定向（HTTP 302 → {r.headers.get('Location', '?')}）")
+        text = r.text or ""
+        ok_http = r.status_code == 200
+        kws = success_keywords or ["success", "successful", "成功"]
+        hit = any(k.lower() in text.lower() for k in kws)
+        ok = ok_http and hit
+        msg = "预订成功" if ok else f"HTTP {r.status_code} 未匹配成功标志: {text[:200]}"
+        return BookingResult(ok, msg, text[:2000])
 
     # ---------- 会话持久化 ----------
 

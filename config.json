@@ -3,10 +3,32 @@
     {"name": "X123", "ctrId": "151"},
     {"name": "X202", "ctrId": "152"}
   ],
-  "targets": [
-    {"days": [1], "from": "12:30", "to": "18:00"},
-    {"days": [2, 3, 4], "from": "14:30", "to": "18:00"}
-  ],
+
+  "booking": {
+    "enabled": true,
+    "trigger_days": [1, 3],
+    "trigger_time": "08:30",
+    "warmup_minutes": 6,
+    "grace_minutes": 30,
+    "lead_days": 7,
+    "burst_seconds": 120,
+    "retry_interval": 3,
+    "gyms": ["X123", "X202"],
+    "from": "16:30",
+    "to": "17:30",
+    "search_date_format": "%Y-%m-%d",
+    "endpoint": "",
+    "params": {},
+    "success_keywords": ["success", "successful", "success", "成功", "已确认"]
+  },
+
+  "fallback": {
+    "enabled": true,
+    "targets": [
+      {"days": [1, 3], "from": "16:30", "to": "17:30"}
+    ]
+  },
+
   "request": {
     "bookType": "INDV",
     "dataSetId": "18",

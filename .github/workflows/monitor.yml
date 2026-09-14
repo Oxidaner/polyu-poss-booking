@@ -2,8 +2,12 @@ name: POSS Slot Monitor
 
 on:
   schedule:
-    # 每 5 分钟轮询一次（GitHub 实际执行可能有 1~3 分钟延迟，属正常现象）
+    # 常规轮询：每 5 分钟（蹲守提醒用）
     - cron: "*/5 * * * *"
+    # 抢位预热：香港时间 08:29（UTC 00:29），让脚本准点 08:30:00 开火
+    - cron: "29 0 * * *"
+    # 抢位兜底重试：香港时间 08:35（UTC 00:35）
+    - cron: "35 0 * * *"
   workflow_dispatch: # 允许手动触发，方便测试
 
 permissions:
@@ -16,7 +20,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4

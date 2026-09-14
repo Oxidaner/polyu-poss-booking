@@ -1,21 +1,30 @@
-# POSS 蹲位器 🏀
+# POSS 抢位器 / 蹲位器 🏀
 
-监控 PolyU POSS 体育课预订系统（X123 / X202 健身房），一旦目标时段出现空位
-（有人取消预订），**第一时间微信推送 + 邮件提醒**。
+自动登录 PolyU POSS，在触发日（默认**周二、周四 08:30**）准点帮你抢**下周同一天**
+（默认 7 天后）的目标时段（默认 **16:30–17:30**）；没抢到就自动转入**蹲守模式**，
+有人取消放出空位立即 微信推送 + 邮件提醒。
 
-自动登录 NetID → 抓取预订时间表 → 过滤目标时段（周二 12:30–18:00，周三/四/五
-14:30–18:00）→ 对比上次状态 → 新空位立即推送。GitHub Actions 每 5 分钟免费跑一次，
-手机关机也在蹲。
+## 工作原理
+
+```
+触发日 08:29  → 预热运行，脚本原地等到 08:30:00（不听 GitHub 调度的延迟）
+触发日 08:30  → 爆发式抢位（默认持续 120 秒，每 3 秒一轮）：
+                   登录 → 查目标日期时间表 → 找 16:30–17:30 的空位 → 立即提交预订
+                   馆顺序依次尝试（X123 → X202，可配）
+     抢到      → 推送「🎉 抢到了」（当天不再重复抢，防重复扣费）
+     没抢到    → 推送「😤 转入蹲守」+ 每 5 分钟轮询，出现空位立即提醒
+非触发日      → 只做蹲守提醒
+```
 
 ## 文件结构
 
 | 文件 | 作用 |
 |---|---|
-| `config.json` | **馆列表 + 目标时段 + 请求参数**（全部可配，改这里就行） |
-| `poss_client.py` | 自动登录 + 抓 timetable.json（会话缓存复用） |
-| `monitor.py` | 主程序：解析/过滤/去重/推送；`--dump` 校准模式 |
+| `config.json` | **抢位时间/目标时段/馆列表/蹲守目标 全部可配** |
+| `poss_client.py` | 自动登录 + 抓时间表 + 提交预订 |
+| `monitor.py` | 主程序（抢位引擎 + 蹲守提醒 + 校准模式） |
 | `.github/workflows/monitor.yml` | GitHub Actions 定时任务 |
-| `state.json` / `session.json` | 运行状态与会话缓存（由 Actions 自动回写） |
+| `state.json` / `session.json` | 运行状态与会话缓存（Actions 自动回写） |
 | `dumps/` | 校准数据（本地调试用，已 gitignore） |
 
 ## 配置说明（config.json）
@@ -24,92 +33,108 @@
 {
   "gyms": [
     {"name": "X123", "ctrId": "151"},
-    {"name": "X202", "ctrId": "152", "extra_targets": [{"days": [4], "from": "08:00", "to": "12:00"}]},
-    {"name": "X999", "ctrId": "999", "targets": [{"days": [0, 6], "from": "20:00", "to": "22:00"}]}
+    {"name": "X202", "ctrId": "152"}
   ],
-  "targets": [
-    {"days": [1], "from": "12:30", "to": "18:00"},
-    {"days": [2, 3, 4], "from": "14:30", "to": "18:00"}
-  ],
+  "booking": {
+    "enabled": true,
+    "trigger_days": [1, 3],
+    "trigger_time": "08:30",
+    "warmup_minutes": 6,
+    "grace_minutes": 30,
+    "lead_days": 7,
+    "burst_seconds": 120,
+    "retry_interval": 3,
+    "gyms": ["X123", "X202"],
+    "from": "16:30",
+    "to": "17:30",
+    "search_date_format": "%Y-%m-%d",
+    "endpoint": "",
+    "params": {},
+    "success_keywords": ["success", "successful", "成功", "已确认"]
+  },
+  "fallback": {
+    "enabled": true,
+    "targets": [{"days": [1, 3], "from": "16:30", "to": "17:30"}]
+  },
   "request": {
-    "bookType": "INDV",
-    "dataSetId": "18",
-    "actvId": "101",
-    "facilityId": "",
-    "showCourtAreaDetails": "true",
-    "searchDates": []
+    "bookType": "INDV", "dataSetId": "18", "actvId": "101",
+    "facilityId": "", "showCourtAreaDetails": "true", "searchDates": []
   }
 }
 ```
 
-- **`gyms`**：想盯几个馆就加几条。`ctrId` 是 POSS 的场馆编号（X123=151、X202=152），
-  `name` 只用于提醒消息和状态记录，随便起但不能重复。
-- **`targets`**（全局）：所有馆默认盯的时段。`days` 里 `0`=周一 … `6`=周日；
-  `from`/`to` 是 `HH:MM`；只要时段与窗口**有交集**就算命中。
-- **馆级时段规则**（可选，三选一）：
-  - 什么都不配 → 用全局 `targets`
-  - `extra_targets` → **全局 + 追加**（例：X202 既盯全局时段，又多盯周五上午）
-  - `targets` → **覆盖全局**（例：X999 只盯周末晚上，不看全局）
-- **`request`**：timetable.json 的请求参数（换运动项目就改 `actvId`）。
-  `searchDates` 留空数组表示用系统默认视图；填日期数组（如 `["2026-09-15"]`）
-  则按日期逐个查询。
-- **环境变量 `POSS_CONFIG`** 可以传整个 JSON 字符串，优先级高于 `config.json`
-  （适合在 GitHub Variables 里在线改配置而不用改文件）。
+**抢位部分：**
 
+| 字段 | 含义 |
+|---|---|
+| `trigger_days` | 哪几天开抢。`0`=周一 … `6`=周日。默认 `[1, 3]` = 周二、周四 |
+| `trigger_time` | 开抢时刻（香港时间），默认 `08:30` |
+| `lead_days` | 抢几天后的场：`7` = 下周同一天 |
+| `from` / `to` | 目标时段，默认 `16:30`–`17:30`。时段与窗口有交集即为候选 |
+| `gyms` | 尝试顺序；空数组 = 按顶层 `gyms` 顺序全部试 |
+| `burst_seconds` / `retry_interval` | 爆发时长 / 每轮间隔秒数 |
+| `warmup_minutes` | 提前多少分钟到达就原地等待（默认 6 分钟） |
+| `grace_minutes` | 开抢后多少分钟内仍积极尝试（默认 30 分钟） |
+| `endpoint` / `params` | ⚠️ **预订提交接口与表单（需抓包校准，见下）** |
 
+**蹲守部分：** `fallback.targets` 不配则自动由 booking 派生（触发日 + 目标时段）。
 
-## 第一步：本地校准（必做一次）
+## ⚠️ 必做：校准预订接口
 
-1. 复制 `.env.example` 为 `.env`，填入 `POSS_NETID`、`POSS_PASSWORD`
-   （**密码只写进本地 .env，永远不要发到任何聊天/仓库里**）
-2. 安装依赖并跑校准：
-   ```bash
-   pip3 install -r requirements.txt
-   python3 monitor.py --dump
+查询时间表可以自己攒，但**提交预订必须照抄真实请求**——凭空猜一个会扣押金的
+POST 端点是不负责任的，所以代码在校准前会拒绝抢位（只做蹲守提醒）并推送警报。
+
+**抓取步骤：**
+1. 登录 POSS，进入预订页，正常操作到「提交预订」那一步
+2. F12 → Network → 找到点击提交后发出的请求（若还有确认步骤，两条都要）
+3. 右键 **Copy as cURL**，得到 URL 路径和表单字段
+4. 填进 `config.json`：
+   - `booking.endpoint`：请求路径，如 `/starspossfbstud/secure/ui_make_book/xxx.do`
+   - `booking.params`：表单字段模板，值里可用占位符
+     `{ctrId}` `{date}` `{startTime}` `{endTime}` `{gym}` `{searchDate}`，
+     以及时间表返回的任意字段名（如槽位 ID）
+
+   例：真实请求体为 `slotId=12345&bookingDate=2026-09-22&startTime=16:30`，
+   时间表返回里槽位 ID 字段叫 `slotId`，则写：
+   ```json
+   "params": {"slotId": "{slotId}", "bookingDate": "{date}", "startTime": "{startTime}"}
    ```
-3. 成功后 `dumps/` 里会有两馆的时间表原始 JSON —— 拿到它们即可完成解析器定稿。
+5. 验证：`python3 monitor.py --dry-book` —— 会查时间表、打印将要提交的表单但不真提交。
+   对照抓包结果，字段一致即可上线。
+
+## 第一步：本地校准与试跑
+
+```bash
+cp .env.example .env      # 填入 POSS_NETID / POSS_PASSWORD（只写本地，别贴聊天）
+pip3 install -r requirements.txt
+python3 monitor.py --dump       # 抓真实时间表结构 → dumps/
+python3 monitor.py --dry-book   # 演练抢位并打印表单，不真提交
+```
 
 ## 第二步：配置通知渠道
 
-### 微信推送（PushPlus，免费）
-1. 微信扫码登录 https://www.pushplus.plus 并关注其公众号
-2. 「一对一推送」页复制 TOKEN → 填入 `.env` 的 `PUSHPLUS_TOKEN`
-
-### 邮件（QQ 邮箱示例）
-1. 设置 → 账户 → 开启 SMTP → 生成「授权码」
-2. 填 `.env`：`SMTP_HOST=smtp.qq.com`、`SMTP_PORT=465`、
-   `SMTP_USER=发件邮箱`、`SMTP_PASS=授权码`、`MAIL_TO=收件邮箱`
+- **微信推送（PushPlus，免费）**：扫码登录 https://www.pushplus.plus 并关注公众号，
+  「一对一推送」复制 TOKEN → `.env` 的 `PUSHPLUS_TOKEN`
+- **邮件（QQ 邮箱示例）**：设置 → 账户 → 开启 SMTP → 生成授权码 →
+  填 `SMTP_HOST=smtp.qq.com`、`SMTP_PORT=465`、`SMTP_USER`、`SMTP_PASS`、`MAIL_TO`
 
 ## 第三步：部署 GitHub Actions
 
-1. 新建 **Private** 仓库（必须私有！）并推送代码：
-   ```bash
-   git remote add origin git@github.com:<你>/poss-monitor.git
-   git push -u origin main
-   ```
-2. 仓库 Settings → Secrets and variables → Actions，添加 **Secrets**：
+1. 新建 **Private** 仓库（必须私有！）并推送代码
+2. Settings → Secrets and variables → Actions：
+   **Secrets**：`POSS_NETID`、`POSS_PASSWORD`、`PUSHPLUS_TOKEN`、
+   `SMTP_HOST`、`SMTP_USER`、`SMTP_PASS`、`MAIL_TO`
+   **Variables**（可选）：`POSS_FB_USER_ID`（默认 657032）、`POSS_CONFIG`（整段 JSON，在线覆盖配置）
+3. Actions 页启用 workflow。定时任务（UTC，香港时间 = UTC+8）：
+   - `*/5 * * * *` 常规轮询（蹲守提醒）
+   - `29 0 * * *` = 香港 08:29 预热，准点 08:30:00 开火
+   - `35 0 * * *` = 香港 08:35 兜底重试
 
-   | 名称 | 内容 |
-   |---|---|
-   | `POSS_NETID` | 你的 NetID |
-   | `POSS_PASSWORD` | 你的 NetPassword |
-   | `PUSHPLUS_TOKEN` | PushPlus token |
-   | `SMTP_HOST` | 如 `smtp.qq.com` |
-   | `SMTP_USER` / `SMTP_PASS` | 发件邮箱 / 授权码 |
-   | `MAIL_TO` | 收件邮箱 |
+## 注意事项 / 风险
 
-   可选 **Variables**（非敏感）：`POSS_FB_USER_ID`（默认 657032）、
-   `POSS_CONFIG`（装上面那段 JSON，可在线覆盖 `config.json`）
-
-3. Actions 页启用 workflow，点 **Run workflow** 手动跑一次验证
-4. 收到第一条推送 = 上线成功
-
-## 工作机制 & 注意事项
-
-- **自动登录**：每次运行先复用 `session.json` 里的缓存会话（约 90 分钟），
-  失效才重新登录——避免每天 288 次登录触发学校风控。
-- **去重**：名额 0→N 才提醒；空位持续存在每 30 分钟重提醒（`RENOTIFY_AFTER`）。
-- **失明警报**：登录失败/接口异常会推送警报（每小时最多一条），绝不静默装死。
-- **风险自担**：自动化访问学校系统理论上可能违反 IT 使用守则，频率已刻意保守
-  （5 分钟一次、会话复用），但请知悉风险。密码仅存于 GitHub Secrets（加密），
-  代码与日志不落明文；`session.json` 含短期会话 cookie，仅存在于你的私有仓库。
+- **会自动花钱**：预订成功会扣押金。代码做了防重复（同一触发日只抢一次，成功后跳过），
+  但**请自己核对 POSS 上的预订记录**。
+- **预订完成后请手动确认**：若 POSS 还有「确认预订」步骤或支付环节，记得去做。
+- **频率与风控**：常规轮询 5 分钟一次、会话缓存复用约 90 分钟，抢位仅集中在触发时刻。
+- **风险自担**：自动化访问学校系统可能违反 IT 使用守则；密码仅存 GitHub Secrets（加密），
+  代码与日志不落明文；`session.json` 含短期会话 cookie，仅存于你的私有仓库。

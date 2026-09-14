@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-POSS 蹲位器 - 主程序
-====================
-poss_client 自动登录 → 抓两馆 timetable.json → 解析时段 → 过滤目标时段
-→ 与 state.json 对比 → 新空位立即 微信推送 + 邮件。
+POSS 抢位器 / 蹲位器 - 主程序
+==============================
+两种模式自动切换：
+
+  ① 抢位（config.booking）：在触发日（默认周二、周四）08:30 前预热等待，
+     到点后爆发式抢「lead_days 天后（默认下周同一天）」的目标时段（默认 16:30–17:30）。
+     抢到 → 立即推送；没抢到 → 推送一次「转入蹲守」。
+  ② 蹲守提醒（config.fallback）：监控目标时段的空位（有人取消就放出来），
+     出现空位立即 微信推送 + 邮件。
 
 用法：
-  python3 monitor.py            # 正常监控（本地测试/Actions）
-  python3 monitor.py --dump     # 校准模式：登录+抓取，原始数据存 dumps/，不推送
-  python3 monitor.py --no-notify # 监控但不推送（干跑测试）
+  python3 monitor.py                # 正常跑（Actions / 本地）
+  python3 monitor.py --dump         # 校准：抓原始数据存 dumps/，不抢不推
+  python3 monitor.py --dry-book     # 演练：演练抢位并打印将要提交的表单，不真提交
+  python3 monitor.py --no-notify    # 静默跑（不发通知，用于测试）
+
+测试用：设 POSS_FAKE_NOW=2026-09-15T08:31 可伪造当前时间（同时跳过等待）。
 """
 
 import argparse
@@ -22,7 +30,12 @@ from datetime import datetime, timedelta, timezone
 from email.header import Header
 from email.mime.text import MIMEText
 
-from poss_client import LoginFailed, PossClient, SessionExpired
+from poss_client import (
+    BookingNotCalibrated,
+    LoginFailed,
+    PossClient,
+    SessionExpired,
+)
 
 TZ = timezone(timedelta(hours=8))
 
@@ -35,10 +48,10 @@ POSS_BOOK_URL = "https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/
 
 # 同一空位一直没被抢走时，隔多久再提醒一次（秒）
 RENOTIFY_AFTER = int(os.environ.get("RENOTIFY_AFTER", 30 * 60))
-# 「监控失明」警报的最小间隔（秒），防止每 5 分钟轰炸一次
+# 「监控失明」警报的最小间隔（秒）
 FAIL_ALERT_INTERVAL = 60 * 60
 
-# ---- 通知渠道配置（环境变量 / .env） ----
+# ---- 通知渠道（环境变量 / .env） ----
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
@@ -47,20 +60,47 @@ SMTP_USER = os.environ.get("SMTP_USER", "").strip()
 SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
 MAIL_TO = os.environ.get("MAIL_TO", "").strip()
 
-# ---- 目标时段（config.json 不存在且无 POSS_CONFIG 环境变量时的内置默认） ----
-# days: 0=周一 … 6=周日
-DEFAULT_TARGET_SLOTS = [
-    {"days": [1], "from": "12:30", "to": "18:00"},
-    {"days": [2, 3, 4], "from": "14:30", "to": "18:00"},
-]
+# ---- 内置默认 ----
 DEFAULT_GYMS = [
     {"name": "X123", "ctrId": "151"},
     {"name": "X202", "ctrId": "152"},
 ]
+DEFAULT_BOOKING = {
+    "enabled": True,
+    "trigger_days": [1, 3],          # 周二、周四（0=周一）
+    "trigger_time": "08:30",
+    "warmup_minutes": 6,             # 触发前多少分钟内到达就原地等待
+    "grace_minutes": 30,             # 触发后多少分钟内仍积极尝试抢
+    "lead_days": 7,                  # 抢 7 天后（下周同一天）
+    "burst_seconds": 120,            # 爆发抢位持续时长
+    "retry_interval": 3,             # 每轮间隔秒数
+    "gyms": [],                      # 空 = 按 gyms 顺序全部尝试
+    "from": "16:30",
+    "to": "17:30",
+    "search_date_format": "%Y-%m-%d",
+    "endpoint": "",                  # ⚠️ 预订提交接口（需抓包校准）
+    "params": {},                    # ⚠️ 预订表单模板（支持 {ctrId}/{date}/{startTime} 等占位符）
+    "success_keywords": ["success", "successful", "成功", "已确认"],
+}
+
+
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+# ==================== 配置 ====================
 
 
 def load_config() -> dict:
-    """配置优先级：环境变量 POSS_CONFIG（JSON 字符串）> config.json > 内置默认。"""
+    """优先级：环境变量 POSS_CONFIG（JSON）> config.json > 内置默认。"""
     raw = os.environ.get("POSS_CONFIG", "").strip()
     if raw:
         cfg = json.loads(raw)
@@ -70,7 +110,10 @@ def load_config() -> dict:
     else:
         cfg = {}
     cfg.setdefault("gyms", DEFAULT_GYMS)
-    cfg.setdefault("targets", DEFAULT_TARGET_SLOTS)
+    booking = dict(DEFAULT_BOOKING)
+    booking.update(cfg.get("booking") or {})
+    cfg["booking"] = booking
+    cfg.setdefault("fallback", {"enabled": True})
     cfg.setdefault("request", {})
     _validate_config(cfg)
     return cfg
@@ -81,7 +124,7 @@ def _validate_config(cfg: dict):
         raise ValueError(f"配置错误: {msg}")
 
     if not isinstance(cfg["gyms"], list) or not cfg["gyms"]:
-        bad("gyms 必须是非空数组，例: [{\"name\": \"X123\", \"ctrId\": \"151\"}]")
+        bad('gyms 必须是非空数组，例: [{"name": "X123", "ctrId": "151"}]')
     names = set()
     for g in cfg["gyms"]:
         if not isinstance(g, dict) or not g.get("name") or not g.get("ctrId"):
@@ -89,10 +132,30 @@ def _validate_config(cfg: dict):
         if g["name"] in names:
             bad(f"gym 名称重复: {g['name']}")
         names.add(g["name"])
-        for key in ("targets", "extra_targets"):
-            if key in g:
-                _validate_targets(g[key], where=f"gym {g['name']} 的 {key}")
-    _validate_targets(cfg["targets"], where="全局 targets")
+
+    b = cfg["booking"]
+    for d in b["trigger_days"]:
+        if not isinstance(d, int) or not 0 <= d <= 6:
+            bad(f"booking.trigger_days 取值 0-6（0=周一）: {d}")
+    if not _parse_hm(b["trigger_time"]):
+        bad(f"booking.trigger_time 必须是 HH:MM: {b['trigger_time']}")
+    if not _parse_hm(b["from"]) or not _parse_hm(b["to"]):
+        bad(f"booking.from/to 必须是 HH:MM: {b['from']}/{b['to']}")
+    if b["from"] >= b["to"]:
+        bad(f"booking 时段起点必须早于终点: {b['from']}-{b['to']}")
+    for k in ("warmup_minutes", "grace_minutes", "lead_days", "burst_seconds", "retry_interval"):
+        if not isinstance(b[k], int) or b[k] < 0:
+            bad(f"booking.{k} 必须是非负整数: {b[k]}")
+    unknown = [g for g in b["gyms"] if g not in names]
+    if unknown:
+        bad(f"booking.gyms 里有未定义的馆名: {unknown}（可选: {sorted(names)}）")
+    if b["enabled"] and not b["endpoint"]:
+        print("[warn] booking.endpoint 未配置 —— 抢位将无法执行（仅蹲守提醒）。"
+              "请抓取手动预订的提交请求后填入。")
+
+    if cfg["fallback"].get("enabled", True) and cfg["fallback"].get("targets"):
+        _validate_targets(cfg["fallback"]["targets"], where="fallback.targets")
+
     dates = cfg["request"].get("searchDates", [])
     if not isinstance(dates, list):
         bad("request.searchDates 必须是日期字符串数组")
@@ -111,23 +174,86 @@ def _validate_targets(targets, where):
             raise ValueError(f"配置错误: {where} 的 from/to 必须是 HH:MM: {t}")
 
 
-def load_env_file(path=".env"):
-    """极简 .env 加载（本地测试用；线上用 GitHub Secrets 注入环境变量）。"""
-    if not os.path.exists(path):
+def ctr_of(cfg, gym_name):
+    for g in cfg["gyms"]:
+        if g["name"] == gym_name:
+            return g["ctrId"]
+    raise ValueError(f"配置里没有馆: {gym_name}")
+
+
+def fallback_targets(cfg):
+    """蹲守目标时段：显式配置优先，否则由 booking 派生（触发日 + 抢位时段）。"""
+    fb = cfg["fallback"]
+    if fb.get("targets"):
+        return fb["targets"]
+    b = cfg["booking"]
+    return [{"days": list(b["trigger_days"]), "from": b["from"], "to": b["to"]}]
+
+
+# ==================== 时间 ====================
+
+
+def hk_now() -> datetime:
+    fake = os.environ.get("POSS_FAKE_NOW")
+    if fake:
+        return datetime.strptime(fake, "%Y-%m-%dT%H:%M").replace(tzinfo=TZ)
+    return datetime.now(TZ)
+
+
+def _parse_hm(s):
+    s = str(s).strip()
+    for fmt in ("%H:%M:%S", "%H:%M", "%H%M"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%H:%M")
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_date(s):
+    s = str(s).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def hm_to_min(hm: str) -> int:
+    h, m = hm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def booking_phase(cfg, now: datetime) -> str:
+    """'pre'=预热等待 / 'open'=窗口内应抢 / 'closed'=不抢。"""
+    b = cfg["booking"]
+    if not b["enabled"] or now.weekday() not in b["trigger_days"]:
+        return "closed"
+    now_m = now.hour * 60 + now.minute
+    t0 = hm_to_min(b["trigger_time"])
+    if t0 <= now_m <= t0 + b["grace_minutes"]:
+        return "open"
+    if t0 - b["warmup_minutes"] <= now_m < t0:
+        return "pre"
+    return "closed"
+
+
+def wait_until_trigger(cfg):
+    """原地等到触发时刻（测试环境 POSS_FAKE_NOW 时直接跳过）。"""
+    if os.environ.get("POSS_FAKE_NOW"):
         return
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
+    b = cfg["booking"]
+    h, m = (int(x) for x in b["trigger_time"].split(":"))
+    target = hk_now().replace(hour=h, minute=m, second=0, microsecond=0)
+    while hk_now() < target:
+        time.sleep(1)
+    print(f"[booking] 已到触发时刻 {b['trigger_time']}")
 
 
 # ==================== 解析 timetable.json ====================
-# ⚠️ 结构未知（会话过期没能拿到样本）。以下为启发式解析：
-#    深度遍历 JSON，收集「像时段」的 dict（同时含日期键 + 时间键 + 数量键）。
-#    --dump 校准拿到真实结构后，这一段要替换成精确解析。⚠️
+# ⚠️ 结构未校准：深度遍历 JSON，收集「像时段」的 dict（日期键 + 时间键 + 数量键）。
+#    拿到真实样本（--dump）后替换为精确解析。⚠️
 
 DATE_KEYS = ["bookdate", "bookingdate", "date", "daydate", "slotdate", "startdate"]
 START_KEYS = ["starttime", "start", "booktime", "timefrom", "from", "bookstart"]
@@ -143,7 +269,7 @@ class ParseNeedsCalibration(Exception):
 
 
 def parse_timetable(data) -> list:
-    """返回 [{date:'YYYY-MM-DD', start:'HH:MM', end:'HH:MM', left:int, raw:...}]"""
+    """返回 [{date, start, end, left, raw}]"""
     found = []
 
     def walk(node):
@@ -151,11 +277,12 @@ def parse_timetable(data) -> list:
             date_v = _pick(node, DATE_KEYS)
             start_v = _pick(node, START_KEYS)
             if date_v and start_v:
-                end_v = _pick(node, END_KEYS) or ""
-                left = _pick_int(node, LEFT_HINTS)
                 found.append({
-                    "date": str(date_v), "start": str(start_v),
-                    "end": str(end_v), "left": left, "raw": node,
+                    "date": str(date_v),
+                    "start": str(start_v),
+                    "end": str(_pick(node, END_KEYS) or ""),
+                    "left": _pick_int(node, LEFT_HINTS),
+                    "raw": node,
                 })
             for item in node.values():
                 walk(item)
@@ -186,42 +313,20 @@ def _pick_int(d: dict, hints):
     return None
 
 
-# ==================== 时段过滤 ====================
-
-
-def _parse_hm(s):
-    s = str(s).strip()
-    for fmt in ("%H:%M:%S", "%H:%M", "%H%M"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%H:%M")
-        except ValueError:
-            continue
-    return None
-
-
-def _parse_date(s):
-    s = str(s).strip()
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
 def slot_matches_target(slot, targets) -> bool:
-    """时段与任一目标窗口有交集（按香港时区的星期几 + HH:MM）。"""
+    """时段与任一目标窗口有交集（按星期几 + HH:MM）。"""
     d = _parse_date(slot["date"])
     st = _parse_hm(slot["start"])
     if not d or not st:
         return False
     et = _parse_hm(slot["end"]) if slot.get("end") else None
-    slot_start = st
-    slot_end = et or st  # 没有结束时间就按点处理
     for t in targets:
         if d.weekday() not in t["days"]:
             continue
-        if slot_start < t["to"] and (slot_end > t["from"] if slot_end != slot_start else slot_start >= t["from"]):
+        if et:
+            if st < t["to"] and et > t["from"]:
+                return True
+        elif t["from"] <= st < t["to"]:
             return True
     return False
 
@@ -289,6 +394,8 @@ def notify_all(title, content):
         notify_serverchan(title, content)
     if notify_email(title, content):
         channels += 1
+    if channels == 0:
+        print("[warn] 没有任何通知渠道可用（消息仅打印在日志）")
     return channels
 
 
@@ -302,12 +409,189 @@ def load_state() -> dict:
                 return json.load(f)
         except (OSError, json.JSONDecodeError):
             pass
-    return {"slots": {}}
+    return {"slots": {}, "booked": {}}
 
 
 def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ==================== 抢位引擎 ====================
+
+
+def safe_format(template: str, ctx: dict) -> str:
+    """占位符替换；未知占位符原样保留（便于发现配置写错）。"""
+    out = template
+    for k, v in ctx.items():
+        out = out.replace("{" + k + "}", str(v))
+    return out
+
+
+def build_booking_payload(slot, cfg, gym_name, ctr_id, target_date) -> dict:
+    """按 config.booking.params 模板 + 时段上下文组装提交表单。"""
+    b = cfg["booking"]
+    ctx = {
+        "gym": gym_name,
+        "ctrId": str(ctr_id),
+        "date": slot["date"],
+        "startDate": slot["date"],
+        "startTime": slot["start"],
+        "endTime": slot["end"],
+        "searchDate": target_date.strftime(b["search_date_format"]),
+    }
+    for k, v in (slot.get("raw") or {}).items():
+        if isinstance(v, (str, int, float)):
+            ctx.setdefault(str(k), str(v))
+    return {
+        k: (safe_format(v, ctx) if isinstance(v, str) else v)
+        for k, v in (b.get("params") or {}).items()
+    }
+
+
+def pick_best(slots, b):
+    """优先精确命中起点（如 16:30），否则取最早开始的。"""
+    exact = [s for s in slots if _parse_hm(s["start"]) == b["from"]]
+    pool = exact or slots
+    return sorted(pool, key=lambda s: (_parse_date(s["date"]), _parse_hm(s["start"]) or ""))[0]
+
+
+def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
+    """爆发式抢位。返回是否抢到。"""
+    b = cfg["booking"]
+    today_key = now.date().isoformat()
+    booked = state.setdefault("booked", {})
+    if today_key in booked:
+        print(f"[booking] {today_key} 已抢到，跳过（防重复扣费）")
+        return True
+    if not b["endpoint"]:
+        raise BookingNotCalibrated("booking.endpoint 未配置")
+
+    gym_names = b["gyms"] or [g["name"] for g in cfg["gyms"]]
+    target = now.date() + timedelta(days=b["lead_days"])
+    date_str = target.strftime(b["search_date_format"])
+    window = [{"days": [target.weekday()], "from": b["from"], "to": b["to"]}]
+    print(f"[booking] 目标：{date_str}（周{'一二三四五六日'[target.weekday()]}）"
+          f" {b['from']}-{b['to']}，馆顺序 {gym_names}")
+
+    deadline = time.time() + (0 if dry_book else b["burst_seconds"])
+    attempts = 0
+    while True:
+        attempts += 1
+        for gym_name in gym_names:
+            ctr = ctr_of(cfg, gym_name)
+            try:
+                raw = client.timetable(ctr, date_str, params=cfg["request"])
+            except SessionExpired:
+                print("[booking] 查询时会话失效 → 重新登录")
+                client.login()
+                client.save_session(SESSION_FILE)
+                continue
+            cands = [s for s in parse_timetable(raw)
+                     if slot_matches_target(s, window) and (s["left"] or 0) > 0]
+            if not cands:
+                continue
+            best = pick_best(cands, b)
+            payload = build_booking_payload(best, cfg, gym_name, ctr, target)
+            if dry_book:
+                print(f"[dry-book] 候选: {gym_name} {best['date']} {best['start']}-{best['end']} "
+                      f"(剩 {best['left']})")
+                print(f"[dry-book] 将提交到: {b['endpoint'] or '(未配置 endpoint)'}")
+                print(f"[dry-book] 表单: {json.dumps(payload, ensure_ascii=False)}")
+                return False
+            try:
+                res = client.book(payload, endpoint=b["endpoint"],
+                                  success_keywords=b["success_keywords"])
+            except SessionExpired as e:
+                print(f"[booking] 提交时会话失效: {e} → 重新登录")
+                client.login()
+                continue
+            print(f"[booking] 第 {attempts} 轮 {gym_name} {best['start']}: {res.message}")
+            if res.ok:
+                booked[today_key] = {
+                    "gym": gym_name, "date": best["date"], "start": best["start"],
+                    "end": best["end"], "at": int(time.time()),
+                }
+                save_state(state)
+                notify_all(
+                    "🎉 POSS 抢到了！",
+                    f"{gym_name} {best['date']} {best['start']}–{best['end']}\n"
+                    f"请登录 POSS 确认预订状态与押金扣除。\n"
+                    f"（{now.strftime('%m-%d %H:%M')} 自动抢位）",
+                )
+                return True
+        if dry_book or time.time() >= deadline:
+            break
+        time.sleep(b["retry_interval"])
+    print(f"[booking] 爆发 {attempts} 轮未抢到")
+    return False
+
+
+# ==================== 蹲守提醒 ====================
+
+
+def fetch_timetables(client, cfg):
+    dates = cfg["request"].get("searchDates") or [""]
+
+    def _grab():
+        return {g["name"]: [client.timetable(g["ctrId"], d, params=cfg["request"]) for d in dates]
+                for g in cfg["gyms"]}
+
+    if client.load_session(SESSION_FILE):
+        try:
+            return _grab()
+        except SessionExpired:
+            pass
+    client.login()
+    client.save_session(SESSION_FILE)
+    return _grab()
+
+
+def monitor_fallback(client, cfg, now, args):
+    targets = fallback_targets(cfg)
+    data = fetch_timetables(client, cfg)
+
+    state = load_state()
+    slots = state.setdefault("slots", {})
+    open_slots = []
+    for gym in cfg["gyms"]:
+        for raw in data[gym["name"]]:
+            for s in parse_timetable(raw):
+                if not slot_matches_target(s, targets) or (s["left"] or 0) <= 0:
+                    continue
+                open_slots.append({
+                    "key": f"{gym['name']}|{s['date']}|{s['start']}",
+                    "gym": gym["name"],
+                    **{k: s[k] for k in ("date", "start", "end", "left")},
+                })
+
+    now_ts = int(time.time())
+    to_alert = []
+    for s in open_slots:
+        prev = slots.get(s["key"], {})
+        if prev.get("left", 0) <= 0 or now_ts - prev.get("last_notified", 0) > RENOTIFY_AFTER:
+            to_alert.append(s)
+
+    if to_alert:
+        lines = [f"🔥 {s['gym']} {s['date']} {s['start']}–{s['end'] or '?'}：剩 {s['left']} 个名额"
+                 for s in sorted(to_alert, key=lambda x: (x["date"], x["start"]))]
+        content = "\n".join(lines) + f"\n\n抢位入口：{POSS_BOOK_URL}\n" \
+                                     f"（{now.strftime('%m-%d %H:%M')} 抓到，手速就是一切）"
+        print(f"发现空位！\n{content}")
+        if not args.no_notify:
+            notify_all("🏀 POSS 有空位啦，快抢！", content)
+    else:
+        print(f"[{now.strftime('%m-%d %H:%M')}] 目标时段暂无空位，继续蹲……")
+
+    for key in list(slots):
+        if not any(s["key"] == key for s in open_slots):
+            slots[key]["left"] = 0
+    for s in open_slots:
+        e = slots.setdefault(s["key"], {})
+        e["left"] = s["left"]
+        if any(t["key"] == s["key"] for t in to_alert):
+            e["last_notified"] = now_ts
+    save_state(state)
 
 
 # ==================== 主流程 ====================
@@ -320,128 +604,81 @@ def build_client():
     return PossClient(netid, password, fb_user_id)
 
 
-def fetch_all(client, cfg) -> dict:
-    """抓所有配置馆的时间表。返回 {馆名: [各 searchDate 的响应,...]}。会话失效自动登录一次。"""
-    dates = cfg["request"].get("searchDates") or [""]
-
-    def _grab():
-        out = {}
-        for gym in cfg["gyms"]:
-            out[gym["name"]] = [
-                client.timetable(gym["ctrId"], d, params=cfg["request"]) for d in dates
-            ]
-        return out
-
-    if client.load_session(SESSION_FILE):
-        try:
-            print("[session] 复用缓存会话")
-            return _grab()
-        except SessionExpired:
-            print("[session] 缓存会话已失效 → 重新登录")
-
-    client.login()
-    client.save_session(SESSION_FILE)
-    print("[session] 登录成功，会话已缓存")
-    return _grab()
-
-
-def gym_targets(gym: dict, global_targets: list) -> list:
-    """馆级时段规则：
-       - 未配任何 targets/extra_targets → 用全局
-       - 配了 targets → 覆盖全局
-       - 配了 extra_targets → 全局 + 追加
-    """
-    base = gym["targets"] if "targets" in gym else global_targets
-    return list(base) + list(gym.get("extra_targets", []))
-
-
 def run(args):
     cfg = load_config()
-    now = int(time.time())
-    now_str = datetime.now(TZ).strftime("%m-%d %H:%M")
-
+    now = hk_now()
     client = build_client()
-    data = fetch_all(client, cfg)
-    dates = cfg["request"].get("searchDates") or [""]
 
-    # ---- 校准模式：原样落盘，不解析不推送 ----
+    # ---- 校准模式 ----
     if args.dump:
+        fetch_timetables(client, cfg)  # 登录 + 建会话
         os.makedirs(DUMP_DIR, exist_ok=True)
-        for gym_name, responses in data.items():
-            safe = re.sub(r"[^\w-]", "_", gym_name)
-            for i, raw in enumerate(responses):
-                suffix = "" if dates[i] == "" else f"@{dates[i]}"
+        dates = cfg["request"].get("searchDates") or [""]
+        for gym in cfg["gyms"]:
+            safe = re.sub(r"[^\w-]", "_", gym["name"])
+            for d in dates:
+                raw = client.timetable(gym["ctrId"], d, params=cfg["request"])
+                suffix = "" if d == "" else f"@{d}"
                 p = os.path.join(DUMP_DIR, f"timetable_{safe}{suffix}.json")
                 with open(p, "w", encoding="utf-8") as f:
                     json.dump(raw, f, ensure_ascii=False, indent=2)
                 print(f"[dump] {p}")
-        # 顺带把预订页也存一份（看时段/日期字段的呈现方式）
-        r = client.s.get("https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/make_book.do", timeout=30)
+        r = client.s.get(POSS_BOOK_URL, timeout=30)
         with open(os.path.join(DUMP_DIR, "make_book.html"), "w", encoding="utf-8") as f:
             f.write(r.text)
         print(f"[dump] {DUMP_DIR}/make_book.html ({len(r.text)} bytes)")
-        # 结构速览
-        for gym_name, responses in data.items():
-            for raw in responses:
-                head = list(raw.keys()) if isinstance(raw, dict) else "N/A"
-                print(f"[dump] {gym_name} 顶层类型: {type(raw).__name__}, 键: {head}")
         return
 
-    # ---- 正常监控 ----
-    state = load_state()
-    slots = state.setdefault("slots", {})
+    # ---- 抢位 ----
+    phase = booking_phase(cfg, now)
+    if phase != "closed":
+        if phase == "pre":
+            print(f"[booking] 预热：等待至 {cfg['booking']['trigger_time']}")
+            wait_until_trigger(cfg)
+            now = hk_now()
+        state = load_state()
+        try:
+            got = attempt_booking(client, cfg, state, now, dry_book=args.dry_book)
+            if not got and not args.dry_book:
+                _booking_failed_alert(cfg, state, now, args)
+        except BookingNotCalibrated as e:
+            print(f"[booking] 无法抢位：{e}")
+            if not args.no_notify:
+                notify_all("⚠️ POSS 抢位尚未校准", f"{e}\n\n本次仅执行蹲守提醒。")
+    elif args.dry_book:
+        print("[dry-book] 当前不在抢位窗口，仍演示抢位流程（查询 + 打印表单）")
+        try:
+            attempt_booking(client, cfg, load_state(), now, dry_book=True)
+        except BookingNotCalibrated as e:
+            print(f"[dry-book] {e}")
 
-    # 解析 + 过滤出目标时段内、有名额的场次（馆级规则优先，详见 gym_targets）
-    open_slots = []  # [{key, gym, date, start, end, left}]
-    for gym in cfg["gyms"]:
-        targets = gym_targets(gym, cfg["targets"])
-        for raw in data[gym["name"]]:
-            for s in parse_timetable(raw):
-                if not slot_matches_target(s, targets):
-                    continue
-                if s["left"] is None or s["left"] <= 0:
-                    continue
-                key = f"{gym['name']}|{s['date']}|{s['start']}"
-                open_slots.append({"key": key, "gym": gym["name"],
-                                   **{k: s[k] for k in ("date", "start", "end", "left")}})
+    # ---- 蹲守提醒 ----
+    if cfg["fallback"].get("enabled", True):
+        monitor_fallback(client, cfg, now, args)
 
-    # 对比上次状态 → 找出需要提醒的（新空位 或 超过重提醒间隔的持续空位）
-    to_alert = []
-    for s in open_slots:
-        prev = slots.get(s["key"], {})
-        was_full = prev.get("left", 0) <= 0
-        renotify = now - prev.get("last_notified", 0) > RENOTIFY_AFTER
-        if was_full or renotify:
-            to_alert.append(s)
 
-    if to_alert:
-        lines = [f"🔥 {s['gym']} {s['date']} {s['start']}–{s['end'] or '?'}：剩 {s['left']} 个名额"
-                 for s in sorted(to_alert, key=lambda x: (x["date"], x["start"]))]
-        content = "\n".join(lines) + f"\n\n抢位入口：{POSS_BOOK_URL}\n（{now_str} 抓到，手速就是一切）"
-        print(f"发现空位！\n{content}")
-        if not args.no_notify:
-            n = notify_all("🏀 POSS 有空位啦，快抢！", content)
-            if n == 0:
-                print("[FATAL] 检测到空位但没有任何通知渠道可用！")
-    else:
-        print(f"[{now_str}] 目标时段全满，继续蹲……（全周有名额场次：{len(open_slots)}）")
-
-    # 更新状态
-    for key in list(slots):
-        if not any(s["key"] == key for s in open_slots):
-            slots[key]["left"] = 0
-    for s in open_slots:
-        e = slots.setdefault(s["key"], {})
-        e["left"] = s["left"]
-        if any(t["key"] == s["key"] for t in to_alert):
-            e["last_notified"] = now
+def _booking_failed_alert(cfg, state, now, args):
+    """「没抢到」提醒：每个触发日只推一次。"""
+    key = now.date().isoformat()
+    if state.get("booking_failed_notified") == key:
+        return
+    state["booking_failed_notified"] = key
     save_state(state)
+    b = cfg["booking"]
+    target = (now.date() + timedelta(days=b["lead_days"])).isoformat()
+    if not args.no_notify:
+        notify_all(
+            "😤 POSS 没抢到，转入蹲守",
+            f"目标：{target} {b['from']}-{b['to']}（{'/'.join(b['gyms']) or '全部馆'}）\n"
+            f"已转入蹲守模式：有人取消放出空位会立即提醒你。",
+        )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="POSS 蹲位器")
-    parser.add_argument("--dump", action="store_true", help="校准模式：抓原始数据存 dumps/，不推送")
-    parser.add_argument("--no-notify", action="store_true", help="监控但不发送通知")
+    parser = argparse.ArgumentParser(description="POSS 抢位器 / 蹲位器")
+    parser.add_argument("--dump", action="store_true", help="校准模式：抓原始数据存 dumps/")
+    parser.add_argument("--dry-book", action="store_true", help="演练抢位并打印表单，不真提交")
+    parser.add_argument("--no-notify", action="store_true", help="不发通知（测试用）")
     args = parser.parse_args()
 
     load_env_file()
@@ -450,30 +687,33 @@ def main():
         run(args)
     except LoginFailed as e:
         print(f"[FATAL] 登录失败: {e}")
-        _fail_alert(f"POSS 蹲位器登录失败: {e}", args)
+        _fail_alert(f"POSS 登录失败: {e}", args)
         sys.exit(1)
     except (SessionExpired, ParseNeedsCalibration) as e:
         print(f"[FATAL] {e}")
-        _fail_alert(f"POSS 蹲位器失明: {e}", args)
+        _fail_alert(f"POSS 监控失明: {e}", args)
+        sys.exit(1)
+    except ValueError as e:  # 配置错误
+        print(f"[FATAL] {e}")
+        _fail_alert(f"POSS 配置错误: {e}", args)
         sys.exit(1)
     except Exception as e:  # noqa: BLE001
         print(f"[FATAL] 未知错误: {type(e).__name__}: {e}")
-        _fail_alert(f"POSS 蹲位器未知错误: {type(e).__name__}: {e}", args)
+        _fail_alert(f"POSS 未知错误: {type(e).__name__}: {e}", args)
         sys.exit(1)
 
 
 def _fail_alert(msg, args):
-    """监控挂了的警报，限频推送（凭证错时避免每 5 分钟轰炸）。"""
     if args.no_notify:
         return
     state = load_state()
-    now = int(time.time())
-    if now - state.get("last_fail_alert", 0) < FAIL_ALERT_INTERVAL:
+    now_ts = int(time.time())
+    if now_ts - state.get("last_fail_alert", 0) < FAIL_ALERT_INTERVAL:
         print("[fail-alert] 距上次警报太近，跳过")
         return
-    state["last_fail_alert"] = now
+    state["last_fail_alert"] = now_ts
     save_state(state)
-    notify_all("🚨 POSS 蹲位器失明了", msg + "\n\n请检查 GitHub Secrets / 账号状态。")
+    notify_all("🚨 POSS 蹲位器失明了", msg + "\n\n请检查 GitHub Secrets / 账号状态 / 配置。")
 
 
 if __name__ == "__main__":
