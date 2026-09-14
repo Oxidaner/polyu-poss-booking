@@ -25,13 +25,21 @@ LOGIN_POST = f"{BASE}/poss/j_security_check"
 MAKE_BOOK = f"{BASE}/starspossfbstud/secure/ui_make_book/make_book.do"
 TIMETABLE = f"{BASE}/starspossfbstud/secure/ui_make_book/timetable.json"
 
-# 两馆的 ctrId
-GYMS = {"X123": "151", "X202": "152"}
-
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 )
+
+# timetable.json 请求体的默认参数（可被 config.json 的 request 段覆盖）
+DEFAULT_BODY = {
+    "bookType": "INDV",
+    "dataSetId": "18",
+    "actvId": "101",
+    "facilityId": "",
+    "showCourtAreaDetails": "true",
+}
+# 允许从配置覆盖的键（白名单，防止配置注入无关参数）
+OVERRIDABLE = set(DEFAULT_BODY)
 
 UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
@@ -110,23 +118,27 @@ class PossClient:
 
     # ---------- 时间表 ----------
 
-    def timetable(self, ctr_id: str, search_date: str = ""):
-        """④ POST timetable.json，返回原始 JSON。会话失效抛 SessionExpired。"""
+    def timetable(self, ctr_id: str, search_date: str = "", params: dict | None = None):
+        """④ POST timetable.json，返回原始 JSON。会话失效抛 SessionExpired。
+
+        ctr_id / search_date 必填逻辑在这；其余 body 参数可用 params 覆盖默认值
+        （来自 config.json 的 request 段，见 DEFAULT_BODY / OVERRIDABLE）。
+        """
         if not self.api_csrf:
             raise SessionExpired("尚未登录（无接口 CSRFToken）")
+        body = dict(DEFAULT_BODY)
+        for k in OVERRIDABLE:
+            if params and k in params and params[k] is not None:
+                body[k] = str(params[k])
+        body.update({
+            "CSRFToken": self.api_csrf,
+            "fbUserId": self.fb_user_id,
+            "searchDate": search_date,
+            "ctrId": str(ctr_id),
+        })
         r = self.s.post(
             f"{TIMETABLE}?CSRFToken={self.api_csrf}",
-            data={
-                "CSRFToken": self.api_csrf,
-                "fbUserId": self.fb_user_id,
-                "bookType": "INDV",
-                "dataSetId": "18",
-                "actvId": "101",
-                "searchDate": search_date,
-                "ctrId": str(ctr_id),
-                "facilityId": "",
-                "showCourtAreaDetails": "true",
-            },
+            data=body,
             headers={
                 "X-Requested-With": "XMLHttpRequest",
                 "Referer": MAKE_BOOK,

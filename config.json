@@ -1,0 +1,18 @@
+{
+  "gyms": [
+    {"name": "X123", "ctrId": "151"},
+    {"name": "X202", "ctrId": "152"}
+  ],
+  "targets": [
+    {"days": [1], "from": "12:30", "to": "18:00"},
+    {"days": [2, 3, 4], "from": "14:30", "to": "18:00"}
+  ],
+  "request": {
+    "bookType": "INDV",
+    "dataSetId": "18",
+    "actvId": "101",
+    "facilityId": "",
+    "showCourtAreaDetails": "true",
+    "searchDates": []
+  }
+}

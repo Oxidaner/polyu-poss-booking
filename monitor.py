@@ -14,6 +14,7 @@ poss_client 自动登录 → 抓两馆 timetable.json → 解析时段 → 过�
 import argparse
 import json
 import os
+import re
 import smtplib
 import sys
 import time
@@ -21,13 +22,14 @@ from datetime import datetime, timedelta, timezone
 from email.header import Header
 from email.mime.text import MIMEText
 
-from poss_client import GYMS, LoginFailed, PossClient, SessionExpired
+from poss_client import LoginFailed, PossClient, SessionExpired
 
 TZ = timezone(timedelta(hours=8))
 
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 SESSION_FILE = os.environ.get("SESSION_FILE", "session.json")
 DUMP_DIR = os.environ.get("DUMP_DIR", "dumps")
+CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
 
 POSS_BOOK_URL = "https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/make_book.do"
 
@@ -45,19 +47,68 @@ SMTP_USER = os.environ.get("SMTP_USER", "").strip()
 SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
 MAIL_TO = os.environ.get("MAIL_TO", "").strip()
 
-# ---- 目标时段：周二 12:30–18:00；周三/四/五 14:30–18:00 ----
-# days: 0=周一 … 6=周日；可用环境变量 TARGET_SLOTS 覆盖（JSON 数组，同结构）
+# ---- 目标时段（config.json 不存在且无 POSS_CONFIG 环境变量时的内置默认） ----
+# days: 0=周一 … 6=周日
 DEFAULT_TARGET_SLOTS = [
     {"days": [1], "from": "12:30", "to": "18:00"},
     {"days": [2, 3, 4], "from": "14:30", "to": "18:00"},
 ]
+DEFAULT_GYMS = [
+    {"name": "X123", "ctrId": "151"},
+    {"name": "X202", "ctrId": "152"},
+]
 
 
-def load_target_slots():
-    raw = os.environ.get("TARGET_SLOTS", "").strip()
+def load_config() -> dict:
+    """配置优先级：环境变量 POSS_CONFIG（JSON 字符串）> config.json > 内置默认。"""
+    raw = os.environ.get("POSS_CONFIG", "").strip()
     if raw:
-        return json.loads(raw)
-    return DEFAULT_TARGET_SLOTS
+        cfg = json.loads(raw)
+    elif os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    else:
+        cfg = {}
+    cfg.setdefault("gyms", DEFAULT_GYMS)
+    cfg.setdefault("targets", DEFAULT_TARGET_SLOTS)
+    cfg.setdefault("request", {})
+    _validate_config(cfg)
+    return cfg
+
+
+def _validate_config(cfg: dict):
+    def bad(msg):
+        raise ValueError(f"配置错误: {msg}")
+
+    if not isinstance(cfg["gyms"], list) or not cfg["gyms"]:
+        bad("gyms 必须是非空数组，例: [{\"name\": \"X123\", \"ctrId\": \"151\"}]")
+    names = set()
+    for g in cfg["gyms"]:
+        if not isinstance(g, dict) or not g.get("name") or not g.get("ctrId"):
+            bad(f"每个 gym 需要 name 和 ctrId: {g}")
+        if g["name"] in names:
+            bad(f"gym 名称重复: {g['name']}")
+        names.add(g["name"])
+        for key in ("targets", "extra_targets"):
+            if key in g:
+                _validate_targets(g[key], where=f"gym {g['name']} 的 {key}")
+    _validate_targets(cfg["targets"], where="全局 targets")
+    dates = cfg["request"].get("searchDates", [])
+    if not isinstance(dates, list):
+        bad("request.searchDates 必须是日期字符串数组")
+
+
+def _validate_targets(targets, where):
+    if not isinstance(targets, list) or not targets:
+        raise ValueError(f"配置错误: {where} 必须是非空数组")
+    for t in targets:
+        if not isinstance(t, dict) or not {"days", "from", "to"} <= set(t):
+            raise ValueError(f"配置错误: {where} 每项需要 days/from/to: {t}")
+        for d in t["days"]:
+            if not isinstance(d, int) or not 0 <= d <= 6:
+                raise ValueError(f"配置错误: {where} 的 days 取值 0-6（0=周一）: {t}")
+        if not _parse_hm(t["from"]) or not _parse_hm(t["to"]):
+            raise ValueError(f"配置错误: {where} 的 from/to 必须是 HH:MM: {t}")
 
 
 def load_env_file(path=".env"):
@@ -269,10 +320,17 @@ def build_client():
     return PossClient(netid, password, fb_user_id)
 
 
-def fetch_all(client) -> dict:
-    """抓两馆时间表。会话失效自动登录一次。"""
+def fetch_all(client, cfg) -> dict:
+    """抓所有配置馆的时间表。返回 {馆名: [各 searchDate 的响应,...]}。会话失效自动登录一次。"""
+    dates = cfg["request"].get("searchDates") or [""]
+
     def _grab():
-        return {gym: client.timetable(ctr) for gym, ctr in GYMS.items()}
+        out = {}
+        for gym in cfg["gyms"]:
+            out[gym["name"]] = [
+                client.timetable(gym["ctrId"], d, params=cfg["request"]) for d in dates
+            ]
+        return out
 
     if client.load_session(SESSION_FILE):
         try:
@@ -287,47 +345,65 @@ def fetch_all(client) -> dict:
     return _grab()
 
 
+def gym_targets(gym: dict, global_targets: list) -> list:
+    """馆级时段规则：
+       - 未配任何 targets/extra_targets → 用全局
+       - 配了 targets → 覆盖全局
+       - 配了 extra_targets → 全局 + 追加
+    """
+    base = gym["targets"] if "targets" in gym else global_targets
+    return list(base) + list(gym.get("extra_targets", []))
+
+
 def run(args):
-    targets = load_target_slots()
+    cfg = load_config()
     now = int(time.time())
     now_str = datetime.now(TZ).strftime("%m-%d %H:%M")
 
     client = build_client()
-    data = fetch_all(client)
+    data = fetch_all(client, cfg)
+    dates = cfg["request"].get("searchDates") or [""]
 
     # ---- 校准模式：原样落盘，不解析不推送 ----
     if args.dump:
         os.makedirs(DUMP_DIR, exist_ok=True)
-        for gym, raw in data.items():
-            p = os.path.join(DUMP_DIR, f"timetable_{gym}.json")
-            with open(p, "w", encoding="utf-8") as f:
-                json.dump(raw, f, ensure_ascii=False, indent=2)
-            print(f"[dump] {p}")
+        for gym_name, responses in data.items():
+            safe = re.sub(r"[^\w-]", "_", gym_name)
+            for i, raw in enumerate(responses):
+                suffix = "" if dates[i] == "" else f"@{dates[i]}"
+                p = os.path.join(DUMP_DIR, f"timetable_{safe}{suffix}.json")
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(raw, f, ensure_ascii=False, indent=2)
+                print(f"[dump] {p}")
         # 顺带把预订页也存一份（看时段/日期字段的呈现方式）
         r = client.s.get("https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/make_book.do", timeout=30)
         with open(os.path.join(DUMP_DIR, "make_book.html"), "w", encoding="utf-8") as f:
             f.write(r.text)
         print(f"[dump] {DUMP_DIR}/make_book.html ({len(r.text)} bytes)")
         # 结构速览
-        for gym, raw in data.items():
-            print(f"[dump] {gym} 顶层类型: {type(raw).__name__}, "
-                  f"键: {list(raw.keys()) if isinstance(raw, dict) else 'N/A'}")
+        for gym_name, responses in data.items():
+            for raw in responses:
+                head = list(raw.keys()) if isinstance(raw, dict) else "N/A"
+                print(f"[dump] {gym_name} 顶层类型: {type(raw).__name__}, 键: {head}")
         return
 
     # ---- 正常监控 ----
     state = load_state()
     slots = state.setdefault("slots", {})
 
-    # 解析 + 过滤出目标时段内、有名额的场次
+    # 解析 + 过滤出目标时段内、有名额的场次（馆级规则优先，详见 gym_targets）
     open_slots = []  # [{key, gym, date, start, end, left}]
-    for gym, raw in data.items():
-        for s in parse_timetable(raw):
-            if not slot_matches_target(s, targets):
-                continue
-            if s["left"] is None or s["left"] <= 0:
-                continue
-            key = f"{gym}|{s['date']}|{s['start']}"
-            open_slots.append({"key": key, "gym": gym, **{k: s[k] for k in ("date", "start", "end", "left")}})
+    for gym in cfg["gyms"]:
+        targets = gym_targets(gym, cfg["targets"])
+        for raw in data[gym["name"]]:
+            for s in parse_timetable(raw):
+                if not slot_matches_target(s, targets):
+                    continue
+                if s["left"] is None or s["left"] <= 0:
+                    continue
+                key = f"{gym['name']}|{s['date']}|{s['start']}"
+                open_slots.append({"key": key, "gym": gym["name"],
+                                   **{k: s[k] for k in ("date", "start", "end", "left")}})
 
     # 对比上次状态 → 找出需要提醒的（新空位 或 超过重提醒间隔的持续空位）
     to_alert = []

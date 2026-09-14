@@ -11,11 +11,52 @@
 
 | 文件 | 作用 |
 |---|---|
+| `config.json` | **馆列表 + 目标时段 + 请求参数**（全部可配，改这里就行） |
 | `poss_client.py` | 自动登录 + 抓 timetable.json（会话缓存复用） |
 | `monitor.py` | 主程序：解析/过滤/去重/推送；`--dump` 校准模式 |
 | `.github/workflows/monitor.yml` | GitHub Actions 定时任务 |
 | `state.json` / `session.json` | 运行状态与会话缓存（由 Actions 自动回写） |
 | `dumps/` | 校准数据（本地调试用，已 gitignore） |
+
+## 配置说明（config.json）
+
+```json
+{
+  "gyms": [
+    {"name": "X123", "ctrId": "151"},
+    {"name": "X202", "ctrId": "152", "extra_targets": [{"days": [4], "from": "08:00", "to": "12:00"}]},
+    {"name": "X999", "ctrId": "999", "targets": [{"days": [0, 6], "from": "20:00", "to": "22:00"}]}
+  ],
+  "targets": [
+    {"days": [1], "from": "12:30", "to": "18:00"},
+    {"days": [2, 3, 4], "from": "14:30", "to": "18:00"}
+  ],
+  "request": {
+    "bookType": "INDV",
+    "dataSetId": "18",
+    "actvId": "101",
+    "facilityId": "",
+    "showCourtAreaDetails": "true",
+    "searchDates": []
+  }
+}
+```
+
+- **`gyms`**：想盯几个馆就加几条。`ctrId` 是 POSS 的场馆编号（X123=151、X202=152），
+  `name` 只用于提醒消息和状态记录，随便起但不能重复。
+- **`targets`**（全局）：所有馆默认盯的时段。`days` 里 `0`=周一 … `6`=周日；
+  `from`/`to` 是 `HH:MM`；只要时段与窗口**有交集**就算命中。
+- **馆级时段规则**（可选，三选一）：
+  - 什么都不配 → 用全局 `targets`
+  - `extra_targets` → **全局 + 追加**（例：X202 既盯全局时段，又多盯周五上午）
+  - `targets` → **覆盖全局**（例：X999 只盯周末晚上，不看全局）
+- **`request`**：timetable.json 的请求参数（换运动项目就改 `actvId`）。
+  `searchDates` 留空数组表示用系统默认视图；填日期数组（如 `["2026-09-15"]`）
+  则按日期逐个查询。
+- **环境变量 `POSS_CONFIG`** 可以传整个 JSON 字符串，优先级高于 `config.json`
+  （适合在 GitHub Variables 里在线改配置而不用改文件）。
+
+
 
 ## 第一步：本地校准（必做一次）
 
@@ -58,7 +99,7 @@
    | `MAIL_TO` | 收件邮箱 |
 
    可选 **Variables**（非敏感）：`POSS_FB_USER_ID`（默认 657032）、
-   `TARGET_SLOTS`（自定义目标时段 JSON，默认周二 12:30-18:00 + 周三四五 14:30-18:00）
+   `POSS_CONFIG`（装上面那段 JSON，可在线覆盖 `config.json`）
 
 3. Actions 页启用 workflow，点 **Run workflow** 手动跑一次验证
 4. 收到第一条推送 = 上线成功
