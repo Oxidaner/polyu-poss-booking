@@ -1,0 +1,57 @@
+name: POSS Slot Monitor
+
+on:
+  schedule:
+    # 每 5 分钟轮询一次（GitHub 实际执行可能有 1~3 分钟延迟，属正常现象）
+    - cron: "*/5 * * * *"
+  workflow_dispatch: # 允许手动触发，方便测试
+
+permissions:
+  contents: write # 需要写权限把 state.json 推回仓库做状态记录
+
+concurrency:
+  group: poss-monitor
+  cancel-in-progress: false # 上一次还没跑完不重叠执行，排队即可
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          POSS_API_URL: ${{ secrets.POSS_API_URL }}
+          POSS_HEADERS: ${{ secrets.POSS_HEADERS }}
+          POSS_METHOD: ${{ vars.POSS_METHOD }}
+          API_BODY: ${{ secrets.API_BODY }}
+          POSS_BOOK_URL: ${{ vars.POSS_BOOK_URL }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ vars.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python monitor.py
+
+      - name: Commit state
+        run: |
+          git config user.name "poss-bot"
+          git config user.email "actions@github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "状态无变化，跳过提交"
+          else
+            git commit -m "chore: update state [skip ci]"
+            git push
+          fi
