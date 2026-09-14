@@ -1,0 +1,5 @@
+.env
+dumps/
+__pycache__/
+*.pyc
+/tmp/

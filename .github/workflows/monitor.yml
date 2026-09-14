@@ -7,11 +7,11 @@ on:
   workflow_dispatch: # 允许手动触发，方便测试
 
 permissions:
-  contents: write # 需要写权限把 state.json 推回仓库做状态记录
+  contents: write # 需要写权限把 state.json / session.json 推回仓库
 
 concurrency:
   group: poss-monitor
-  cancel-in-progress: false # 上一次还没跑完不重叠执行，排队即可
+  cancel-in-progress: false # 上一次没跑完不重叠，排队即可
 
 jobs:
   monitor:
@@ -30,11 +30,10 @@ jobs:
 
       - name: Run monitor
         env:
-          POSS_API_URL: ${{ secrets.POSS_API_URL }}
-          POSS_HEADERS: ${{ secrets.POSS_HEADERS }}
-          POSS_METHOD: ${{ vars.POSS_METHOD }}
-          API_BODY: ${{ secrets.API_BODY }}
-          POSS_BOOK_URL: ${{ vars.POSS_BOOK_URL }}
+          POSS_NETID: ${{ secrets.POSS_NETID }}
+          POSS_PASSWORD: ${{ secrets.POSS_PASSWORD }}
+          POSS_FB_USER_ID: ${{ vars.POSS_FB_USER_ID }}
+          TARGET_SLOTS: ${{ vars.TARGET_SLOTS }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -44,11 +43,11 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python monitor.py
 
-      - name: Commit state
+      - name: Commit state & session
         run: |
           git config user.name "poss-bot"
           git config user.email "actions@github.com"
-          git add state.json
+          git add state.json session.json
           if git diff --cached --quiet; then
             echo "状态无变化，跳过提交"
           else

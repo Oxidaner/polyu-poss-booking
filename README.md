@@ -1,76 +1,74 @@
-# POSS 体育课蹲位器 🏀
+# POSS 蹲位器 🏀
 
-监控 PolyU POSS 体育课预订系统，一旦有人取消预订放出空位，**第一时间微信推送 + 邮件提醒**。
+监控 PolyU POSS 体育课预订系统（X123 / X202 健身房），一旦目标时段出现空位
+（有人取消预订），**第一时间微信推送 + 邮件提醒**。
 
-原理很简单：GitHub Actions 每 5 分钟免费帮你跑一次 `monitor.py`，轮询那个预订情况接口，发现空位就推送。你只需要负责手速。
+自动登录 NetID → 抓取预订时间表 → 过滤目标时段（周二 12:30–18:00，周三/四/五
+14:30–18:00）→ 对比上次状态 → 新空位立即推送。GitHub Actions 每 5 分钟免费跑一次，
+手机关机也在蹲。
 
-## 一、准备通知渠道
+## 文件结构
 
-### 微信推送（二选一，推荐 PushPlus）
+| 文件 | 作用 |
+|---|---|
+| `poss_client.py` | 自动登录 + 抓 timetable.json（会话缓存复用） |
+| `monitor.py` | 主程序：解析/过滤/去重/推送；`--dump` 校准模式 |
+| `.github/workflows/monitor.yml` | GitHub Actions 定时任务 |
+| `state.json` / `session.json` | 运行状态与会话缓存（由 Actions 自动回写） |
+| `dumps/` | 校准数据（本地调试用，已 gitignore） |
 
-**PushPlus（免费）**
-1. 微信扫码登录 https://www.pushplus.plus
-2. 关注它的微信公众号（登录页面会提示）
-3. 「一对一推送」页面复制你的 `TOKEN`
+## 第一步：本地校准（必做一次）
 
-**Server酱（备选）**
-1. 微信扫码登录 https://sct.ftqq.com
-2. 「SendKey」页面复制 `SendKey`
-
-### 邮件（以 QQ 邮箱为例）
-
-1. QQ 邮箱 → 设置 → 账户 → 开启 SMTP 服务
-2. 生成「授权码」（不是 QQ 密码！）
-3. 记下：SMTP 服务器 `smtp.qq.com`、端口 `465`、你的邮箱、授权码、收件邮箱
-
-## 二、部署到 GitHub
-
-1. 新建一个 **Private** 仓库（务必私有！里面有你的登录 Cookie）
-2. 把本项目所有文件推上去：
-
+1. 复制 `.env.example` 为 `.env`，填入 `POSS_NETID`、`POSS_PASSWORD`
+   （**密码只写进本地 .env，永远不要发到任何聊天/仓库里**）
+2. 安装依赖并跑校准：
    ```bash
-   git remote add origin git@github.com:<你的用户名>/poss-monitor.git
+   pip3 install -r requirements.txt
+   python3 monitor.py --dump
+   ```
+3. 成功后 `dumps/` 里会有两馆的时间表原始 JSON —— 拿到它们即可完成解析器定稿。
+
+## 第二步：配置通知渠道
+
+### 微信推送（PushPlus，免费）
+1. 微信扫码登录 https://www.pushplus.plus 并关注其公众号
+2. 「一对一推送」页复制 TOKEN → 填入 `.env` 的 `PUSHPLUS_TOKEN`
+
+### 邮件（QQ 邮箱示例）
+1. 设置 → 账户 → 开启 SMTP → 生成「授权码」
+2. 填 `.env`：`SMTP_HOST=smtp.qq.com`、`SMTP_PORT=465`、
+   `SMTP_USER=发件邮箱`、`SMTP_PASS=授权码`、`MAIL_TO=收件邮箱`
+
+## 第三步：部署 GitHub Actions
+
+1. 新建 **Private** 仓库（必须私有！）并推送代码：
+   ```bash
+   git remote add origin git@github.com:<你>/poss-monitor.git
    git push -u origin main
    ```
-
-3. 仓库页面 → **Settings → Secrets and variables → Actions**，配置：
-
-   **Secrets（敏感信息）：**
+2. 仓库 Settings → Secrets and variables → Actions，添加 **Secrets**：
 
    | 名称 | 内容 |
    |---|---|
-   | `POSS_API_URL` | 预订情况接口的完整 URL |
-   | `POSS_HEADERS` | 请求头 JSON，含 Cookie，如 `{"Cookie":"...","Authorization":"..."}` |
-   | `API_BODY` | POST 请求才需要，请求体；GET 留空 |
-   | `PUSHPLUS_TOKEN` | PushPlus 的 TOKEN（用 Server酱则配 `SERVERCHAN_KEY`） |
-   | `SERVERCHAN_KEY` | Server酱 SendKey（可选，和 PushPlus 二选一或都配） |
+   | `POSS_NETID` | 你的 NetID |
+   | `POSS_PASSWORD` | 你的 NetPassword |
+   | `PUSHPLUS_TOKEN` | PushPlus token |
    | `SMTP_HOST` | 如 `smtp.qq.com` |
-   | `SMTP_USER` | 发件邮箱 |
-   | `SMTP_PASS` | 邮箱授权码 |
+   | `SMTP_USER` / `SMTP_PASS` | 发件邮箱 / 授权码 |
    | `MAIL_TO` | 收件邮箱 |
 
-   **Variables（非敏感，可选项）：**
+   可选 **Variables**（非敏感）：`POSS_FB_USER_ID`（默认 657032）、
+   `TARGET_SLOTS`（自定义目标时段 JSON，默认周二 12:30-18:00 + 周三四五 14:30-18:00）
 
-   | 名称 | 内容 |
-   |---|---|
-   | `POSS_METHOD` | `GET` 或 `POST`，默认 GET |
-   | `POSS_BOOK_URL` | 抢位时手动打开的预订页面链接（提醒消息里会带上） |
-   | `SMTP_PORT` | 默认 `465` |
+3. Actions 页启用 workflow，点 **Run workflow** 手动跑一次验证
+4. 收到第一条推送 = 上线成功
 
-4. 仓库 **Actions** 页启用 `POSS Slot Monitor` workflow，可先点 **Run workflow** 手动跑一次测试
+## 工作机制 & 注意事项
 
-## 三、本地测试（可选）
-
-```bash
-export POSS_API_URL="https://..."
-export POSS_HEADERS='{"Cookie":"..."}'
-export PUSHPLUS_TOKEN="..."
-python3 monitor.py
-```
-
-## ⚠️ 重要提醒
-
-- **Cookie 会过期**：POSS 的登录态一般几天到几周失效。如果监控连续报错/返回登录页，去浏览器重新抓一次 Cookie，更新 `POSS_HEADERS` 这个 Secret 即可。
-- **接口返回结构**：`monitor.py` 里 `parse_availability()` 是占位实现，拿到真实返回后需要按实际 JSON 字段定制（跑一次会把原始返回打在日志里，贴出来即可定制）。
-- **频率**：GitHub Actions cron 每 5 分钟一次，实际可能有 1~3 分钟调度延迟。对蹲退订来说够用；想更快可以本地跑 `watch -n 30 python3 monitor.py`。
-- 同一场次空位持续存在时，每 30 分钟重复提醒一次（`RENOTIFY_AFTER` 可调），不会刷屏。
+- **自动登录**：每次运行先复用 `session.json` 里的缓存会话（约 90 分钟），
+  失效才重新登录——避免每天 288 次登录触发学校风控。
+- **去重**：名额 0→N 才提醒；空位持续存在每 30 分钟重提醒（`RENOTIFY_AFTER`）。
+- **失明警报**：登录失败/接口异常会推送警报（每小时最多一条），绝不静默装死。
+- **风险自担**：自动化访问学校系统理论上可能违反 IT 使用守则，频率已刻意保守
+  （5 分钟一次、会话复用），但请知悉风险。密码仅存于 GitHub Secrets（加密），
+  代码与日志不落明文；`session.json` 含短期会话 cookie，仅存在于你的私有仓库。
