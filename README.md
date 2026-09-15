@@ -59,7 +59,10 @@
     ],
     "endpoint": "",
     "params": {},
-    "success_keywords": ["success", "successful", "成功", "已确认"]
+    "success_keywords": ["success", "successful", "成功", "confirmed", "已确认"],
+    "failure_keywords": ["unsuccessful", "not successful", "not available",
+                         "already been booked", "失败", "名额已满"],
+    "result_url": ""
   },
   "fallback": {
     "enabled": true,
@@ -86,7 +89,9 @@
 | `grace_minutes` | 开抢后多少分钟内仍积极尝试（默认 30 分钟） |
 | `steps` | 多步预订流程。POSS 是「选时段 → 确认页 → 最终提交」两步，每步一个 `curl_file`；<br>中间步骤可用 `extract` 从响应 HTML 提取字段（如确认页的新 CSRFToken） |
 | `curl_file` | 单步预订模板文件（默认 `booking.curl`，若配置了 `steps` 则仅作为各步骤的默认回退） |
-| `success_keywords` | 判定「预订成功」的响应关键词（默认含 `success`/`成功`） |
+| `success_keywords` | 判定「预订成功」的结果页关键词 |
+| `failure_keywords` | 判定「服务端明确拒绝」的结果页关键词（如时段已被别人抢走）。命中即换下一个候选继续抢；空数组 = 用内置默认值 |
+| `result_url` | 预订结果页地址，默认 `make_book_result.do`。一般不用改 |
 | `endpoint` / `params` | 遗留路径：不用 cURL 模板时手填端点与表单 |
 
 **蹲守部分：** `fallback.targets` 不配则自动由 booking 派生（触发日 + 目标时段）。
@@ -99,6 +104,9 @@ POST 端点是不负责任的。所以拿不到真实抓包时，代码会拒绝
 POSS 的实际流程是**两步**：
 1. 选中时段后点击提交 → POST `make_book.do` → 返回「确认页」（带 declare 复选框）
 2. 勾选 declare 后再点击提交 → POST `make_book_submit.do` → 真正扣押金下单
+3. 服务端处理完 → 302 跳到 `make_book_result.do` → **这一页才是「抢到没有」的判决书**
+
+第 3 步不用你抓：脚本会跟着那个 302 自己走过去读结果页。
 
 所以你需要**抓两条** cURL，并分别导入成两个模板：
 
@@ -125,6 +133,28 @@ pbpaste | python3 calibrate.py --import - --out booking.curl
   需要编码的占位符会自动写成 `{key:url}`。
 - **字段名带 `Facilities` 的日期时间字段**（如 `boMakeBookFacilities[0].startDateTime`）
   先按「值像不像日期时间」判定，再看字段名 —— 否则会被误判成 `{facilityId}`。
+
+## 抢到没有？—— 结果页判定
+
+提交后服务端会 302 到 `make_book_result.do`，那一页才是权威结论。脚本会跟过去读它，
+把结果分成三种，**三种都会把结果页原文存进 `dumps/`**（Actions 里作为 `poss-dumps`
+artifact 保留 14 天），判错了照原文改 `config.json` 里的关键字就行：
+
+| 判定 | 触发条件 | 脚本动作 |
+|---|---|---|
+| ✅ 抢到 | 结果页命中 `success_keywords` | 记状态、推送、收工 |
+| ❌ 明确没抢到 | 结果页命中 `failure_keywords` | 排除这个馆+时段，**继续试下一个候选** |
+| ❓ 结果不明 | 两类关键词都没命中 | 立刻停止重试（防重复扣费）并推送让你人工确认 |
+
+两个刻意的设计：
+
+- **先判失败、再判成功。** 英文结果页里 `unsuccessful` 本身就含 `success` 子串，
+  反过来判会把「预订失败」读成「抢到了」，然后就此收工 —— 你会以为订上了，实际没有。
+  判错方向的代价不对称，所以顺序不能反。
+- **比对的是去掉 `<script>`/`<style>` 后的内容。** 既不漏掉藏在隐藏字段里的结果标志，
+  也不会因为某个 JS 库里恰巧出现 "success" 就把失败读成成功。
+- **同一轮不重复提交已被拒的「馆+时段」。** 否则 120 秒的爆发窗口里会对着同一个
+  满位时段提交几十次，除了给风控送素材毫无用处。
 
 **验证**：`python3 monitor.py --dry-book` 会按顺序打印每一步**真正会发出去**的请求
 （token 已打码），并检查占位符能否取到值。与抓包逐字段核对一致即可上线。
@@ -172,8 +202,9 @@ python3 monitor.py --dry-book     # 演练两步流程并打印真实请求，�
 ## 注意事项 / 风险
 
 - **会自动花钱**：预订成功会扣押金。代码做了三层防护：同一触发日只抢一次（成功后跳过）；
-  响应是「结果不明」的跳转时立刻停止重试并推送让你人工确认（绝不重试第二次）；
+  结果页读不出结论时立刻停止重试并推送让你人工确认（绝不盲重试）；
   模板里有取不到值的占位符时直接拒绝发送。
+  只有服务端**明确**回了失败（如时段已被抢走）才会继续试下一个候选 —— 因为那说明钱没花出去。
   但**请自己核对 POSS 上的预订记录**。
 - **`facilityId` 从时间表数据来**：POSS 的预订请求需要场馆内部的设施编号
   （`boMakeBookFacilities[0].facilityId`），这个值必须来自 timetable.json。

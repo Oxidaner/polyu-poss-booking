@@ -26,6 +26,7 @@ BASE = "https://www40.polyu.edu.hk"
 LOGIN_PAGE = f"{BASE}/poss/secure/login/loginhome.do"
 LOGIN_POST = f"{BASE}/poss/j_security_check"
 MAKE_BOOK = f"{BASE}/starspossfbstud/secure/ui_make_book/make_book.do"
+MAKE_BOOK_RESULT = f"{BASE}/starspossfbstud/secure/ui_make_book/make_book_result.do"
 TIMETABLE = f"{BASE}/starspossfbstud/secure/ui_make_book/timetable.json"
 
 UA = (
@@ -304,15 +305,76 @@ class BookingFailed(Exception):
 
 
 class BookingResult:
-    def __init__(self, ok: bool, message: str, raw: str = "", inconclusive: bool = False):
+    def __init__(self, ok: bool, message: str, raw: str = "", inconclusive: bool = False,
+                 confirmed_failure: bool = False):
         self.ok = ok
         self.message = message
         self.raw = raw
-        # 结果不明（如 HTTP 302）：既不能当成抢到，也绝不能再重试 —— 防止重复扣费
+        # 结果不明（如 HTTP 302 且拿不到结果页）：既不能当成抢到，也绝不能再重试 ——
+        # 防止重复扣费。此时只能推人去看一眼。
         self.inconclusive = inconclusive
+        # 服务端明确说「这次没订上」（如时段已被别人抢走）：这不是赌博，是事实，
+        # 所以可以放心去试下一个候选，不算重复扣费风险。
+        self.confirmed_failure = confirmed_failure
 
     def __repr__(self):
         return f"BookingResult(ok={self.ok}, message={self.message!r})"
+
+
+# ---- 结果页判定 ----
+# POSS 提交后走 PRG（POST→Redirect→GET）模式：make_book_submit.do 处理完 → 302 到
+# make_book_result.do → 结果（成功/失败）存在会话里由该页渲染出来。
+# 所以「跟着 302 走一步」就能拿到权威结论，不用再让用户人工去查。
+
+_TAG_RE = re.compile(r"(?s)<[^>]+>")
+_DROP_BLOCK_RE = re.compile(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>")
+
+
+def html_to_text(html: str) -> str:
+    """粗剥 HTML，留下可比对的可见文本（不做完整 DOM 解析，够用即可）。"""
+    import html as _html
+
+    s = _DROP_BLOCK_RE.sub(" ", html or "")
+    s = _TAG_RE.sub(" ", s)
+    s = _html.unescape(s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# 默认「明确失败」标志。刻意选不会误伤成功页的短语：
+# 英文 "unsuccessful" 本身含 "success"，所以判定时必须先看失败词再看成功词。
+DEFAULT_FAILURE_KEYWORDS = [
+    "unsuccessful", "not successful", "booking failed", "cannot be booked",
+    "unable to book", "no longer available", "not available", "already been booked",
+    "already booked", "have been booked", "was booked", "duplicate",
+    "不成功", "失败", "額滿", "额满", "名額已滿", "名额已满", "已被", "已經被", "已经被",
+    "餘額不足", "余额不足", "押金不足",
+]
+DEFAULT_SUCCESS_KEYWORDS = ["success", "successful", "成功", "confirmed", "已確認", "已确认"]
+
+
+def classify_result(text: str, success_keywords=None, failure_keywords=None):
+    """判定结果页 → (verdict, matched)
+
+    verdict ∈ {"ok", "fail", "unknown"}
+
+    顺序很重要：**先判失败**。英文结果页里「unsuccessful」包含「success」子串，
+    若先判成功，一次失败的预订会被读成抢到了 —— 我们就此收工，然后你要自己
+    发现问题。反过来判错的代价只是多试一次，安全得多。
+
+    只比对「去掉了 script/style 的内容」：既不漏掉藏在隐藏字段/属性里的结果标志，
+    也不会因为某个 JS 库里恰巧有 "success" 三个字就把失败读成成功。
+    """
+    visible = html_to_text(text)
+    without_js = _DROP_BLOCK_RE.sub(" ", text or "")
+    low = (visible + "\n" + without_js).lower()
+    fails = [k for k in (failure_keywords or DEFAULT_FAILURE_KEYWORDS) if k.lower() in low]
+    if fails:
+        return "fail", fails
+    oks = [k for k in (success_keywords or DEFAULT_SUCCESS_KEYWORDS) if k.lower() in low]
+    if oks:
+        return "ok", oks
+    return "unknown", []
+
 
 
 class PossClient:
@@ -531,8 +593,28 @@ class PossClient:
         msg = "预订成功" if ok else f"HTTP {r.status_code} 未匹配成功标志: {text[:200]}"
         return BookingResult(ok, msg, text[:2000])
 
-    # ---------- 会话持久化 ----------
+    # ---------- 预订结果页 ----------
 
+    def open_result_page(self, url: str, referer: str = "", max_hops: int = 3):
+        """跟着 302 打开预订结果页（PRG 的最后一步，等价于浏览器自动跳转）。
+
+        返回最终响应对象；中途被踢到登录页抛 SessionExpired。
+        """
+        r = None
+        for _ in range(max_hops):
+            headers = {"Referer": referer} if referer else {}
+            r = self.s.get(url, headers=headers, allow_redirects=False, timeout=30)
+            if r.status_code not in (301, 302):
+                return r
+            loc = r.headers.get("Location", "")
+            if not loc:
+                return r
+            if "login" in loc.lower() or "loginhome" in loc.lower():
+                raise SessionExpired(f"打开结果页时被踢到登录页（302 → {loc}）")
+            url = loc if loc.startswith("http") else BASE + loc
+        return r
+
+    # ---------- 会话持久化 ----------
     def save_session(self, path: str):
         """把 cookie 序列化到文件（保留 domain/path，跨运行复用）。"""
         cookies = [

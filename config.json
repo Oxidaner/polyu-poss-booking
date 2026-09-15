@@ -24,7 +24,14 @@
     ],
     "endpoint": "",
     "params": {},
-    "success_keywords": ["success", "successful", "成功", "已确认"]
+    "success_keywords": ["success", "successful", "成功", "confirmed", "已确认"],
+    "failure_keywords": [
+      "unsuccessful", "not successful", "booking failed", "cannot be booked",
+      "unable to book", "no longer available", "not available", "already been booked",
+      "already booked", "have been booked", "duplicate",
+      "不成功", "失败", "额满", "名额已满", "已被", "已经被", "余额不足", "押金不足"
+    ],
+    "result_url": ""
   },
 
   "fallback": {

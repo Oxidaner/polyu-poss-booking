@@ -35,9 +35,12 @@ from poss_client import (
     BASE,
     BookingNotCalibrated,
     LoginFailed,
+    MAKE_BOOK_RESULT,
     PossClient,
     SessionExpired,
+    classify_result,
     find_unresolved,
+    html_to_text,
     mask_secrets,
     render_template,
 )
@@ -98,6 +101,8 @@ DEFAULT_BOOKING = {
     "endpoint": "",                  # 遗留路径：手工填端点（未用 cURL 时）
     "params": {},                    # 遗留路径：手工填表单模板
     "success_keywords": ["success", "successful", "成功", "已确认"],
+    "failure_keywords": [],          # 空 = 用 poss_client.DEFAULT_FAILURE_KEYWORDS
+    "result_url": "",                # 空 = poss_client.MAKE_BOOK_RESULT
 }
 
 
@@ -600,21 +605,20 @@ def run_booking_steps(client, b: dict, steps: list, ctx: dict, dry_book: bool = 
             last_req = req
             continue
 
-        r = client.s.post(
-            req["url"], data=req["body"], headers=req["headers"],
-            allow_redirects=False, timeout=30,
-        )
+        kwargs = {"headers": req["headers"], "allow_redirects": False, "timeout": 30}
+        if req["method"].upper() == "GET":
+            r = client.s.get(req["url"], **kwargs)
+        else:
+            r = client.s.post(req["url"], data=req["body"], **kwargs)
 
         if r.status_code in (301, 302):
             loc = r.headers.get("Location", "")
             if "login" in loc.lower() or "loginhome" in loc.lower():
                 raise SessionExpired(f"步骤 {step_no} 被重定向到登录页（302 → {loc}）")
             if idx == len(steps) - 1:
-                # 最后一步出现非登录 302：结果不明，绝不再试
-                return BookingResult(
-                    False, f"HTTP 302 → {loc}（结果不明，请人工确认）",
-                    (r.text or "")[:2000], inconclusive=True,
-                )
+                # 提交后的 302 = PRG 跳转：服务端的判定结果挂在目标页上，
+                # 跟着走一步就能拿到答案，不用再麻烦人去 POSS 里瞅一眼。
+                return resolve_final_result(client, b, r, req["url"], success_keywords)
             # 中间步骤：跟进到确认页
             url = loc if loc.startswith("http") else BASE + loc
             r = _follow_redirects(client, url, req["headers"])
@@ -627,16 +631,98 @@ def run_booking_steps(client, b: dict, steps: list, ctx: dict, dry_book: bool = 
                 print(f"[booking] 步骤 {step_no} 提取 {key} = {m.group(1)[:20]}...")
 
         if idx == len(steps) - 1:
-            text = r.text or ""
-            ok = r.status_code == 200 and any(k.lower() in text.lower() for k in (success_keywords or []))
-            msg = "预订成功" if ok else f"HTTP {r.status_code} 未匹配成功标志: {text[:200]}"
-            return BookingResult(ok, msg, text[:2000])
+            return resolve_final_result(client, b, r, req["url"], success_keywords)
 
     if dry_book:
         # 演练只打印，不返回真实结果
         return BookingResult(False, "dry-book", "")
     # 正常流程不会到达这里（最后一步已返回）
     return BookingResult(False, "步骤执行异常", "")
+
+
+def _dump_result_page(label: str, text: str) -> str:
+    """结果页原文存盘。关键字判定一旦判错，全靠这个文件回溯真相。"""
+    try:
+        os.makedirs(DUMP_DIR, exist_ok=True)
+        safe = re.sub(r"[^\w-]", "_", label)[:60]
+        p = os.path.join(DUMP_DIR, f"booking_result_{safe}.html")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(text or "")
+        return p
+    except OSError:
+        return ""
+
+
+def resolve_final_result(client, b, resp, referer, success_keywords=None):
+    """读「预订结果页」，判定抢到了没有 → BookingResult。
+
+    POSS 提交后是 PRG 模式：make_book_submit.do 处理完 → 302 到
+    make_book_result.do（结果由会话里取出来渲染）。所以：
+
+      · 提交步返回 302 → 跟着跳到结果页去判（等于浏览器自动跳转）；
+      · 提交步直接返回 200 → 就判这一页；
+      · 都判不出来、且没发生跳转、正文又短得像空壳（<200 字节）→
+        再直开一次结果页兜底（有些流程结果只挂在会话里）。
+
+    判定结果：ok / confirmed_failure（服务端明说没订上，可放心试下一个）/
+    inconclusive（看不出来，停手报警）。三种都会把原文存进 dumps/。
+    """
+    from poss_client import BookingResult
+
+    kws_ok = success_keywords or b.get("success_keywords") or None
+    kws_fail = b.get("failure_keywords") or None
+    result_url = b.get("result_url") or MAKE_BOOK_RESULT
+
+    pages = []  # [(来源说明, HTTP 状态, 正文)]
+    loc = (resp.headers.get("Location") or "") if resp.status_code in (301, 302) else ""
+    followed = bool(loc)
+    if followed:
+        target = loc if loc.startswith("http") else BASE + loc
+        r = client.open_result_page(target, referer=referer)
+        pages.append((f"跟随 302 → {target}", r.status_code, r.text or ""))
+    else:
+        pages.append((f"提交响应 HTTP {resp.status_code}", resp.status_code, resp.text or ""))
+
+    def _check(items):
+        for where_, status_, body in items:
+            v, m = classify_result(body, kws_ok, kws_fail)
+            if v != "unknown":
+                return v, m, where_, status_, body
+        return None
+
+    hit = _check(pages)
+    if hit is None and not followed and len(pages[0][2]) < 200:
+        # 没跳转、正文又短得像个空壳：结果很可能只挂在会话里，直接问结果页要答案
+        try:
+            r = client.open_result_page(result_url, referer=referer)
+            pages.append((f"直开结果页 {result_url}", r.status_code, r.text or ""))
+            hit = _check(pages[1:])
+        except SessionExpired:
+            raise
+
+    if hit:
+        verdict, matched, where, status, text = hit
+    else:
+        verdict, matched = "unknown", []
+        where, status, text = pages[0]
+
+    dump = _dump_result_page(where, text)
+    if dump:
+        print(f"[booking] 结果页已存盘: {dump}（关键字判错时照这个文件改配置）")
+    snippet = html_to_text(text)[:300]
+
+    if verdict == "ok":
+        return BookingResult(True, f"预订成功（{where}｜命中 {matched}）", text[:4000])
+    if verdict == "fail":
+        return BookingResult(
+            False,
+            f"服务端明确拒绝：命中 {matched}（{where}）｜页面：{snippet}",
+            text[:4000], confirmed_failure=True,
+        )
+    return BookingResult(
+        False, f"结果不明（{where}｜HTTP {status}）｜页面：{snippet}",
+        text[:4000], inconclusive=True,
+    )
 
 
 def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
@@ -670,6 +756,9 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
     attempts = 0
     session_failures = 0
     max_session_failures = 3
+    # 已经被服务端明确拒掉的「馆+时段」：同一轮里别再重复提同一条，
+    # 否则 120 秒里对着同一个满位时段提交几十次，除了给风控送素材毫无用处。
+    tried: set = set()
     while True:
         attempts += 1
         for gym_name in gym_names:
@@ -687,7 +776,8 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
                 client.save_session(SESSION_FILE)
                 continue
             cands = [s for s in parse_timetable(raw)
-                     if slot_matches_target(s, window) and (s["left"] or 0) > 0]
+                     if slot_matches_target(s, window) and (s["left"] or 0) > 0
+                     and (gym_name, str(s["date"]), str(s["start"])) not in tried]
             if not cands:
                 continue
             best = pick_best(cands, b)
@@ -738,9 +828,14 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
                     "❓ POSS 抢位结果不明，请立刻确认",
                     f"{gym_name} {best['date']} {best['start']}–{best['end']}\n"
                     f"服务端返回：{res.message}\n"
-                    f"脚本已停止重试（避免重复扣费）。请马上去 POSS 看一眼订单状态。",
+                    f"脚本已停止重试（避免重复扣费）。请马上去 POSS 看一眼订单状态。\n"
+                    f"（结果页原文已存 dumps/，可据此校准 success/failure 关键字）",
                 )
                 return True
+
+            # 服务端明确说没订上（如时段被别人抢先）：这不是未知数，可以放心试下一个
+            tried.add((gym_name, str(best["date"]), str(best["start"])))
+            print(f"[booking] {gym_name} {best['start']} 被拒，已排除，继续试其他候选")
         if dry_book or time.time() >= deadline:
             break
         time.sleep(b["retry_interval"])

@@ -54,6 +54,17 @@ jobs:
           MAIL_TO: ${{ secrets.MAIL_TO }}
         run: python monitor.py
 
+      # 抢位提交后，服务端返回的结果页原文会落到 dumps/。
+      # 一旦 success/failure 关键字判错，就靠这个 artifact 回溯并改配置。
+      - name: Upload result dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: poss-dumps
+          path: dumps/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Commit state & session
         run: |
           git config user.name "poss-bot"
