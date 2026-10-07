@@ -287,144 +287,319 @@ PAGE = r"""<!DOCTYPE html>
 <html lang="zh-Hans">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>POSS 抢位目标选择器</title>
 <style>
   :root{
-    --bg:#f6f7f9; --panel:#fff; --line:#e3e6ec; --ink:#1c1f26; --dim:#6b7280;
-    --gray:#b9bec7; --free:#ff2fbe; --paid:#4a6cf7; --unknown:#9fd0ff;
-    --accent:#1f6feb; --warn:#b45309; --ok:#0f9d58;
+    --bg:#f5f6f8; --panel:#fff; --line:#e6e9ef; --line-2:#eef1f6;
+    --ink:#12151c; --dim:#697386; --faint:#98a1b3;
+    --accent:#4f46e5; --accent-h:#4338ca;
+    --free:#ec4899; --paid:#3b82f6; --gray:#c9d0da; --gray-ink:#5a6474;
+    --nodata:#edf1f6; --ok:#0f766e; --err:#b42318;
+    --r:13px; --r-sm:9px;
+    --sh:0 1px 2px rgba(16,24,40,.05), 0 1px 3px rgba(16,24,40,.04);
+    --sh-lg:0 6px 20px rgba(16,24,40,.10);
   }
   *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--ink);
-       font:14px/1.5 -apple-system,"PingFang SC","Helvetica Neue",Arial,sans-serif}
-  header{padding:16px 20px;background:var(--panel);border-bottom:1px solid var(--line);
-         display:flex;align-items:center;gap:12px;position:sticky;top:0;z-index:10}
-  header h1{margin:0;font-size:16px;font-weight:650}
-  header .sp{flex:1}
-  button{font:inherit;padding:6px 12px;border:1px solid var(--line);border-radius:7px;
-         background:#fff;color:var(--ink);cursor:pointer}
-  button:hover{border-color:#c3c9d4}
-  button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
-  button.primary:hover{background:#1a5fd0}
-  button:disabled{opacity:.5;cursor:not-allowed}
-  .wrap{padding:16px 20px 80px;max-width:1500px;margin:0 auto}
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
-         padding:14px 16px;margin-bottom:14px}
-  .row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end}
-  label.f{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--dim)}
-  select,input{font:inherit;padding:6px 9px;border:1px solid var(--line);border-radius:7px;
-               background:#fff;color:var(--ink);min-width:180px}
-  .msg{font-size:12px;color:var(--dim);margin-left:auto}
-  .msg.err{color:#b3261e;white-space:pre-wrap;max-width:640px}
-  .msg.ok{color:var(--ok)}
-  /* 网格 */
-  .gridwrap{overflow:auto;border:1px solid var(--line);border-radius:8px;background:#fff}
-  table.grid{border-collapse:collapse;font-size:12px;width:100%}
-  table.grid th{position:sticky;top:0;background:#fff;border-bottom:1px solid var(--line);
-                padding:6px 4px;font-weight:600;white-space:nowrap;z-index:2}
-  table.grid td{border:1px solid #eceff4;padding:0;text-align:center}
-  table.grid th.tcol{position:sticky;left:0;background:#fff;border-right:1px solid var(--line);
-                     z-index:3;min-width:78px;text-align:right;padding-right:8px}
-  .cell{height:34px;min-width:86px;display:flex;align-items:center;justify-content:center;
-        cursor:pointer;user-select:none;font-size:11px;color:#fff;position:relative}
-  /* 灰色格子也可以点：现在不可订 ≠ 放位那一刻不可订，抢位目标本来就是给未来定的 */
-  .cell.unavailable{background:var(--gray);color:#565c66}
-  .cell.free{background:var(--free)}
-  .cell.paid{background:var(--paid)}
-  .cell.unknown{background:var(--unknown);color:#1c3f66;outline:1px dashed #5b9bd5;
-                outline-offset:-3px}
-  .cell.nodata{background:#f2f4f7;color:#c2c8d0}
-  .cell.sel{box-shadow:inset 0 0 0 3px #111;font-weight:700}
-  .cell.sel::after{content:"✓";position:absolute;top:1px;right:3px;font-size:10px}
-  .legend{display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--dim)}
-  .legend i{display:inline-block;width:13px;height:13px;border-radius:3px;margin-right:6px;
-            vertical-align:-2px}
-  /* 已选 */
-  .chips{display:flex;flex-direction:column;gap:8px;margin-top:6px}
-  .chip{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--line);
-        border-radius:8px;background:#fbfcfe;font-size:13px}
-  .chip .who{font-weight:600}
-  .chip .meta{color:var(--dim);font-size:12px}
-  .chip button{padding:3px 8px;font-size:12px}
-  .empty{color:var(--dim);font-size:13px;padding:6px 0}
-  details{margin-top:10px}
-  summary{cursor:pointer;color:var(--dim);font-size:12px}
-  pre{background:#0f1117;color:#d7dae0;padding:12px;border-radius:8px;overflow:auto;
-      max-height:340px;font-size:11.5px;line-height:1.45}
-  .hint{font-size:12px;color:var(--dim);margin-top:6px}
-  .warn{background:#fff8e6;border:1px solid #f0d9a0;color:#7a5300;padding:9px 12px;
-        border-radius:8px;font-size:12.5px;margin-bottom:12px}
+  html,body{margin:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:14px/1.55 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB",
+         "Microsoft YaHei",Inter,"Helvetica Neue",Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  h1,h2{margin:0;font-weight:650}
+  .sp{flex:1}
+
+  /* ---------- 顶栏 ---------- */
+  header{
+    position:sticky; top:0; z-index:30; height:64px; padding:0 24px;
+    display:flex; align-items:center; gap:13px;
+    background:rgba(255,255,255,.85); backdrop-filter:saturate(180%) blur(14px);
+    -webkit-backdrop-filter:saturate(180%) blur(14px);
+    border-bottom:1px solid var(--line);
+  }
+  .logo{
+    width:30px; height:30px; border-radius:10px; flex:none;
+    background:linear-gradient(135deg,#6366f1,#a855f7); color:#fff;
+    display:grid; place-items:center; font-weight:700; font-size:14px;
+    box-shadow:0 2px 10px rgba(99,102,241,.38);
+  }
+  .brand h1{font-size:15px; letter-spacing:-.01em}
+  .brand .sub{font-size:11.5px; color:var(--faint); margin-top:1px}
+
+  .pill{
+    font-size:12px; color:var(--dim); background:#f2f4f8; border:1px solid var(--line);
+    padding:4px 11px; border-radius:999px; max-width:46ch;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    transition:.2s;
+  }
+  .pill.ok{color:var(--ok); background:#f0fdfa; border-color:#b6ece5}
+  .pill.err{color:var(--err); background:#fff5f4; border-color:#fbd3ce}
+  .pill.busy{color:#5b21b6; background:#f5f3ff; border-color:#ddd6fe}
+
+  /* ---------- 按钮 ---------- */
+  button{
+    font:inherit; font-size:13px; padding:7px 13px; border-radius:var(--r-sm);
+    border:1px solid var(--line); background:#fff; color:var(--ink); cursor:pointer;
+    box-shadow:var(--sh); display:inline-flex; align-items:center; gap:6px;
+    white-space:nowrap;   /* 别让「重新登录」在窄屏被折成两行 */
+    transition:transform .13s, box-shadow .13s, border-color .13s, background .13s;
+  }
+  button:hover{border-color:#d3d9e3; transform:translateY(-1px); box-shadow:var(--sh-lg)}
+  button:active{transform:translateY(0)}
+  button:focus-visible{outline:none; box-shadow:0 0 0 3px rgba(79,70,229,.25)}
+  button.primary{
+    background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600;
+    box-shadow:0 1px 2px rgba(79,70,229,.28), 0 5px 14px rgba(79,70,229,.24);
+  }
+  button.primary:hover{background:var(--accent-h); border-color:var(--accent-h)}
+  button.primary:disabled{opacity:.45; cursor:not-allowed; transform:none; box-shadow:none}
+  /* 有未保存改动时，保存按钮上亮个小点 */
+  button.dirty::after{
+    content:""; width:7px; height:7px; border-radius:50%; background:#fbbf24;
+    box-shadow:0 0 0 3px rgba(251,191,36,.28);
+  }
+
+  /* ---------- 布局 ---------- */
+  .wrap{max-width:1560px; margin:0 auto; padding:20px 24px 72px}
+  .panel{
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--r);
+    padding:16px 18px; margin-bottom:16px; box-shadow:var(--sh);
+  }
+  .panel-head{display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:13px}
+  .panel-head h2{font-size:13.5px; letter-spacing:-.005em}
+  .panel-head .hint{margin:0}
+
+  .toolbar{
+    display:grid; gap:12px;
+    grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+    align-items:end;
+  }
+  .field{display:flex; flex-direction:column; gap:6px; min-width:0}
+  .field label{
+    font-size:11px; font-weight:650; color:var(--faint);
+    letter-spacing:.06em; text-transform:uppercase;
+  }
+  .field.act button{width:100%; justify-content:center; height:38px}
+  select{
+    font:inherit; font-size:13.5px; width:100%; height:38px;
+    padding:0 34px 0 11px; color:var(--ink); background:#fff;
+    border:1px solid var(--line); border-radius:var(--r-sm);
+    appearance:none; -webkit-appearance:none; cursor:pointer;
+    transition:border-color .13s, box-shadow .13s;
+    background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'><path d='M3 4.6L6 7.6L9 4.6' fill='none' stroke='%23697386' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat:no-repeat; background-position:right 11px center;
+  }
+  select:hover{border-color:#cfd6e2}
+  select:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(79,70,229,.13)}
+
+  .stats{display:flex; flex-wrap:wrap; gap:8px; margin-top:14px}
+  .stat{
+    display:inline-flex; align-items:baseline; gap:6px; font-size:12px; color:var(--dim);
+    background:#f7f8fb; border:1px solid var(--line-2); padding:5px 11px; border-radius:999px;
+  }
+  .stat b{color:var(--ink); font-weight:650; font-variant-numeric:tabular-nums; font-size:12.5px}
+  .hint{font-size:12px; color:var(--faint); margin-top:10px; line-height:1.6}
+  .warn{
+    background:#fffbeb; border:1px solid #fde68a; color:#92400e;
+    padding:11px 14px; border-radius:var(--r-sm); font-size:12.5px; margin-bottom:14px;
+  }
+
+  /* ---------- 网格 ---------- */
+  .gridwrap{
+    overflow:auto; max-height:62vh; border:1px solid var(--line-2);
+    border-radius:var(--r-sm); background:var(--panel);
+  }
+  table.grid{border-collapse:collapse; width:100%; font-size:12px}
+  table.grid th{
+    position:sticky; top:0; z-index:2; background:var(--panel);
+    padding:9px 6px 8px; font-weight:650; color:var(--ink); white-space:nowrap;
+    border-bottom:1px solid var(--line);
+  }
+  table.grid th .dow{
+    display:block; font-size:10.5px; font-weight:500; color:var(--faint); margin-top:1px;
+  }
+  table.grid th.tcol{
+    left:0; z-index:3; text-align:right; padding-right:11px; min-width:68px;
+    font-variant-numeric:tabular-nums; font-weight:500; color:var(--dim);
+    border-right:1px solid var(--line);
+  }
+  table.grid thead th.tcol{z-index:4}
+  table.grid th.today{color:var(--accent)}
+  table.grid th.today .dow{color:var(--accent)}
+  table.grid th.today::after{
+    content:""; position:absolute; left:50%; transform:translateX(-50%); bottom:2px;
+    width:16px; height:2px; border-radius:2px; background:var(--accent);
+  }
+  table.grid td{padding:2px; border:none}
+
+  .cell{
+    height:34px; border-radius:8px; display:grid; place-items:center; cursor:pointer;
+    user-select:none; font-size:11.5px; font-weight:650; position:relative;
+    background-image:linear-gradient(180deg,rgba(255,255,255,.17),rgba(0,0,0,.05));
+    transition:transform .12s, box-shadow .12s;
+  }
+  .cell:hover{transform:translateY(-1px); box-shadow:0 3px 10px rgba(16,24,40,.22); z-index:1}
+  .cell.unavailable{background-color:var(--gray); color:var(--gray-ink)}
+  .cell.free{background-color:var(--free); color:#fff}
+  .cell.paid{background-color:var(--paid); color:#fff}
+  .cell.unknown{background-color:#a5cdf5; color:#12395f}
+  .cell.nodata{
+    background-color:var(--nodata); color:#c7cfdb;
+    background-image:none; box-shadow:inset 0 0 0 1px #e2e8f1;
+  }
+  .cell.sel{
+    box-shadow:0 0 0 2px var(--panel), 0 0 0 4px var(--accent);
+    transform:translateY(-1px); z-index:1;
+  }
+  .cell.sel::after{
+    content:""; position:absolute; top:4px; right:4px; width:6px; height:6px;
+    border-radius:50%; background:#fff; box-shadow:0 0 0 1.5px rgba(0,0,0,.28);
+  }
+
+  .legend{display:flex; flex-wrap:wrap; gap:8px; margin-top:14px}
+  .lg{
+    display:inline-flex; align-items:center; gap:7px; font-size:11.5px; color:var(--dim);
+    background:#f7f8fb; border:1px solid var(--line-2); padding:5px 11px; border-radius:999px;
+  }
+  .lg i{width:11px; height:11px; border-radius:3.5px; display:inline-block; flex:none}
+
+  .placeholder{padding:64px 20px; text-align:center; color:var(--faint); font-size:13.5px}
+  .placeholder .big{font-size:28px; margin-bottom:10px; opacity:.45}
+
+  /* ---------- 目标列表 ---------- */
+  .chips{display:grid; grid-template-columns:repeat(auto-fill,minmax(310px,1fr)); gap:10px}
+  .chip{
+    display:flex; align-items:center; gap:12px; padding:11px 12px 11px 15px;
+    border:1px solid var(--line); border-radius:var(--r-sm); background:#fff;
+    position:relative; overflow:hidden;
+    transition:border-color .15s, box-shadow .15s, transform .15s;
+  }
+  .chip::before{
+    content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--accent);
+  }
+  .chip:hover{border-color:#d3d9e3; box-shadow:var(--sh-lg); transform:translateY(-1px)}
+  .chip .body{flex:1; min-width:0}
+  .chip .t{
+    font-weight:650; font-size:13.5px; font-variant-numeric:tabular-nums;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .chip .m{
+    font-size:11.5px; color:var(--faint); margin-top:2px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .chip button{opacity:0; padding:4px 10px; font-size:12px}
+  .chip:hover button, .chip:focus-within button{opacity:1}
+  .empty{
+    grid-column:1/-1; text-align:center; color:var(--faint); font-size:13px;
+    padding:28px 0; border:1px dashed var(--line); border-radius:var(--r-sm); background:#fafbfd;
+  }
+
+  /* ---------- 原始数据 ---------- */
+  details{margin-top:14px}
+  summary{
+    cursor:pointer; color:var(--dim); font-size:12.5px; list-style:none;
+    display:inline-flex; align-items:center; gap:6px; user-select:none;
+  }
+  summary::-webkit-details-marker{display:none}
+  summary::before{content:"▸"; font-size:10px; transition:transform .15s}
+  details[open] summary::before{transform:rotate(90deg)}
+  pre{
+    background:#0f1117; color:#d7dae0; padding:14px; border-radius:var(--r-sm);
+    overflow:auto; max-height:340px; font-size:11.5px; line-height:1.5; margin:10px 0 0;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+
+  /* ---------- 窄屏（手机 / 半屏窗口）---------- */
+  @media (max-width:760px){
+    header{height:auto; min-height:56px; padding:10px 16px; flex-wrap:wrap; gap:8px 10px}
+    .brand .sub{display:none}
+    .pill{order:9; flex-basis:100%; max-width:none; text-align:center}
+    .wrap{padding:14px 14px 56px}
+    .panel{padding:14px 13px}
+    .chip button{opacity:1}          /* 触屏没有 hover，移除按钮得一直露着 */
+  }
 </style>
 </head>
 <body>
+
 <header>
-  <h1>POSS 抢位目标选择器</h1>
-  <span id="status" class="msg"></span>
+  <div class="logo">P</div>
+  <div class="brand">
+    <h1>POSS 抢位目标选择器</h1>
+    <div class="sub">点选要抢的时段 → 写进 config.json</div>
+  </div>
+  <span id="status" class="pill"></span>
   <span class="sp"></span>
-  <button id="reload">重新读取 POSS</button>
+  <button id="reload">重新读取</button>
   <button id="relogin">重新登录</button>
 </header>
 
 <div class="wrap">
   <div id="banner"></div>
 
-  <div class="panel">
-    <div class="row">
-      <label class="f">Activity（活动）
-        <select id="activity"><option value="">— 载入中 —</option></select>
-      </label>
-      <label class="f">Center（中心）
-        <select id="center"><option value="">— 载入中 —</option></select>
-      </label>
-      <label class="f" id="dsWrap" style="display:none">Category（分类）
-        <select id="dataset"></select>
-      </label>
-      <label class="f">Date（日期窗口起始）
-        <select id="datefrom"></select>
-      </label>
-      <button id="fetch">读取时间表</button>
-      <span id="count" class="msg"></span>
+  <section class="panel">
+    <div class="toolbar">
+      <div class="field"><label>Activity 活动</label>
+        <select id="activity"><option value="">载入中…</option></select></div>
+      <div class="field"><label>Center 中心</label>
+        <select id="center"><option value="">载入中…</option></select></div>
+      <div class="field" id="dsWrap" style="display:none"><label>Category 分类</label>
+        <select id="dataset"></select></div>
+      <div class="field"><label>Date 窗口起始</label>
+        <select id="datefrom"></select></div>
+      <div class="field act"><label>&nbsp;</label>
+        <button class="primary" id="fetch">读取时间表</button></div>
     </div>
+    <div class="stats" id="stats"></div>
     <div class="hint" id="selectnote"></div>
-  </div>
+  </section>
 
-  <div class="panel">
-    <div class="gridwrap"><table class="grid" id="grid"></table></div>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>可订时间表</h2>
+      <span class="sp"></span>
+      <span class="hint" id="count" style="margin:0"></span>
+    </div>
+    <div class="gridwrap"><div id="grid"></div></div>
     <div class="legend">
-      <span><i style="background:var(--gray)"></i>不可用</span>
-      <span><i style="background:var(--free)"></i>$0 + 可退押金</span>
-      <span><i style="background:var(--paid)"></i>收费</span>
-      <span><i style="background:var(--unknown);outline:1px dashed #5b9bd5"></i>价格未知（原始数据没给金额字段）</span>
-      <span><i style="background:#f2f4f7;border:1px solid #dfe3e9"></i>原始数据里没有这个时段</span>
-      <span>点击格子加入/移出抢位目标（灰色也能选 —— 现在不可订 ≠ 放位那刻不可订）</span>
+      <span class="lg"><i style="background:var(--gray)"></i>不可用</span>
+      <span class="lg"><i style="background:var(--free)"></i>$0 + 可退押金</span>
+      <span class="lg"><i style="background:var(--paid)"></i>收费</span>
+      <span class="lg"><i style="background:#a5cdf5"></i>价格未知</span>
+      <span class="lg"><i style="background:var(--nodata);box-shadow:inset 0 0 0 1px #e0e5ee"></i>原始数据无此段</span>
+      <span class="lg">灰色也能点 —— 现在不可订 ≠ 放位那刻不可订</span>
     </div>
     <details>
       <summary>看原始 timetable.json（字段对不上时照这个改解析器）</summary>
       <pre id="raw">（先点「读取时间表」）</pre>
     </details>
-  </div>
+  </section>
 
-  <div class="panel">
-    <div class="row">
-      <strong>抢位目标</strong>
-      <span class="hint" id="cfgpath"></span>
+  <section class="panel">
+    <div class="panel-head">
+      <h2>抢位目标</h2>
+      <span class="hint" id="cfgpath" style="margin:0"></span>
       <span class="sp"></span>
       <button id="clear">清空</button>
       <button class="primary" id="save">保存到 config.json</button>
     </div>
     <div class="chips" id="chips"></div>
-  </div>
+  </section>
 </div>
 
 <script>
 const $ = s => document.querySelector(s);
-let META = null, GRID = null, SEL = new Map();
+let META = null, GRID = null, SEL = new Map(), DIRTY = false;
 
-function say(t, cls){ const e=$("#status"); e.textContent=t||""; e.className="msg "+(cls||""); }
+function say(t, cls){ const e=$("#status"); e.textContent=t||""; e.className="pill "+(cls||""); }
 function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function selText(id){ const e=$(id); return e && e.selectedOptions[0] ? e.selectedOptions[0].textContent.trim() : ""; }
 function selVal(id){ const e=$(id); return e ? e.value : ""; }
+function dow(d){ return "日一二三四五六"[new Date(d+"T00:00:00").getDay()]; }
+function markDirty(v){ DIRTY = v; $("#save").classList.toggle("dirty", v); }
 
 async function api(path, opts){
   const r = await fetch(path, opts);
@@ -455,34 +630,36 @@ function roleOptions(role){
 }
 
 async function loadMeta(){
-  say("正在登录 POSS 并读取表单…");
+  say("正在登录 POSS 并读取表单…", "busy");
   try{
     META = await api("/api/meta");
   }catch(e){
-    say("读取失败：" + e.message, "err");
+    say("读取失败", "err");
     $("#banner").innerHTML = '<div class="warn">拿不到 POSS 页面。先确认 <b>.env</b> 里的 '
       + 'POSS_NETID / POSS_PASSWORD 填对了，再点右上角「重新登录」。</div>';
     return;
   }
+  $("#banner").innerHTML = "";
   fillSelect($("#activity"), roleOptions("activity"));
   fillSelect($("#center"), roleOptions("center"));
   const ds = META.roles.dataset;
   $("#dsWrap").style.display = ds ? "" : "none";
   if(ds) fillSelect($("#dataset"), ds.options);
-  const dates = (META.date_options || META.window).map(d => ({value:d, label:d + " " + "日一二三四五六"[new Date(d+"T00:00:00").getDay()]}));
+  const dates = (META.date_options || META.window).map(d => ({value:d, label:d + " " + dow(d)}));
   fillSelect($("#datefrom"), dates);
 
-  const found = Object.keys(META.roles);
   const missing = ["activity","center"].filter(r => !META.roles[r]);
   $("#selectnote").textContent =
-    "页面上识别到的下拉框：" + META.selects.map(s => `${s.name||"?"}(${s.role})`).join("、")
-    + (missing.length ? "　⚠️ 没认出来的角色：" + missing.join("、") + " —— 照上面括号里的名字告诉我，我改映射" : "");
+    "识别到的下拉框：" + META.selects.map(s => `${s.name||"?"}(${s.role})`).join("、")
+    + (missing.length ? "　⚠️ 没认出的角色：" + missing.join("、") + " —— 把上面括号里的名字告诉我，我改映射" : "");
 
   $("#cfgpath").textContent = "写入：" + META.config_file;
   SEL.clear();
   for(const t of (META.targets||[])) SEL.set(keyOf(t), t);
+  markDirty(false);
   renderChips();
-  say("就绪，选好 Activity / Center 后点「读取时间表」", "ok");
+  renderStats();
+  say("就绪", "ok");
   await fetchGrid();
 }
 
@@ -494,19 +671,21 @@ async function fetchGrid(){
   const q = new URLSearchParams({ctrId: ctr, start: $("#datefrom").value});
   if(META.roles.activity && $("#activity").value) q.set("actvId", $("#activity").value);
   if(META.roles.dataset && $("#dataset").value) q.set("dataSetId", $("#dataset").value);
-  say("读取时间表中…");
+  say("读取时间表中…", "busy");
   try{
     const res = await api("/api/timetable?" + q.toString());
     GRID = res.grid;
     $("#raw").textContent = JSON.stringify(res.raw, null, 2);
     $("#count").textContent = res.grid ? `解析到 ${res.slot_count} 个时段` : "解析失败";
     renderGrid();
-    if(res.warning) say("原始数据拿到了，但解析不出时段：" + res.warning, "err");
+    renderStats();
+    if(res.warning) say("原始数据拿到了，但解析不出时段", "err");
     else say("时间表已更新", "ok");
   }catch(e){
     GRID = null; renderGrid();
     $("#count").textContent = "";
-    say("读取时间表失败：" + e.message, "err");
+    say("读取时间表失败", "err");
+    $("#grid").innerHTML = `<div class="placeholder"><div class="big">⚠️</div>${esc(e.message)}</div>`;
   }
 }
 
@@ -518,12 +697,16 @@ function cellClass(c){
 }
 
 function renderGrid(){
-  const t = $("#grid");
-  if(!GRID){ t.innerHTML = ""; return; }
-  let h = "<thead><tr><th class='tcol'>时间</th>";
+  const box = $("#grid");
+  if(!GRID){
+    box.innerHTML = '<div class="placeholder"><div class="big">🗓️</div>'
+      + '选好 Activity / Center 后点「读取时间表」</div>';
+    return;
+  }
+  let h = "<table class='grid'><thead><tr><th class='tcol'>时间</th>";
   for(const d of GRID.dates){
-    const w = "日一二三四五六"[new Date(d+"T00:00:00").getDay()];
-    h += `<th>${d.slice(5)}<br><span style="font-weight:400;color:#6b7280">(${w})</span></th>`;
+    const cls = (META && d === META.today) ? " class='today'" : "";
+    h += `<th${cls}>${d.slice(5)}<span class="dow">周${dow(d)}</span></th>`;
   }
   h += "</tr></thead><tbody>";
   for(const tm of GRID.times){
@@ -540,8 +723,8 @@ function renderGrid(){
     }
     h += "</tr>";
   }
-  t.innerHTML = h + "</tbody>";
-  t.querySelectorAll(".cell").forEach(el=>{
+  box.innerHTML = h + "</tbody></table>";
+  box.querySelectorAll(".cell").forEach(el=>{
     el.addEventListener("click", ()=>toggle(el.dataset.d, el.dataset.t));
   });
   paintSelection();
@@ -562,8 +745,10 @@ function toggle(date, tm){
       dataSetId: selVal("#dataset")
     });
   }
+  markDirty(true);
   paintSelection();
   renderChips();
+  renderStats();
 }
 
 function paintSelection(){
@@ -573,21 +758,40 @@ function paintSelection(){
   });
 }
 
+function renderStats(){
+  const box = $("#stats");
+  const n = SEL.size;
+  const lead = (META && META.booking.lead_days) || 7;
+  const tt = (META && META.booking.trigger_time) || "08:30";
+  const earliest = [...SEL.values()].map(t => releaseOf(t.date)).sort()[0];
+  const parts = [
+    `<span class="stat">已选 <b>${n}</b> 个目标</span>`,
+    `<span class="stat">放位规则 <b>目标日 −${lead} 天 ${esc(tt)}</b></span>`,
+  ];
+  if(earliest) parts.push(`<span class="stat">最早放位日 <b>${esc(earliest)}</b></span>`);
+  box.innerHTML = n ? parts.join("") : parts.slice(0,2).join("");
+}
+
 function renderChips(){
   const box = $("#chips");
   const items = [...SEL.values()].sort((a,b)=>(a.date+a.from).localeCompare(b.date+b.from));
-  if(!items.length){ box.innerHTML = '<div class="empty">还没选。在网格里点格子。</div>'; return; }
+  if(!items.length){ box.innerHTML = '<div class="empty">还没选。在上面的网格里点格子。</div>'; return; }
   box.innerHTML = "";
   for(const t of items){
     const k = keyOf(t);
     const div = document.createElement("div");
     div.className = "chip";
-    div.innerHTML = `<span class="who">${esc(t.date)} ${esc(t.from)}–${esc(t.to)}</span>
-      <span class="meta">${esc(t.name || t.ctrId)}${t.activity ? " · " + esc(t.activity) : ""}
-      · 放位日 ${esc(releaseOf(t.date))}</span>`;
+    div.innerHTML = `<div class="body">
+        <div class="t">${esc(t.date)}　${esc(t.from)}–${esc(t.to)}</div>
+        <div class="m">${esc(t.name || t.ctrId)}${t.activity ? " · " + esc(t.activity) : ""}
+          · 放位日 ${esc(releaseOf(t.date))}</div>
+      </div>`;
     const b = document.createElement("button");
     b.textContent = "移除";
-    b.onclick = ()=>{ SEL.delete(k); renderChips(); paintSelection(); };
+    b.onclick = ()=>{
+      SEL.delete(k); markDirty(true);
+      renderChips(); paintSelection(); renderStats();
+    };
     div.appendChild(b);
     box.appendChild(div);
   }
@@ -606,22 +810,27 @@ $("#center").onchange = ()=>{ if(META) fetchGrid(); };
 $("#activity").onchange = ()=>{ if(META) fetchGrid(); };
 $("#dataset").onchange = ()=>{ if(META) fetchGrid(); };
 $("#datefrom").onchange = ()=>{ if(META) fetchGrid(); };
-$("#clear").onclick = ()=>{ SEL.clear(); renderChips(); paintSelection(); };
+$("#clear").onclick = ()=>{
+  if(!SEL.size) return;
+  SEL.clear(); markDirty(true);
+  renderChips(); paintSelection(); renderStats();
+};
 $("#relogin").onclick = async ()=>{
-  say("重新登录中…");
+  say("重新登录中…", "busy");
   try{ await api("/api/login", {method:"POST"}); await loadMeta(); }
-  catch(e){ say("登录失败：" + e.message, "err"); }
+  catch(e){ say("登录失败", "err"); }
 };
 $("#save").onclick = async ()=>{
   const targets = [...SEL.values()].sort((a,b)=>(a.date+a.from).localeCompare(b.date+b.from));
   if(!targets.length && !confirm("目标为空，确定要把 config.json 的 targets 清空吗？")) return;
-  say("保存中…");
+  say("保存中…", "busy");
   try{
     const r = await api("/api/targets", {
       method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({targets})
     });
-    say(`已保存 ${r.count} 个目标到 config.json`, "ok");
+    markDirty(false);
+    say(`已保存 ${r.count} 个目标`, "ok");
   }catch(e){ say("保存失败：" + e.message, "err"); }
 };
 
