@@ -25,16 +25,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from poss_client import (
+    DEFAULT_BODY,
     LoginFailed,
     PossClient,
     SessionExpired,
     parse_selects,
+    to_curl,
 )
+import calibrate
 import monitor as M
 
 CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
 DEFAULT_PORT = 8765
 WINDOW_DAYS = 8          # POSS 只放「今天起 8 天」的场
+PLACEHOLDER_RE = re.compile(r"\{[A-Za-z_][\w-]*(?::[^}]*)?\}")
 
 
 def config_path() -> str:
@@ -69,21 +73,103 @@ def load_config_raw() -> dict:
     return {}
 
 
-def save_targets(targets: list) -> dict:
-    """把 targets 写回 config.json（其余字段原样保留），并做一次校验。"""
-    p = config_path()
-    cfg = load_config_raw()
+def deep_merge(base, patch):
+    """把 patch 递归合并进 base：两边都是 dict 就递归，否则 patch 覆盖。"""
+    if not isinstance(base, dict) or not isinstance(patch, dict):
+        return patch
+    out = dict(base)
+    for k, v in patch.items():
+        cur = out.get(k)
+        out[k] = deep_merge(cur, v) if isinstance(v, dict) and isinstance(cur, dict) else v
+    return out
+
+
+def with_defaults(cfg: dict) -> dict:
+    """把内置默认值补进配置。
+
+    `request` 的默认值住在 poss_client.DEFAULT_BODY 里（bookType/dataSetId/actvId…），
+    不补的话 UI 上那几个框会是空的 —— 用户看到的是「没配」，实际却有生效值。
+    """
+    cfg = dict(cfg)
     booking = dict(M.DEFAULT_BOOKING)
     booking.update(cfg.get("booking") or {})
-    booking["targets"] = targets
     cfg["booking"] = booking
     cfg.setdefault("gyms", M.DEFAULT_GYMS)
-    cfg.setdefault("fallback", {"enabled": True})
-    cfg.setdefault("request", {})
-    M._validate_config(cfg)          # 配置非法就别落盘，免得 Actions 里炸
-    with open(p, "w", encoding="utf-8") as f:
+    fb = {"enabled": True}
+    fb.update(cfg.get("fallback") or {})
+    cfg["fallback"] = fb
+    req = dict(DEFAULT_BODY)
+    req.update(cfg.get("request") or {})
+    cfg["request"] = req
+    return cfg
+
+
+def effective_config() -> dict:
+    """补齐默认值后的完整配置（UI 展示与校验都用它）。"""
+    return with_defaults(load_config_raw())
+
+
+def save_config(patch: dict) -> dict:
+    """把 UI 提交的配置片段合并进 config.json。
+
+    先合并 → 补默认值 → 校验，**校验不过就绝不落盘**，
+    否则坏配置进了仓库、等 Actions 跑起来才炸。
+    """
+    cfg = with_defaults(deep_merge(load_config_raw(), patch or {}))
+    M._validate_config(cfg)
+    with open(config_path(), "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     return cfg
+
+
+def save_targets(targets: list) -> dict:
+    """只改 booking.targets，其余字段原样保留。"""
+    return save_config({"booking": {"targets": targets}})
+
+
+# ---- 预订模板（.curl 文件，不是 config.json）----
+
+def template_status(cfg: dict | None = None) -> dict:
+    """每一步的 cURL 模板导入了没有 —— 没导入就根本抢不了位。"""
+    b = (cfg or effective_config())["booking"]
+    steps = M.load_booking_steps(b)
+    out = []
+    for i, st in enumerate(steps):
+        path = st.get("curl_file") or b.get("curl_file") or M.BOOKING_CURL_FILE
+        txt = M.load_step_curl(st, b, i)
+        out.append({
+            "step": i + 1,
+            "file": str(path),
+            "imported": bool(txt),
+            "bytes": len(txt or ""),
+            "extract": sorted((st.get("extract") or {}).keys()),
+        })
+    return {"steps": out, "ready": bool(out) and all(s["imported"] for s in out)}
+
+
+def import_template(idx: int, curl_text: str) -> dict:
+    """把一条抓包 cURL 模板化后写进第 idx 步的 .curl 文件。
+
+    刻意**不写进 config.json** —— 模板里可能残留会话凭据痕迹，
+    而 config.json 是要提交进仓库的。
+    """
+    if not (curl_text or "").strip():
+        raise ValueError("cURL 文本是空的")
+    cfg = effective_config()
+    b = cfg["booking"]
+    steps = M.load_booking_steps(b)
+    if not (0 <= idx < len(steps)):
+        raise ValueError(f"没有第 {idx + 1} 步（当前共 {len(steps)} 步）")
+    info = calibrate.import_curl(curl_text)
+    text = to_curl(info["method"], info["url"], info["headers"], info["data"])
+    path = steps[idx].get("curl_file") or b.get("curl_file") or M.BOOKING_CURL_FILE
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.rstrip("\n") + "\n")
+    return {
+        "step": idx + 1, "file": path, "bytes": len(text),
+        "method": info["method"], "mode": info["mode"],
+        "placeholders": sorted(set(PLACEHOLDER_RE.findall(text))),
+    }
 
 
 # ==================== 时间表 → 网格 ====================
@@ -189,6 +275,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(self.api_timetable(q))
             elif u.path == "/api/targets":
                 self._json({"ok": True, "targets": load_config_raw().get("booking", {}).get("targets", [])})
+            elif u.path == "/api/config":
+                self._json(self.api_get_config())
+            elif u.path == "/api/template":
+                self._json({"ok": True, "status": template_status()})
             else:
                 self._err("not found", 404)
         except ValueError as e:
@@ -215,6 +305,19 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[ui] 已写入 {config_path()}：{len(targets)} 个目标")
                 self._json({"ok": True, "count": len(targets),
                             "targets": cfg["booking"]["targets"]})
+            elif u.path == "/api/config":
+                body = self._read_body()
+                with _lock:
+                    cfg = save_config(body)
+                print(f"[ui] 已写入 {config_path()}（设置）")
+                self._json({"ok": True, "config": cfg})
+            elif u.path == "/api/template":
+                body = self._read_body()
+                step = int(body.get("step") or 1) - 1
+                with _lock:
+                    info = import_template(step, body.get("curl") or "")
+                print(f"[ui] 已导入第 {info['step']} 步模板 → {info['file']}（{info['bytes']} 字节）")
+                self._json({"ok": True, "info": info, "status": template_status()})
             else:
                 self._err("not found", 404)
         except ValueError as e:                         # 配置校验失败
@@ -235,9 +338,8 @@ class Handler(BaseHTTPRequestHandler):
         roles = {}
         for s in selects:
             roles.setdefault(s["role"], s)
-        cfg = load_config_raw()
-        booking = dict(M.DEFAULT_BOOKING)
-        booking.update(cfg.get("booking") or {})
+        cfg = with_defaults(load_config_raw())
+        booking = cfg["booking"]
         today = M.hk_now().date()
         return {
             "ok": True,
@@ -254,7 +356,25 @@ class Handler(BaseHTTPRequestHandler):
                 "to": booking["to"],
                 "trigger_days": booking["trigger_days"],
             },
+            "template": template_status(),
             "config_file": os.path.abspath(config_path()),
+        }
+
+    def api_get_config(self):
+        cfg = effective_config()
+        b = cfg["booking"]
+        return {
+            "ok": True,
+            "config": cfg,
+            "template": template_status(cfg),
+            "defaults": M.DEFAULT_BOOKING,
+            "derived": {
+                "mode": "targets" if b.get("targets") else "derived",
+                "release_rule": f"目标日 − {b['lead_days']} 天 {b['trigger_time']}",
+                "config_file": os.path.abspath(config_path()),
+                # booking.gyms 会盖掉顶层 gyms 的顺序，UI 里要提示
+                "booking_gyms_override": bool(b.get("gyms")),
+            },
         }
 
     def api_timetable(self, q):
@@ -288,7 +408,7 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>POSS 抢位目标选择器</title>
+<title>POSS 抢位控制台</title>
 <style>
   :root{
     --bg:#f5f6f8; --panel:#fff; --line:#e6e9ef; --line-2:#eef1f6;
@@ -308,7 +428,7 @@ PAGE = r"""<!DOCTYPE html>
          "Microsoft YaHei",Inter,"Helvetica Neue",Arial,sans-serif;
     -webkit-font-smoothing:antialiased;
   }
-  h1,h2{margin:0;font-weight:650}
+  h1,h2,h3{margin:0;font-weight:650}
   .sp{flex:1}
 
   /* ---------- 顶栏 ---------- */
@@ -343,7 +463,7 @@ PAGE = r"""<!DOCTYPE html>
     font:inherit; font-size:13px; padding:7px 13px; border-radius:var(--r-sm);
     border:1px solid var(--line); background:#fff; color:var(--ink); cursor:pointer;
     box-shadow:var(--sh); display:inline-flex; align-items:center; gap:6px;
-    white-space:nowrap;   /* 别让「重新登录」在窄屏被折成两行 */
+    white-space:nowrap;
     transition:transform .13s, box-shadow .13s, border-color .13s, background .13s;
   }
   button:hover{border-color:#d3d9e3; transform:translateY(-1px); box-shadow:var(--sh-lg)}
@@ -355,7 +475,6 @@ PAGE = r"""<!DOCTYPE html>
   }
   button.primary:hover{background:var(--accent-h); border-color:var(--accent-h)}
   button.primary:disabled{opacity:.45; cursor:not-allowed; transform:none; box-shadow:none}
-  /* 有未保存改动时，保存按钮上亮个小点 */
   button.dirty::after{
     content:""; width:7px; height:7px; border-radius:50%; background:#fbbf24;
     box-shadow:0 0 0 3px rgba(251,191,36,.28);
@@ -393,6 +512,28 @@ PAGE = r"""<!DOCTYPE html>
   }
   select:hover{border-color:#cfd6e2}
   select:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(79,70,229,.13)}
+
+  input[type=text],input[type=time],input[type=number]{
+    font:inherit; font-size:13.5px; width:100%; height:38px; padding:0 11px;
+    border:1px solid var(--line); border-radius:var(--r-sm);
+    background:#fff; color:var(--ink); transition:border-color .13s, box-shadow .13s;
+  }
+  input[type=time]{font-variant-numeric:tabular-nums}
+  input:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(79,70,229,.13)}
+
+  textarea{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:12.5px; line-height:1.55; width:100%; padding:9px 11px;
+    border:1px solid var(--line); border-radius:var(--r-sm);
+    background:#fff; color:var(--ink); resize:vertical;
+    transition:border-color .13s, box-shadow .13s;
+  }
+  textarea:focus{outline:none; border-color:var(--accent); box-shadow:0 0 0 3px rgba(79,70,229,.13)}
+
+  /* auto-fill 而不是 auto-fit：后者会把空轨道折叠掉，
+     于是「2 个开关」那行变成 2 列各占一半，跟下面「6 个数字框」的列宽对不齐 */
+  .rows{display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(148px,1fr))}
+  .rows.wide{grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
 
   .stats{display:flex; flex-wrap:wrap; gap:8px; margin-top:14px}
   .stat{
@@ -496,29 +637,85 @@ PAGE = r"""<!DOCTYPE html>
     padding:28px 0; border:1px dashed var(--line); border-radius:var(--r-sm); background:#fafbfd;
   }
 
-  /* ---------- 原始数据 ---------- */
-  details{margin-top:14px}
-  summary{
+  /* ---------- 设置 ---------- */
+  .sec{border-top:1px solid var(--line-2); margin-top:18px; padding-top:16px}
+  .sec:first-of-type{border-top:none; margin-top:0; padding-top:0}
+  .sec > h3{
+    font-size:11.5px; font-weight:650; color:var(--dim);
+    letter-spacing:.04em; margin-bottom:11px;
+  }
+  .switch{
+    display:inline-flex; align-items:center; gap:9px; cursor:pointer; user-select:none;
+    font-size:13.5px; height:38px;
+  }
+  .switch input{position:absolute; opacity:0; width:0; height:0}
+  .switch .track{
+    width:38px; height:22px; border-radius:999px; background:#d5dae3;
+    position:relative; transition:background .18s; flex:none;
+  }
+  .switch .track::after{
+    content:""; position:absolute; top:2px; left:2px; width:18px; height:18px;
+    border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.25);
+    transition:transform .18s;
+  }
+  .switch input:checked + .track{background:var(--accent)}
+  .switch input:checked + .track::after{transform:translateX(16px)}
+  .switch input:focus-visible + .track{box-shadow:0 0 0 3px rgba(79,70,229,.25)}
+
+  .days{display:flex; gap:7px; flex-wrap:wrap}
+  .day{cursor:pointer; user-select:none}
+  .day input{position:absolute; opacity:0; width:0; height:0}
+  .day span{
+    display:inline-block; padding:7px 13px; font-size:12.5px; border-radius:8px;
+    border:1px solid var(--line); background:#fff; transition:.13s;
+  }
+  .day input:checked + span{
+    background:var(--accent); border-color:var(--accent); color:#fff; font-weight:650;
+  }
+  .day input:focus-visible + span{box-shadow:0 0 0 3px rgba(79,70,229,.25)}
+
+  .tpl{
+    display:flex; align-items:center; gap:10px; padding:10px 12px;
+    border:1px solid var(--line); border-radius:var(--r-sm); background:#fbfcfe;
+    margin-bottom:9px; font-size:12.5px;
+  }
+  .tpl .dot{width:8px; height:8px; border-radius:50%; flex:none}
+  .tpl .dot.ok{background:#10b981; box-shadow:0 0 0 3px rgba(16,185,129,.18)}
+  .tpl .dot.no{background:#ef4444; box-shadow:0 0 0 3px rgba(239,68,68,.18)}
+  .tpl code{font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11.5px; color:var(--dim)}
+  .tpl .sp{flex:1}
+
+  details.adv > summary{
+    cursor:pointer; color:var(--dim); font-size:13px; font-weight:600; list-style:none;
+    display:inline-flex; align-items:center; gap:7px; user-select:none;
+    padding:8px 0; margin-top:6px;
+  }
+  details.adv > summary::-webkit-details-marker{display:none}
+  details.adv > summary::before{content:"▸"; font-size:10px; transition:transform .15s}
+  details.adv[open] > summary::before{transform:rotate(90deg)}
+
+  details.raw{margin-top:14px}
+  details.raw > summary{
     cursor:pointer; color:var(--dim); font-size:12.5px; list-style:none;
     display:inline-flex; align-items:center; gap:6px; user-select:none;
   }
-  summary::-webkit-details-marker{display:none}
-  summary::before{content:"▸"; font-size:10px; transition:transform .15s}
-  details[open] summary::before{transform:rotate(90deg)}
+  details.raw > summary::-webkit-details-marker{display:none}
+  details.raw > summary::before{content:"▸"; font-size:10px; transition:transform .15s}
+  details.raw[open] > summary::before{transform:rotate(90deg)}
   pre{
     background:#0f1117; color:#d7dae0; padding:14px; border-radius:var(--r-sm);
     overflow:auto; max-height:340px; font-size:11.5px; line-height:1.5; margin:10px 0 0;
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
   }
 
-  /* ---------- 窄屏（手机 / 半屏窗口）---------- */
+  /* ---------- 窄屏 ---------- */
   @media (max-width:760px){
     header{height:auto; min-height:56px; padding:10px 16px; flex-wrap:wrap; gap:8px 10px}
     .brand .sub{display:none}
     .pill{order:9; flex-basis:100%; max-width:none; text-align:center}
     .wrap{padding:14px 14px 56px}
     .panel{padding:14px 13px}
-    .chip button{opacity:1}          /* 触屏没有 hover，移除按钮得一直露着 */
+    .chip button{opacity:1}
   }
 </style>
 </head>
@@ -527,8 +724,8 @@ PAGE = r"""<!DOCTYPE html>
 <header>
   <div class="logo">P</div>
   <div class="brand">
-    <h1>POSS 抢位目标选择器</h1>
-    <div class="sub">点选要抢的时段 → 写进 config.json</div>
+    <h1>POSS 抢位控制台</h1>
+    <div class="sub">选目标 · 调参数 · 一步到位</div>
   </div>
   <span id="status" class="pill"></span>
   <span class="sp"></span>
@@ -539,6 +736,7 @@ PAGE = r"""<!DOCTYPE html>
 <div class="wrap">
   <div id="banner"></div>
 
+  <!-- ① 选目标 -->
   <section class="panel">
     <div class="toolbar">
       <div class="field"><label>Activity 活动</label>
@@ -556,6 +754,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="hint" id="selectnote"></div>
   </section>
 
+  <!-- ② 时间表 -->
   <section class="panel">
     <div class="panel-head">
       <h2>可订时间表</h2>
@@ -571,35 +770,150 @@ PAGE = r"""<!DOCTYPE html>
       <span class="lg"><i style="background:var(--nodata);box-shadow:inset 0 0 0 1px #e0e5ee"></i>原始数据无此段</span>
       <span class="lg">灰色也能点 —— 现在不可订 ≠ 放位那刻不可订</span>
     </div>
-    <details>
+    <details class="raw">
       <summary>看原始 timetable.json（字段对不上时照这个改解析器）</summary>
       <pre id="raw">（先点「读取时间表」）</pre>
     </details>
   </section>
 
+  <!-- ③ 目标 -->
   <section class="panel">
     <div class="panel-head">
       <h2>抢位目标</h2>
-      <span class="hint" id="cfgpath" style="margin:0"></span>
       <span class="sp"></span>
       <button id="clear">清空</button>
-      <button class="primary" id="save">保存到 config.json</button>
+      <button class="primary" id="save">保存目标</button>
     </div>
     <div class="chips" id="chips"></div>
+  </section>
+
+  <!-- ④ 设置 -->
+  <section class="panel">
+    <div class="panel-head">
+      <h2>设置</h2>
+      <span class="hint" id="cfgpath" style="margin:0"></span>
+      <span class="sp"></span>
+      <button id="resetCfg">恢复默认值</button>
+      <button class="primary" id="saveCfg">保存设置</button>
+    </div>
+
+    <div class="sec">
+      <h3>常用</h3>
+      <div class="rows">
+        <label class="switch"><input type="checkbox" id="bk_enabled"><span class="track"></span>自动抢位</label>
+        <label class="switch"><input type="checkbox" id="fb_enabled"><span class="track"></span>蹲守提醒</label>
+      </div>
+      <div class="rows" style="margin-top:12px">
+        <div class="field"><label>放位时刻</label><input type="time" id="bk_trigger_time"></div>
+        <div class="field"><label>提前几天抢</label><input type="number" id="bk_lead_days" min="0" max="60"></div>
+        <div class="field"><label>预热（分钟）</label><input type="number" id="bk_warmup" min="0" max="120"></div>
+        <div class="field"><label>宽限（分钟）</label><input type="number" id="bk_grace" min="0" max="600"></div>
+        <div class="field"><label>爆发时长（秒）</label><input type="number" id="bk_burst" min="0" max="3600"></div>
+        <div class="field"><label>重试间隔（秒）</label><input type="number" id="bk_retry" min="0" max="600"></div>
+      </div>
+      <div class="hint" id="ruleHint"></div>
+    </div>
+
+    <details class="adv" id="adv">
+      <summary>高级设置</summary>
+
+      <div class="sec">
+        <h3>触发日（只在没配抢位目标时生效）</h3>
+        <div class="days" id="days"></div>
+        <div class="hint">配了抢位目标后，脚本按每个目标各自的「放位日」干活，这里就不再起作用。</div>
+      </div>
+
+      <div class="sec">
+        <h3>默认时段（派生模式 / 蹲守用）</h3>
+        <div class="rows">
+          <div class="field"><label>起</label><input type="time" id="bk_from"></div>
+          <div class="field"><label>止</label><input type="time" id="bk_to"></div>
+          <div class="field"><label>日期格式</label><input type="text" id="bk_datefmt" placeholder="%Y-%m-%d"></div>
+        </div>
+      </div>
+
+      <div class="sec">
+        <h3>场馆列表（名字=ctrId，每行一个）</h3>
+        <textarea id="ta_gyms" rows="4" spellcheck="false"></textarea>
+        <div class="hint" id="gymHint"></div>
+      </div>
+
+      <div class="sec">
+        <h3>请求参数</h3>
+        <div class="rows">
+          <div class="field"><label>bookType</label><input type="text" id="rq_booktype"></div>
+          <div class="field"><label>dataSetId</label><input type="text" id="rq_datasetid"></div>
+          <div class="field"><label>actvId</label><input type="text" id="rq_actvid"></div>
+          <div class="field"><label>facilityId</label><input type="text" id="rq_facilityid"></div>
+          <div class="field"><label>searchDates（逗号分隔）</label><input type="text" id="rq_searchdates"></div>
+          <div class="field"><label>&nbsp;</label>
+            <label class="switch"><input type="checkbox" id="rq_showcourt"><span class="track"></span>显示场地详情</label></div>
+        </div>
+        <div class="hint">目标里带了 actvId / dataSetId 时，以目标为准。</div>
+      </div>
+
+      <div class="sec">
+        <h3>结果判定</h3>
+        <div class="rows wide">
+          <div class="field"><label>成功关键词（逗号分隔）</label><input type="text" id="kw_success"></div>
+          <div class="field"><label>失败关键词（逗号分隔）</label><input type="text" id="kw_failure"></div>
+        </div>
+        <div class="field" style="margin-top:12px"><label>结果页地址（留空用默认）</label>
+          <input type="text" id="bk_result_url" placeholder="https://www40.polyu.edu.hk/.../make_book_result.do"></div>
+        <div class="hint">判定顺序是<b>先失败后成功</b>：英文 <code>unsuccessful</code> 含 <code>success</code>，
+          反过来判会把失败读成抢到。真跑一次后照 <code>dumps/</code> 里的结果页原文微调。</div>
+      </div>
+
+      <div class="sec">
+        <h3>蹲守目标（JSON，留空 = 跟随抢位目标）</h3>
+        <textarea id="ta_fbtargets" rows="3" spellcheck="false" placeholder="[]"></textarea>
+      </div>
+
+      <div class="sec">
+        <h3>预订流程（JSON，导入 cURL 时自动生成，一般别手改）</h3>
+        <textarea id="ta_steps" rows="4" spellcheck="false"></textarea>
+      </div>
+
+      <div class="sec">
+        <h3>预订模板（抓包导入）</h3>
+        <div id="tplStatus"></div>
+        <div class="rows wide" style="margin-top:12px">
+          <div class="field">
+            <label>第 1 步 · 选时段进确认页</label>
+            <textarea id="tpl1" rows="4" spellcheck="false" placeholder="在 POSS 里选中时段点提交，右键 → 复制 → 以 cURL 格式复制，粘到这里"></textarea>
+            <button style="margin-top:8px" data-step="1" class="imp">导入第 1 步</button>
+          </div>
+          <div class="field">
+            <label>第 2 步 · 勾选 declare 最终提交</label>
+            <textarea id="tpl2" rows="4" spellcheck="false" placeholder="勾上 declare 再提交，同样复制 cURL 粘到这里"></textarea>
+            <button style="margin-top:8px" data-step="2" class="imp">导入第 2 步</button>
+          </div>
+        </div>
+        <div class="hint">
+          模板写到 <code>booking_step1.curl</code> / <code>booking.curl</code>（已被 .gitignore 排除），
+          <b>不会写进 config.json</b> —— 里面可能残留会话凭据痕迹，而 config.json 是要提交进仓库的。
+          部署到 Actions 时，把这两个文件的全文分别贴进 Secrets 的
+          <code>BOOKING_CURL_STEP1</code> / <code>BOOKING_CURL_STEP2</code>。
+        </div>
+      </div>
+    </details>
   </section>
 </div>
 
 <script>
 const $ = s => document.querySelector(s);
-let META = null, GRID = null, SEL = new Map(), DIRTY = false;
+const DOWS = ["一","二","三","四","五","六","日"];   // 0=周一，与后端一致
+let META = null, GRID = null, CFG = null, DEFAULTS = null, TPL = null;
+let SEL = new Map(), DIRTY = false, CFG_DIRTY = false;
 
 function say(t, cls){ const e=$("#status"); e.textContent=t||""; e.className="pill "+(cls||""); }
 function esc(s){ return String(s==null?"":s).replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function selText(id){ const e=$(id); return e && e.selectedOptions[0] ? e.selectedOptions[0].textContent.trim() : ""; }
 function selVal(id){ const e=$(id); return e ? e.value : ""; }
-function dow(d){ return "日一二三四五六"[new Date(d+"T00:00:00").getDay()]; }
+function dow(d){ return DOWS[(new Date(d+"T00:00:00").getDay() + 6) % 7]; }
 function markDirty(v){ DIRTY = v; $("#save").classList.toggle("dirty", v); }
+function markCfgDirty(v){ CFG_DIRTY = v; $("#saveCfg").classList.toggle("dirty", v); }
 
 async function api(path, opts){
   const r = await fetch(path, opts);
@@ -607,6 +921,12 @@ async function api(path, opts){
   if(!r.ok || j.ok===false) throw new Error(j.error || ("HTTP "+r.status));
   return j;
 }
+function post(path, obj){
+  return api(path, {method:"POST", headers:{"Content-Type":"application/json"},
+                    body: JSON.stringify(obj)});
+}
+
+/* ==================== 目标选择 ==================== */
 
 function fillSelect(el, items){
   el.innerHTML = "";
@@ -617,13 +937,11 @@ function fillSelect(el, items){
     if(it.selected){ o.selected = true; picked = true; }
     el.appendChild(o);
   }
-  // 抓下来的 selected 状态要照搬；没有的话别停在空占位项上
   if(!picked){
     const first = [...el.options].find(o => o.value !== "");
     if(first) el.value = first.value;
   }
 }
-
 function roleOptions(role){
   const s = META.roles[role];
   return s ? s.options.filter(o => o.value !== "") : [];
@@ -639,7 +957,6 @@ async function loadMeta(){
       + 'POSS_NETID / POSS_PASSWORD 填对了，再点右上角「重新登录」。</div>';
     return;
   }
-  $("#banner").innerHTML = "";
   fillSelect($("#activity"), roleOptions("activity"));
   fillSelect($("#center"), roleOptions("center"));
   const ds = META.roles.dataset;
@@ -657,8 +974,8 @@ async function loadMeta(){
   SEL.clear();
   for(const t of (META.targets||[])) SEL.set(keyOf(t), t);
   markDirty(false);
-  renderChips();
-  renderStats();
+  renderChips(); renderStats();
+  await loadConfig();
   say("就绪", "ok");
   await fetchGrid();
 }
@@ -677,8 +994,7 @@ async function fetchGrid(){
     GRID = res.grid;
     $("#raw").textContent = JSON.stringify(res.raw, null, 2);
     $("#count").textContent = res.grid ? `解析到 ${res.slot_count} 个时段` : "解析失败";
-    renderGrid();
-    renderStats();
+    renderGrid(); renderStats();
     if(res.warning) say("原始数据拿到了，但解析不出时段", "err");
     else say("时间表已更新", "ok");
   }catch(e){
@@ -745,10 +1061,7 @@ function toggle(date, tm){
       dataSetId: selVal("#dataset")
     });
   }
-  markDirty(true);
-  paintSelection();
-  renderChips();
-  renderStats();
+  markDirty(true); paintSelection(); renderChips(); renderStats();
 }
 
 function paintSelection(){
@@ -761,15 +1074,23 @@ function paintSelection(){
 function renderStats(){
   const box = $("#stats");
   const n = SEL.size;
-  const lead = (META && META.booking.lead_days) || 7;
-  const tt = (META && META.booking.trigger_time) || "08:30";
-  const earliest = [...SEL.values()].map(t => releaseOf(t.date)).sort()[0];
+  const lead = (CFG && CFG.booking.lead_days) ?? 7;
+  const tt = (CFG && CFG.booking.trigger_time) || "08:30";
   const parts = [
     `<span class="stat">已选 <b>${n}</b> 个目标</span>`,
     `<span class="stat">放位规则 <b>目标日 −${lead} 天 ${esc(tt)}</b></span>`,
   ];
+  const earliest = [...SEL.values()].map(t => releaseOf(t.date)).sort()[0];
   if(earliest) parts.push(`<span class="stat">最早放位日 <b>${esc(earliest)}</b></span>`);
-  box.innerHTML = n ? parts.join("") : parts.slice(0,2).join("");
+  box.innerHTML = parts.join("");
+}
+
+function releaseOf(date){
+  const lead = (CFG && CFG.booking.lead_days) ?? 7;
+  const tt = (CFG && CFG.booking.trigger_time) || "08:30";
+  const d = new Date(date + "T00:00:00");
+  d.setDate(d.getDate() - lead);
+  return d.toISOString().slice(0,10) + " " + tt;
 }
 
 function renderChips(){
@@ -788,21 +1109,160 @@ function renderChips(){
       </div>`;
     const b = document.createElement("button");
     b.textContent = "移除";
-    b.onclick = ()=>{
-      SEL.delete(k); markDirty(true);
-      renderChips(); paintSelection(); renderStats();
-    };
+    b.onclick = ()=>{ SEL.delete(k); markDirty(true); renderChips(); paintSelection(); renderStats(); };
     div.appendChild(b);
     box.appendChild(div);
   }
 }
 
-function releaseOf(date){
-  const lead = (META && META.booking.lead_days) || 7;
-  const d = new Date(date + "T00:00:00");
-  d.setDate(d.getDate() - lead);
-  return d.toISOString().slice(0,10) + " " + ((META && META.booking.trigger_time) || "08:30");
+/* ==================== 设置 ==================== */
+
+async function loadConfig(){
+  const r = await api("/api/config");
+  CFG = r.config; DEFAULTS = r.defaults; TPL = r.template;
+  fillSettings(); renderTplStatus(); markCfgDirty(false);
 }
+
+function fillSettings(){
+  const b = CFG.booking, f = CFG.fallback || {}, q = CFG.request || {};
+  $("#bk_enabled").checked = !!b.enabled;
+  $("#fb_enabled").checked = f.enabled !== false;
+  $("#bk_trigger_time").value = b.trigger_time || "08:30";
+  $("#bk_lead_days").value = b.lead_days ?? 7;
+  $("#bk_warmup").value = b.warmup_minutes ?? 6;
+  $("#bk_grace").value = b.grace_minutes ?? 30;
+  $("#bk_burst").value = b.burst_seconds ?? 120;
+  $("#bk_retry").value = b.retry_interval ?? 3;
+
+  $("#days").innerHTML = DOWS.map((d, i) =>
+    `<label class="day"><input type="checkbox" value="${i}"${(b.trigger_days||[]).includes(i) ? " checked" : ""}><span>${d}</span></label>`
+  ).join("");
+
+  $("#bk_from").value = b.from || "16:30";
+  $("#bk_to").value = b.to || "17:30";
+  $("#bk_datefmt").value = b.search_date_format || "%Y-%m-%d";
+  $("#ta_gyms").value = (CFG.gyms || []).map(g => `${g.name}=${g.ctrId}`).join("\n");
+  $("#gymHint").innerHTML = b.gyms && b.gyms.length
+    ? `⚠️ config.json 里的 <code>booking.gyms</code> 非空（${esc(b.gyms.join("、"))}），`
+      + `它会盖掉这里的顺序。把它清空才会用上面的列表。`
+    : "派生模式下按这个顺序依次尝试；蹲守也按它决定盯哪些馆。";
+
+  $("#rq_booktype").value = q.bookType ?? "";
+  $("#rq_datasetid").value = q.dataSetId ?? "";
+  $("#rq_actvid").value = q.actvId ?? "";
+  $("#rq_facilityid").value = q.facilityId ?? "";
+  $("#rq_searchdates").value = (q.searchDates || []).join(", ");
+  $("#rq_showcourt").checked = String(q.showCourtAreaDetails) === "true";
+
+  $("#kw_success").value = (b.success_keywords || []).join(", ");
+  $("#kw_failure").value = (b.failure_keywords || []).join(", ");
+  $("#bk_result_url").value = b.result_url || "";
+  $("#ta_fbtargets").value = JSON.stringify(f.targets || [], null, 2);
+  $("#ta_steps").value = JSON.stringify(b.steps || [], null, 2);
+  renderRuleHint();
+}
+
+function renderRuleHint(){
+  const n = (CFG && CFG.booking.targets || []).length;
+  $("#ruleHint").textContent = n
+    ? `已配 ${n} 个抢位目标：脚本只在每个目标的「放位日」（目标日 − 提前天数）那一刻开抢，跟上面的触发日无关。`
+    : "还没配抢位目标：脚本会按「今天 + 提前天数」的派生逻辑，在触发日那天开抢默认时段。";
+}
+
+function renderTplStatus(){
+  const box = $("#tplStatus");
+  if(!TPL) { box.innerHTML = ""; return; }
+  box.innerHTML = TPL.steps.map(s =>
+    `<div class="tpl"><span class="dot ${s.imported ? "ok" : "no"}"></span>
+      <b>第 ${s.step} 步</b>
+      <code>${esc(s.file)}</code>
+      <span class="sp"></span>
+      <span>${s.imported ? esc(s.bytes + " 字节") : "尚未导入"}</span>
+    </div>`
+  ).join("") + (TPL.ready
+    ? '<div class="hint" style="color:var(--ok)">✓ 预订模板齐了，可以真提交。</div>'
+    : '<div class="hint" style="color:var(--err)">✗ 模板不全 —— 现在只会蹲守提醒，不会真抢。</div>');
+  const banner = $("#banner");
+  if(!TPL.ready && banner.dataset.tplWarn !== "1"){
+    banner.dataset.tplWarn = "1";
+    banner.innerHTML = '<div class="warn"><b>预订模板还没导入</b>：'
+      + '脚本能读时间表、能蹲守提醒，但不会真的下单。'
+      + '展开下面的「设置 → 高级设置 → 预订模板」，把两条 cURL 粘进去导入即可。</div>';
+  }
+}
+
+function num(id, name, min=0, max=1e9){
+  const v = parseInt($(id).value, 10);
+  if(!Number.isFinite(v) || v < min || v > max)
+    throw new Error(`${name} 要是 ${min}–${max} 之间的整数`);
+  return v;
+}
+function hhmm(id, name){
+  const v = ($(id).value || "").trim();
+  if(!/^\d{1,2}:\d{2}$/.test(v)) throw new Error(`${name} 要写成 HH:MM`);
+  return v;
+}
+function listOf(id){
+  return $(id).value.split(/[,，\n]/).map(s => s.trim()).filter(Boolean);
+}
+function jsonOf(id, name){
+  const t = $(id).value.trim();
+  if(!t) return [];
+  try{ return JSON.parse(t); }
+  catch(e){ throw new Error(`${name} 不是合法 JSON：${e.message}`); }
+}
+function gymsOf(id){
+  const out = [];
+  for(const raw of $(id).value.split("\n")){
+    const s = raw.trim();
+    if(!s || s.startsWith("#")) continue;
+    const i = s.search(/[=,，:：\t]/);
+    if(i < 0) throw new Error(`场馆列表每行要写成「名字=ctrId」，这行看不懂：${s}`);
+    const name = s.slice(0, i).trim(), ctrId = s.slice(i + 1).trim();
+    if(!name || !ctrId) throw new Error(`场馆这行缺名字或 ctrId：${s}`);
+    out.push({name, ctrId});
+  }
+  if(!out.length) throw new Error("场馆列表不能为空");
+  return out;
+}
+
+function collectSettings(){
+  return {
+    gyms: gymsOf("#ta_gyms"),
+    booking: {
+      enabled: $("#bk_enabled").checked,
+      trigger_time: hhmm("#bk_trigger_time", "放位时刻"),
+      lead_days: num("#bk_lead_days", "提前几天抢", 0, 60),
+      warmup_minutes: num("#bk_warmup", "预热", 0, 120),
+      grace_minutes: num("#bk_grace", "宽限", 0, 600),
+      burst_seconds: num("#bk_burst", "爆发时长", 0, 3600),
+      retry_interval: num("#bk_retry", "重试间隔", 0, 600),
+      trigger_days: [...document.querySelectorAll("#days input:checked")].map(e => +e.value),
+      from: hhmm("#bk_from", "默认时段起"),
+      to: hhmm("#bk_to", "默认时段止"),
+      search_date_format: $("#bk_datefmt").value.trim() || "%Y-%m-%d",
+      success_keywords: listOf("#kw_success"),
+      failure_keywords: listOf("#kw_failure"),
+      result_url: $("#bk_result_url").value.trim(),
+      steps: jsonOf("#ta_steps", "预订流程"),
+      targets: [...SEL.values()].sort((a,b)=>(a.date+a.from).localeCompare(b.date+b.from)),
+    },
+    fallback: {
+      enabled: $("#fb_enabled").checked,
+      targets: jsonOf("#ta_fbtargets", "蹲守目标"),
+    },
+    request: {
+      bookType: $("#rq_booktype").value.trim(),
+      dataSetId: $("#rq_datasetid").value.trim(),
+      actvId: $("#rq_actvid").value.trim(),
+      facilityId: $("#rq_facilityid").value.trim(),
+      searchDates: listOf("#rq_searchdates"),
+      showCourtAreaDetails: $("#rq_showcourt").checked ? "true" : "false",
+    },
+  };
+}
+
+/* ==================== 事件 ==================== */
 
 $("#fetch").onclick = fetchGrid;
 $("#reload").onclick = loadMeta;
@@ -812,27 +1272,75 @@ $("#dataset").onchange = ()=>{ if(META) fetchGrid(); };
 $("#datefrom").onchange = ()=>{ if(META) fetchGrid(); };
 $("#clear").onclick = ()=>{
   if(!SEL.size) return;
-  SEL.clear(); markDirty(true);
-  renderChips(); paintSelection(); renderStats();
+  SEL.clear(); markDirty(true); renderChips(); paintSelection(); renderStats();
 };
 $("#relogin").onclick = async ()=>{
   say("重新登录中…", "busy");
-  try{ await api("/api/login", {method:"POST"}); await loadMeta(); }
+  try{ await post("/api/login", {}); await loadMeta(); }
   catch(e){ say("登录失败", "err"); }
 };
+
 $("#save").onclick = async ()=>{
   const targets = [...SEL.values()].sort((a,b)=>(a.date+a.from).localeCompare(b.date+b.from));
-  if(!targets.length && !confirm("目标为空，确定要把 config.json 的 targets 清空吗？")) return;
-  say("保存中…", "busy");
+  if(!targets.length && !confirm("目标为空，确定要把 targets 清空吗？")) return;
+  say("保存目标中…", "busy");
   try{
-    const r = await api("/api/targets", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({targets})
-    });
-    markDirty(false);
-    say(`已保存 ${r.count} 个目标`, "ok");
+    await post("/api/targets", {targets});
+    markDirty(false); renderRuleHint();
+    say(`已保存 ${targets.length} 个目标`, "ok");
   }catch(e){ say("保存失败：" + e.message, "err"); }
 };
+
+$("#saveCfg").onclick = async ()=>{
+  let patch;
+  try{ patch = collectSettings(); }
+  catch(e){ say("设置有问题：" + e.message, "err"); return; }
+  say("保存设置中…", "busy");
+  try{
+    const r = await post("/api/config", patch);
+    CFG = r.config;
+    markCfgDirty(false); markDirty(false);
+    fillSettings(); renderStats(); renderChips();
+    say("设置已保存", "ok");
+  }catch(e){ say("保存失败：" + e.message, "err"); }
+};
+
+$("#resetCfg").onclick = ()=>{
+  if(!DEFAULTS) return;
+  CFG = JSON.parse(JSON.stringify(CFG));
+  const keep = CFG.booking.targets;
+  CFG.booking = Object.assign({}, CFG.booking, DEFAULTS);
+  CFG.booking.targets = keep;          // 目标不属于"默认值"，别给清了
+  fillSettings(); markCfgDirty(true);
+  say("已填回默认值，点「保存设置」才会写盘", "ok");
+};
+
+document.querySelectorAll(".imp").forEach(btn => {
+  btn.onclick = async ()=>{
+    const step = +btn.dataset.step;
+    const text = $("#tpl" + step).value;
+    if(!text.trim()){ say(`第 ${step} 步的 cURL 还没粘进来`, "err"); return; }
+    say(`导入第 ${step} 步模板中…`, "busy");
+    try{
+      const r = await post("/api/template", {step, curl: text});
+      TPL = r.status;
+      $("#tpl" + step).value = "";
+      $("#banner").dataset.tplWarn = "";
+      renderTplStatus();
+      say(`第 ${step} 步已导入（${r.info.placeholders.length} 个占位符）`, "ok");
+    }catch(e){ say("导入失败：" + e.message, "err"); }
+  };
+});
+
+// 设置区任何改动都标脏
+document.querySelector("#adv").addEventListener("input", ()=>markCfgDirty(true));
+document.querySelector("#adv").addEventListener("change", ()=>markCfgDirty(true));
+["bk_enabled","fb_enabled","bk_trigger_time","bk_lead_days","bk_warmup","bk_grace",
+ "bk_burst","bk_retry"].forEach(id => {
+  const el = $("#" + id);
+  el.addEventListener("input", ()=>{ markCfgDirty(true); });
+  el.addEventListener("change", ()=>{ markCfgDirty(true); });
+});
 
 loadMeta();
 </script>

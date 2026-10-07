@@ -1,14 +1,26 @@
 # POSS 抢位器 / 蹲位器 🏀
 
-自动登录 PolyU POSS，在触发日（默认**周二、周四 08:30**）准点帮你抢**下周同一天**
-（默认 7 天后）的目标时段（默认 **16:30–17:30**）；没抢到就自动转入**蹲守模式**，
-有人取消放出空位立即 微信推送 + 邮件提醒。
+自动登录 PolyU POSS，在放位日（默认**目标日前 7 天的 08:30**）准点帮你抢目标时段；
+没抢到就自动转入**蹲守模式**，有人取消放出空位立即 微信推送 + 邮件提醒。
 
-两种配置方式，选一种：
+**所有配置都在本地网页里改**，不用手编 JSON：
 
-- **`python3 poss_ui.py`（推荐）** —— 起一个本地网页，像 POSS 那样点选「哪天 / 哪个中心 / 哪个活动 / 哪个时段」，
-  点几下就写进 `config.json`。想抢几节就点几个格子，脚本会一次把能抢的都抢下来。
-- **手改 `config.json`** —— 用 `booking.targets` 明确列出目标，或什么都不写走「今天 + 7 天」的派生逻辑。
+```bash
+python3 poss_ui.py        # 自动打开 http://127.0.0.1:8765
+```
+
+## UI 里能配什么
+
+| 面板 | 能改什么 |
+|---|---|
+| **选目标** | Activity / Center / Category / Date 四个下拉框（直接抓 POSS 页面上的），点格子选时段，可多选 |
+| **抢位目标** | 每个目标的日期、时段、场馆、活动；每个都显示自己的**放位日** |
+| **设置 · 常用** | 自动抢位开关、蹲守开关、放位时刻、提前几天抢、预热 / 宽限 / 爆发时长 / 重试间隔 |
+| **设置 · 高级** | 触发日、默认时段、日期格式、场馆列表、请求参数、成功 / 失败关键词、结果页地址、蹲守目标、预订流程 |
+| **设置 · 预订模板** | 粘贴两条抓包 cURL 直接导入（写进 `.curl` 文件，**不进 config.json**） |
+
+面板顶部会直接告诉你**预订模板导入了没有** —— 没导入就只能蹲守提醒、不会真下单，
+不会让你以为配好了其实没配。
 
 ## 工作原理
 
@@ -23,14 +35,17 @@
 ```
 
 > **放位日**：POSS 只放「今天起 8 天」的场，所以想抢 `D` 那天的场，就得在 `D − 7` 天
-> 的 08:30 去抢。配了 `booking.targets` 后，脚本按每个目标各自的放位日决定要不要干活 ——
+> 的 08:30 去抢。配了抢位目标后，脚本按每个目标各自的放位日决定要不要干活 ——
 > 也就是说放位日不一定落在周二/周四，配什么日子就什么时候抢。UI 里每个目标都会标出它的放位日。
+
+> 不想开网页也行：`config.json` 仍然是唯一真相来源，UI 只是它的编辑器。
+> 用 `booking.targets` 明确列出目标，或什么都不写走「今天 + 提前天数」的派生逻辑。
 
 ## 文件结构
 
 | 文件 | 作用 |
 |---|---|
-| `poss_ui.py` | **本地选课 UI**：点选目标 → 写回 config.json |
+| `poss_ui.py` | **本地控制台**：选目标 + 调所有设置 + 导入 cURL，写回 config.json |
 | `config.json` | **抢位时间/目标/馆列表/活动/蹲守目标 全部可配** |
 | `booking_step1.curl` | 第一步请求模板：选时段 → 进入确认页（已 gitignore） |
 | `booking.curl` | 第二步请求模板：勾选 declare → 最终提交（已 gitignore） |
@@ -41,7 +56,7 @@
 | `state.json` / `session.json` | 运行状态与会话缓存（Actions 自动回写） |
 | `dumps/` | 校准数据 + 预订结果页原文（已 gitignore） |
 
-## 用 UI 选目标（推荐）
+## 用 UI 配好一切（推荐）
 
 ```bash
 cp .env.example .env          # 填 POSS_NETID / POSS_PASSWORD
@@ -49,14 +64,25 @@ pip3 install -r requirements.txt
 python3 poss_ui.py            # 自动打开 http://127.0.0.1:8765
 ```
 
-界面上：
+**① 选目标**
 
 1. **Activity / Center / Category / Date** 四个下拉框直接从 POSS 的 `make_book.do` 页面抓下来 ——
    不是写死的常量，POSS 有什么就有什么。
 2. 点「读取时间表」→ 画出 `日期 × 时段` 的彩色网格（灰=不可用，洋红=$0+可退押金，蓝=收费）。
 3. **点格子选中要抢的时段**（可以选多个）。灰色的格子也能点 —— 现在不可订 ≠ 放位那一刻不可订，
    抢位目标本来就是给未来定的。
-4. 「保存到 config.json」→ 写进 `booking.targets`，每个目标会显示它自己的**放位日**。
+4. 「保存目标」→ 写进 `booking.targets`，每个目标会显示它自己的**放位日**。
+
+**② 调设置**
+
+「设置 · 常用」里改开关、放位时刻、提前几天、爆发时长等；更细的都在「设置 · 高级设置」里。
+改完点「保存设置」。**校验不过不会写盘** —— 坏配置进不了仓库。
+
+**③ 导入预订模板**
+
+「设置 · 高级设置 → 预订模板」里把两条抓包 cURL 粘进去点导入。顶部状态会显示
+`✓ 预订模板齐了` 或 `✗ 模板不全 —— 现在只会蹲守提醒，不会真抢`。
+模板写进 `.curl` 文件（已 gitignore），**不会写进 config.json**。
 
 写入的配置长这样，直接可以提交到仓库给 Actions 用：
 
@@ -73,6 +99,8 @@ python3 poss_ui.py            # 自动打开 http://127.0.0.1:8765
 > `poss_client._ROLE_HINTS` 就行。
 
 ## 配置说明（config.json）
+
+> 下面这些**都能在 UI 里改**，这一节是给想直接看文件的人看的。
 
 ```json
 {
@@ -152,7 +180,11 @@ POSS 的实际流程是**两步**：
 
 第 3 步不用你抓：脚本会跟着那个 302 自己走过去读结果页。
 
-所以你需要**抓两条** cURL，并分别导入成两个模板：
+所以你需要**抓两条** cURL，并分别导入成两个模板。两条路选一条：
+
+**在 UI 里导入（推荐）** —— 展开「设置 → 高级设置 → 预订模板」，把 cURL 粘进对应的框，点导入。
+
+**命令行导入：**
 
 ```bash
 # 第 1 步：选时段进入确认页
@@ -212,13 +244,13 @@ artifact 保留 14 天），判错了照原文改 `config.json` 里的关键字�
 ```bash
 cp .env.example .env      # 填入 POSS_NETID / POSS_PASSWORD（只写本地，别贴聊天）
 pip3 install -r requirements.txt
-# 抓两条 cURL 分别导入：
-python3 calibrate.py --import - --out booking_step1.curl   # 选时段进入确认页
-python3 calibrate.py --import - --out booking.curl         # 勾选 declare 最终提交
-python3 poss_ui.py        # 起本地 UI，点选要抢的时段 → 写进 config.json
+python3 poss_ui.py        # 起本地控制台：选目标 + 调设置 + 导入 cURL，全在这一个页面里
 python3 monitor.py --dump         # 抓真实时间表结构 → dumps/，并检查占位符能否填满
 python3 monitor.py --dry-book     # 演练两步流程并打印真实请求，不真提交
 ```
+
+（不想开网页时，cURL 也可以命令行导入：
+`python3 calibrate.py --import - --out booking_step1.curl`）
 
 ## 第二步：配置通知渠道
 
@@ -239,9 +271,11 @@ python3 monitor.py --dry-book     # 演练两步流程并打印真实请求，�
    - `PUSHPLUS_TOKEN`、`SERVERCHAN_KEY`、`SMTP_HOST`、`SMTP_USER`、`SMTP_PASS`、`MAIL_TO`
    **Variables**（可选）：`POSS_FB_USER_ID`（默认 657032）、`POSS_CONFIG`（整段 JSON，在线覆盖配置）、
    `BOOKING_CURL_FILE_STEP1` / `BOOKING_CURL_FILE_STEP2`（用文件路径而非 Secret 全文）
-3. **把 UI 选好的目标带上云**：`config.json` 里现在有 `booking.targets`。
-   两条路选一条 —— 直接把 `config.json` 提交进仓库（最简单，里面没有凭据），
-   或者把整个 JSON 贴进 `POSS_CONFIG` 这个 Variable（仓库里就不留目标清单了）。
+3. **把 UI 配好的东西带上云**：
+   - `config.json`（含 `booking.targets` 和你在「设置」里调的所有参数）——
+     直接提交进仓库（最简单，里面没有凭据），或把整个 JSON 贴进 `POSS_CONFIG` 这个 Variable。
+   - `.curl` 模板 —— 文件本身被 gitignore 了，所以必须走上面那两个 Secret。
+     在 UI 的「预订模板」里能看到每步的字节数，粘 Secret 前对一下长度就知道有没有粘错。
 4. Actions 页启用 workflow。定时任务（UTC，香港时间 = UTC+8）：
    - `*/5 * * * *` 常规轮询（蹲守提醒）
    - `29 0 * * *` = 香港 08:29 预热，准点 08:30:00 开火（**每天**跑，所以任意放位日都能接住）
@@ -264,5 +298,7 @@ python3 monitor.py --dry-book     # 演练两步流程并打印真实请求，�
   否则字段名对得上、值却是旧中心的。
 - **预订完成后请手动确认**：若 POSS 还有「确认预订」步骤或支付环节，记得去做。
 - **频率与风控**：常规轮询 5 分钟一次、会话缓存复用约 90 分钟，抢位仅集中在触发时刻。
+- **UI 会直接改 `config.json`**：所有保存都是「读原文 → 深合并 → 校验 → 写回」，
+  校验不过就不写盘；但如果你同时手工编辑着这个文件，两边会互相覆盖。改之前先停一下 UI。
 - **风险自担**：自动化访问学校系统可能违反 IT 使用守则；密码仅存 GitHub Secrets（加密），
   代码与日志不落明文；`session.json` 含短期会话 cookie，仅存于你的私有仓库。

@@ -34,6 +34,8 @@ from email.mime.text import MIMEText
 from poss_client import (
     BASE,
     BookingNotCalibrated,
+    DEFAULT_FAILURE_KEYWORDS,
+    DEFAULT_SUCCESS_KEYWORDS,
     LoginFailed,
     MAKE_BOOK_RESULT,
     PossClient,
@@ -101,8 +103,10 @@ DEFAULT_BOOKING = {
     "steps": [],                     # 多步预订：每步一个 {"curl_file": "...", "extract": {...}}
     "endpoint": "",                  # 遗留路径：手工填端点（未用 cURL 时）
     "params": {},                    # 遗留路径：手工填表单模板
-    "success_keywords": ["success", "successful", "成功", "已确认"],
-    "failure_keywords": [],          # 空 = 用 poss_client.DEFAULT_FAILURE_KEYWORDS
+    # 关键词直接引用 poss_client 里的那一份 —— 否则 UI 显示「空」、代码却用着内置默认，
+    # 用户会以为自己没配失败词，实际配了。
+    "success_keywords": list(DEFAULT_SUCCESS_KEYWORDS),
+    "failure_keywords": list(DEFAULT_FAILURE_KEYWORDS),
     "result_url": "",                # 空 = poss_client.MAKE_BOOK_RESULT
 }
 
