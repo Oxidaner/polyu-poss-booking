@@ -42,8 +42,9 @@ DEFAULT_BODY = {
     "facilityId": "",
     "showCourtAreaDetails": "true",
 }
-# 允许从配置覆盖的键（白名单，防止配置注入无关参数）
-OVERRIDABLE = set(DEFAULT_BODY)
+# 这些键**不许**被外部参数覆盖：会话令牌、用户身份，以及由函数参数显式传入的
+# ctrId / searchDate。放行它们等于让人从 UI 里改会话身份。
+PROTECTED_BODY_KEYS = {"CSRFToken", "fbUserId", "ctrId", "searchDate"}
 
 UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
@@ -524,15 +525,18 @@ class PossClient:
     def timetable(self, ctr_id: str, search_date: str = "", params: dict | None = None):
         """④ POST timetable.json，返回原始 JSON。会话失效抛 SessionExpired。
 
-        ctr_id / search_date 必填逻辑在这；其余 body 参数可用 params 覆盖默认值
-        （来自 config.json 的 request 段，见 DEFAULT_BODY / OVERRIDABLE）。
+        ctr_id / search_date 必填逻辑在这；其余 body 参数由 params 透传
+        （来自 config.json 的 request 段，或 UI 上抓到的下拉框）。
+        只挡 PROTECTED_BODY_KEYS —— 白名单校验交给调用方（UI 那边只放行
+        页面上真实存在的 select 名），这里再挡一道令牌级别的。
         """
         if not self.api_csrf:
             raise SessionExpired("尚未登录（无接口 CSRFToken）")
         body = dict(DEFAULT_BODY)
-        for k in OVERRIDABLE:
-            if params and k in params and params[k] is not None:
-                body[k] = str(params[k])
+        for k, v in (params or {}).items():
+            if k in PROTECTED_BODY_KEYS or v is None:
+                continue
+            body[k] = str(v)
         body.update({
             "CSRFToken": self.api_csrf,
             "fbUserId": self.fb_user_id,

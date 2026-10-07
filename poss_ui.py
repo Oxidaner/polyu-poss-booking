@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from poss_client import (
     DEFAULT_BODY,
     LoginFailed,
+    PROTECTED_BODY_KEYS,
     PossClient,
     SessionExpired,
     parse_selects,
@@ -245,6 +246,17 @@ def test_notify() -> dict:
     if n == 0:
         raise ValueError("没有任何通知渠道可用（PushPlus / Server酱 / 邮件至少配一个）")
     return {"channels": n}
+
+
+def allowed_param_keys() -> set:
+    """允许从 UI 透传给 timetable 的参数名。
+
+    只认「已知默认键」+「POSS 页面上真实存在的 <select name>」——
+    这样站点换了字段名能自动跟上（不用改代码），同时挡住乱塞参数。
+    """
+    keys = set(DEFAULT_BODY)
+    keys.update(s["name"] for s in _selects_cache if s.get("name"))
+    return keys - PROTECTED_BODY_KEYS
 
 
 # ---- 预订模板（.curl 文件，不是 config.json）----
@@ -515,9 +527,11 @@ class Handler(BaseHTTPRequestHandler):
         if not ctr:
             raise ValueError("缺少 ctrId（先在「中心」里选一个）")
         params = {}
-        for key in ("actvId", "dataSetId", "bookType"):
-            v = (q.get(key) or [""])[0].strip()
-            if v:
+        for key, vals in q.items():
+            if key in ("ctrId", "start"):
+                continue
+            v = (vals or [""])[0].strip()
+            if v and key in allowed_param_keys():
                 params[key] = v
         with _lock:
             client = get_client()
@@ -686,7 +700,9 @@ PAGE = r"""<!DOCTYPE html>
   .gridwrap{
     overflow:auto; max-height:62vh; border:1px solid var(--line-2);
     border-radius:var(--r-sm); background:var(--panel);
+    transition:opacity .15s;
   }
+  .gridwrap.busy{opacity:.45; pointer-events:none}
   table.grid{border-collapse:collapse; width:100%; font-size:12px}
   table.grid th{
     position:sticky; top:0; z-index:2; background:var(--panel);
@@ -946,6 +962,7 @@ PAGE = r"""<!DOCTYPE html>
   <section class="panel">
     <div class="panel-head">
       <h2>可订时间表</h2>
+      <span class="hint" id="gridCaption" style="margin:0"></span>
       <span class="sp"></span>
       <span class="hint" id="count" style="margin:0"></span>
     </div>
@@ -1190,9 +1207,26 @@ function keyOf(t){ return [t.ctrId, t.date, t.from].join("|"); }
 async function fetchGrid(){
   const ctr = $("#center").value;
   if(!ctr){ say("先在 Center 里选一个中心", "err"); return; }
+  // 参数名：页面 select 的真实 name + API 的规范名，**两个都发**。
+  // 页面字段名和 AJAX 接口的参数名不一定一致 —— 只发一个就可能被服务端忽略，
+  // 表现就是「换了选项格子不变」。多发的那个服务端不认识会自己忽略，无害。
   const q = new URLSearchParams({ctrId: ctr, start: $("#datefrom").value});
-  if(META.roles.activity && $("#activity").value) q.set("actvId", $("#activity").value);
-  if(META.roles.dataset && $("#dataset").value) q.set("dataSetId", $("#dataset").value);
+  const put = (role, canonical, val) => {
+    if(!val) return;
+    const r = META.roles[role];
+    if(r && r.name) q.set(r.name, val);
+    q.set(canonical, val);
+  };
+  put("activity", "actvId", $("#activity").value);
+  put("dataset", "dataSetId", $("#dataset").value);
+
+  // 先把"当前视图"和加载态显示出来 —— 请求还没回来也能看到选的是什么，
+  // 否则用户没法判断到底是没刷新、还是数据本来就一样。
+  $("#gridCaption").textContent =
+    [selText("#activity"), selText("#center"), `${$("#datefrom").value} 起 8 天`]
+      .filter(Boolean).join("　·　");
+  $("#count").textContent = "读取中…";
+  $(".gridwrap").classList.add("busy");
   say("读取时间表中…", "busy");
   try{
     const res = await api("/api/timetable?" + q.toString());
@@ -1207,6 +1241,8 @@ async function fetchGrid(){
     $("#count").textContent = "";
     say("读取时间表失败", "err");
     $("#grid").innerHTML = `<div class="placeholder"><div class="big">⚠️</div>${esc(e.message)}</div>`;
+  }finally{
+    $(".gridwrap").classList.remove("busy");
   }
 }
 
