@@ -13,14 +13,32 @@ python3 poss_ui.py        # 自动打开 http://127.0.0.1:8765
 
 | 面板 | 能改什么 |
 |---|---|
+| **登录与通知** | POSS 的 NetID / NetPassword、fbUserId；PushPlus / Server酱 / 邮件渠道，还能一键发测试通知 |
 | **选目标** | Activity / Center / Category / Date 四个下拉框（直接抓 POSS 页面上的），点格子选时段，可多选 |
 | **抢位目标** | 每个目标的日期、时段、场馆、活动；每个都显示自己的**放位日** |
 | **设置 · 常用** | 自动抢位开关、蹲守开关、放位时刻、提前几天抢、预热 / 宽限 / 爆发时长 / 重试间隔 |
 | **设置 · 高级** | 触发日、默认时段、日期格式、场馆列表、请求参数、成功 / 失败关键词、结果页地址、蹲守目标、预订流程 |
 | **设置 · 预订模板** | 粘贴两条抓包 cURL 直接导入（写进 `.curl` 文件，**不进 config.json**） |
 
-面板顶部会直接告诉你**预订模板导入了没有** —— 没导入就只能蹲守提醒、不会真下单，
-不会让你以为配好了其实没配。
+面板顶部会直接告诉你两件事，免得你以为配好了其实没配：
+
+- **账号配了没** —— 没配就什么都干不了；
+- **预订模板导入了没** —— 没导入就只能蹲守提醒、不会真下单。
+
+## 凭据放在哪（重要）
+
+| 内容 | 存哪 | 会不会进仓库 |
+|---|---|---|
+| NetID / NetPassword / fbUserId | `.env`（UI 写入，权限 0600） | ❌ 已 gitignore |
+| PushPlus / Server酱 / SMTP 凭据 | 同上 | ❌ |
+| 抢位目标、时段、关键词等参数 | `config.json` | ✅ 要提交，所以里面**不含凭据** |
+| 抓包得到的预订模板 | `booking_step1.curl` / `booking.curl` | ❌ 已 gitignore |
+
+UI 只绑 `127.0.0.1`；**密码永不回传给浏览器**，页面上只显示「已设置 / 未设置」。
+密码框留空 = 不改（不然你每次调通知渠道都会把密码清掉）。
+
+部署到 Actions 时凭据走 **Secrets**（`POSS_NETID` / `POSS_PASSWORD`），
+`.env` 只服务本地。
 
 ## 工作原理
 
@@ -59,10 +77,17 @@ python3 poss_ui.py        # 自动打开 http://127.0.0.1:8765
 ## 用 UI 配好一切（推荐）
 
 ```bash
-cp .env.example .env          # 填 POSS_NETID / POSS_PASSWORD
 pip3 install -r requirements.txt
 python3 poss_ui.py            # 自动打开 http://127.0.0.1:8765
 ```
+
+**⓪ 填账号**
+
+页面最上面就是「登录与通知」。填 NetID 和 NetPassword，点「保存并登录」——
+凭据写进 `.env`（自动 `chmod 600`、已 gitignore），**不会进 config.json，也不会回显到页面上**。
+顺手把通知渠道也填了，点「发一条测试通知」验证真的能收到。
+
+（习惯命令行的话：`cp .env.example .env` 然后自己填也行。）
 
 **① 选目标**
 
@@ -242,15 +267,14 @@ artifact 保留 14 天），判错了照原文改 `config.json` 里的关键字�
 ## 第一步：本地校准与试跑
 
 ```bash
-cp .env.example .env      # 填入 POSS_NETID / POSS_PASSWORD（只写本地，别贴聊天）
 pip3 install -r requirements.txt
-python3 poss_ui.py        # 起本地控制台：选目标 + 调设置 + 导入 cURL，全在这一个页面里
+python3 poss_ui.py        # 起本地控制台：账号 + 选目标 + 调设置 + 导入 cURL，全在这一个页面里
 python3 monitor.py --dump         # 抓真实时间表结构 → dumps/，并检查占位符能否填满
 python3 monitor.py --dry-book     # 演练两步流程并打印真实请求，不真提交
 ```
 
-（不想开网页时，cURL 也可以命令行导入：
-`python3 calibrate.py --import - --out booking_step1.curl`）
+（不想开网页时，账号可以 `cp .env.example .env` 手填，cURL 可以
+`python3 calibrate.py --import - --out booking_step1.curl`。）
 
 ## 第二步：配置通知渠道
 

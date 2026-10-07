@@ -127,6 +127,126 @@ def save_targets(targets: list) -> dict:
     return save_config({"booking": {"targets": targets}})
 
 
+# ---- 账号与通知（走 .env，绝不进 config.json）----
+# config.json 是要提交进仓库的，凭据放进去等于把密码贴到 GitHub 上。
+ENV_FILE = os.environ.get("ENV_FILE", ".env")
+
+# 表单字段 → 环境变量名
+ENV_FIELDS = {
+    "netid": "POSS_NETID",
+    "fbUserId": "POSS_FB_USER_ID",
+    "pushplus": "PUSHPLUS_TOKEN",
+    "serverchan": "SERVERCHAN_KEY",
+    "smtpHost": "SMTP_HOST",
+    "smtpPort": "SMTP_PORT",
+    "smtpUser": "SMTP_USER",
+    "mailTo": "MAIL_TO",
+}
+# 这三个只在「填了」的时候才覆盖，留空表示不改（避免每次保存都把密码清掉）
+ENV_SECRET_FIELDS = {"password": "POSS_PASSWORD", "smtpPass": "SMTP_PASS"}
+
+
+def read_env() -> dict:
+    """读 .env 成 dict。文件是 UI 管理的真相来源。"""
+    out = {}
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k, v = s.split("=", 1)
+                    out[k.strip()] = v.strip()
+    return out
+
+
+def write_env(updates: dict) -> str:
+    """把键值写进 .env：保留原有注释与其他行，只改指定键；权限压到 0600。"""
+    lines = []
+    if os.path.exists(ENV_FILE):
+        with open(ENV_FILE, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    seen = set()
+    out = []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            k = s.split("=", 1)[0].strip()
+            if k in updates:
+                out.append(f"{k}={updates[k]}")
+                seen.add(k)
+                continue
+        out.append(line)
+    for k, v in updates.items():
+        if k not in seen:
+            out.append(f"{k}={v}")
+    with open(ENV_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(out).rstrip("\n") + "\n")
+    try:
+        os.chmod(ENV_FILE, 0o600)      # 只有自己能读
+    except OSError:
+        pass
+    for k, v in updates.items():       # 立刻生效，免得还要重启
+        if v:
+            os.environ[k] = v
+        else:
+            os.environ.pop(k, None)
+    M.reload_notify_env()
+    return ENV_FILE
+
+
+def account_status() -> dict:
+    """账号/通知配置状态。**密码永不回传给前端**，只说配没配。"""
+    env = read_env()
+    return {
+        "ok": True,
+        "env_file": os.path.abspath(ENV_FILE),
+        "exists": os.path.exists(ENV_FILE),
+        "netid": env.get("POSS_NETID", ""),
+        "password_set": bool(env.get("POSS_PASSWORD")),
+        "ready": bool(env.get("POSS_NETID") and env.get("POSS_PASSWORD")),
+        "fbUserId": env.get("POSS_FB_USER_ID") or os.environ.get("POSS_FB_USER_ID", "657032"),
+        "pushplus_set": bool(env.get("PUSHPLUS_TOKEN")),
+        "serverchan_set": bool(env.get("SERVERCHAN_KEY")),
+        "smtpHost": env.get("SMTP_HOST", ""),
+        "smtpPort": env.get("SMTP_PORT", ""),
+        "smtpUser": env.get("SMTP_USER", ""),
+        "smtpPass_set": bool(env.get("SMTP_PASS")),
+        "mailTo": env.get("MAIL_TO", ""),
+        "channels": sum(bool(env.get(k)) for k in
+                        ("PUSHPLUS_TOKEN", "SERVERCHAN_KEY", "SMTP_PASS")),
+    }
+
+
+def save_account(payload: dict) -> dict:
+    """保存登录凭据与通知渠道到 .env。密码留空 = 不改。"""
+    updates = {}
+    for field, key in ENV_FIELDS.items():
+        if field in payload:
+            updates[key] = str(payload.get(field) or "").strip()
+    for field, key in ENV_SECRET_FIELDS.items():
+        v = payload.get(field)
+        if v:                                  # 留空 = 保持原密码
+            updates[key] = str(v).strip()
+    if not updates:
+        raise ValueError("没有要保存的内容")
+    # 表单里 NetID 是预填的，提交成空 = 用户手动删掉了 → 大概率是误操作，直接拒掉。
+    # 也顺手挡住「只保存了通知渠道、却一个 NetID 都没有」这种半截配置。
+    merged_netid = updates.get("POSS_NETID", read_env().get("POSS_NETID", "")).strip()
+    if not merged_netid:
+        raise ValueError("NetID 不能为空（确实要清空请直接编辑 .env）")
+    write_env(updates)
+    return account_status()
+
+
+def test_notify() -> dict:
+    """发一条测试通知，验证渠道真的通。"""
+    M.reload_notify_env()
+    n = M.notify_all("POSS 通知测试", "收到这条说明通知渠道配好了。")
+    if n == 0:
+        raise ValueError("没有任何通知渠道可用（PushPlus / Server酱 / 邮件至少配一个）")
+    return {"channels": n}
+
+
 # ---- 预订模板（.curl 文件，不是 config.json）----
 
 def template_status(cfg: dict | None = None) -> dict:
@@ -279,6 +399,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(self.api_get_config())
             elif u.path == "/api/template":
                 self._json({"ok": True, "status": template_status()})
+            elif u.path == "/api/account":
+                self._json(account_status())
             else:
                 self._err("not found", 404)
         except ValueError as e:
@@ -318,6 +440,17 @@ class Handler(BaseHTTPRequestHandler):
                     info = import_template(step, body.get("curl") or "")
                 print(f"[ui] 已导入第 {info['step']} 步模板 → {info['file']}（{info['bytes']} 字节）")
                 self._json({"ok": True, "info": info, "status": template_status()})
+            elif u.path == "/api/account":
+                body = self._read_body()
+                global _client
+                with _lock:
+                    acct = save_account(body)
+                    _client = None          # 凭据变了，丢弃旧会话
+                print(f"[ui] 已写入 {ENV_FILE}（账号与通知）")
+                self._json({"ok": True, "account": acct})
+            elif u.path == "/api/notify-test":
+                with _lock:
+                    self._json({"ok": True, **test_notify()})
             else:
                 self._err("not found", 404)
         except ValueError as e:                         # 配置校验失败
@@ -534,6 +667,8 @@ PAGE = r"""<!DOCTYPE html>
      于是「2 个开关」那行变成 2 列各占一半，跟下面「6 个数字框」的列宽对不齐 */
   .rows{display:grid; gap:12px; grid-template-columns:repeat(auto-fill,minmax(148px,1fr))}
   .rows.wide{grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
+  .row-actions{display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; padding-top:16px;
+               border-top:1px solid var(--line-2)}
 
   .stats{display:flex; flex-wrap:wrap; gap:8px; margin-top:14px}
   .stat{
@@ -736,6 +871,59 @@ PAGE = r"""<!DOCTYPE html>
 <div class="wrap">
   <div id="banner"></div>
 
+  <!-- ⓪ 登录与通知 -->
+  <section class="panel">
+    <div class="panel-head">
+      <h2>登录与通知</h2>
+      <span class="hint" id="acctStatus" style="margin:0"></span>
+      <span class="sp"></span>
+      <button id="acctToggle">修改</button>
+    </div>
+    <div id="acctBody" style="display:none">
+      <div class="sec">
+        <h3>POSS 账号（写进 .env，不进仓库）</h3>
+        <div class="rows wide">
+          <div class="field"><label>NetID</label>
+            <input type="text" id="ac_netid" autocomplete="username" placeholder="例如 21012345d"></div>
+          <div class="field"><label>NetPassword</label>
+            <input type="password" id="ac_password" autocomplete="current-password"
+                   placeholder="留空 = 不改密码"></div>
+          <div class="field"><label>fbUserId（一般不用改）</label>
+            <input type="text" id="ac_fbuserid" placeholder="657032"></div>
+        </div>
+        <div class="hint">密码只写进 <code id="acPath">.env</code>（权限 0600，已 gitignore），
+          <b>永远不会写进 config.json</b>，也不会回显到页面上。</div>
+      </div>
+
+      <div class="sec">
+        <h3>通知渠道（至少配一个）</h3>
+        <div class="rows wide">
+          <div class="field"><label>PushPlus Token</label>
+            <input type="password" id="ac_pushplus" placeholder="留空 = 不改"></div>
+          <div class="field"><label>Server酱 SendKey</label>
+            <input type="password" id="ac_serverchan" placeholder="留空 = 不改"></div>
+        </div>
+        <div class="rows wide" style="margin-top:12px">
+          <div class="field"><label>SMTP 服务器</label>
+            <input type="text" id="ac_smtphost" placeholder="smtp.qq.com"></div>
+          <div class="field"><label>端口</label>
+            <input type="text" id="ac_smtpport" placeholder="465"></div>
+          <div class="field"><label>发信邮箱</label>
+            <input type="text" id="ac_smtpuser" placeholder="you@qq.com"></div>
+          <div class="field"><label>SMTP 授权码</label>
+            <input type="password" id="ac_smtppass" placeholder="留空 = 不改"></div>
+          <div class="field"><label>收件邮箱</label>
+            <input type="text" id="ac_mailto" placeholder="you@connect.polyu.hk"></div>
+        </div>
+      </div>
+
+      <div class="row-actions">
+        <button class="primary" id="acctSave">保存并登录</button>
+        <button id="acctTest">发一条测试通知</button>
+      </div>
+    </div>
+  </section>
+
   <!-- ① 选目标 -->
   <section class="panel">
     <div class="toolbar">
@@ -915,6 +1103,21 @@ function dow(d){ return DOWS[(new Date(d+"T00:00:00").getDay() + 6) % 7]; }
 function markDirty(v){ DIRTY = v; $("#save").classList.toggle("dirty", v); }
 function markCfgDirty(v){ CFG_DIRTY = v; $("#saveCfg").classList.toggle("dirty", v); }
 
+/* 顶部横幅只有一个写入口：账号、模板、抓取错误都往这里报，
+   否则几处各自 innerHTML 会互相覆盖（先写的那个就永远看不见了）。*/
+let META_ERROR = "";
+function renderBanner(){
+  const warns = [];
+  if(META_ERROR) warns.push(META_ERROR);
+  if(ACCT && !ACCT.ready) warns.push(
+    '<b>先填 POSS 账号</b>：在「登录与通知」里填 NetID 和 NetPassword，点「保存并登录」。'
+    + '凭据写进 <code>.env</code>（已 gitignore），不会进仓库。');
+  if(TPL && !TPL.ready) warns.push(
+    '<b>预订模板还没导入</b>：脚本能读时间表、能蹲守提醒，但不会真的下单。'
+    + '展开「设置 → 高级设置 → 预订模板」，把两条 cURL 粘进去导入即可。');
+  $("#banner").innerHTML = warns.map(w => `<div class="warn">${w}</div>`).join("");
+}
+
 async function api(path, opts){
   const r = await fetch(path, opts);
   const j = await r.json().catch(()=>({ok:false,error:"返回不是 JSON"}));
@@ -953,10 +1156,13 @@ async function loadMeta(){
     META = await api("/api/meta");
   }catch(e){
     say("读取失败", "err");
-    $("#banner").innerHTML = '<div class="warn">拿不到 POSS 页面。先确认 <b>.env</b> 里的 '
-      + 'POSS_NETID / POSS_PASSWORD 填对了，再点右上角「重新登录」。</div>';
+    META_ERROR = '拿不到 POSS 页面。先确认「登录与通知」里的账号密码填对了，'
+               + '再点右上角「重新登录」。原始错误：<code>' + esc(e.message) + '</code>';
+    renderBanner();
     return;
   }
+  META_ERROR = "";
+  renderBanner();
   fillSelect($("#activity"), roleOptions("activity"));
   fillSelect($("#center"), roleOptions("center"));
   const ds = META.roles.dataset;
@@ -975,7 +1181,6 @@ async function loadMeta(){
   for(const t of (META.targets||[])) SEL.set(keyOf(t), t);
   markDirty(false);
   renderChips(); renderStats();
-  await loadConfig();
   say("就绪", "ok");
   await fetchGrid();
 }
@@ -1182,13 +1387,7 @@ function renderTplStatus(){
   ).join("") + (TPL.ready
     ? '<div class="hint" style="color:var(--ok)">✓ 预订模板齐了，可以真提交。</div>'
     : '<div class="hint" style="color:var(--err)">✗ 模板不全 —— 现在只会蹲守提醒，不会真抢。</div>');
-  const banner = $("#banner");
-  if(!TPL.ready && banner.dataset.tplWarn !== "1"){
-    banner.dataset.tplWarn = "1";
-    banner.innerHTML = '<div class="warn"><b>预订模板还没导入</b>：'
-      + '脚本能读时间表、能蹲守提醒，但不会真的下单。'
-      + '展开下面的「设置 → 高级设置 → 预订模板」，把两条 cURL 粘进去导入即可。</div>';
-  }
+  renderBanner();
 }
 
 function num(id, name, min=0, max=1e9){
@@ -1342,7 +1541,113 @@ document.querySelector("#adv").addEventListener("change", ()=>markCfgDirty(true)
   el.addEventListener("change", ()=>{ markCfgDirty(true); });
 });
 
-loadMeta();
+/* ==================== 登录与通知 ==================== */
+
+let ACCT = null;
+
+async function loadAccount(){
+  ACCT = await api("/api/account");
+  fillAccount();
+}
+
+function fillAccount(){
+  $("#acPath").textContent = ACCT.env_file;
+  $("#ac_netid").value = ACCT.netid || "";
+  $("#ac_fbuserid").value = ACCT.fbUserId || "";
+  $("#ac_smtphost").value = ACCT.smtpHost || "";
+  $("#ac_smtpport").value = ACCT.smtpPort || "";
+  $("#ac_smtpuser").value = ACCT.smtpUser || "";
+  $("#ac_mailto").value = ACCT.mailTo || "";
+  // 密码类字段永远不回显，用 placeholder 说明「已经配过了」
+  $("#ac_password").value = "";
+  $("#ac_pushplus").value = "";
+  $("#ac_serverchan").value = "";
+  $("#ac_smtppass").value = "";
+  $("#ac_password").placeholder = ACCT.password_set ? "已设置 · 留空 = 不改" : "还没设密码";
+  $("#ac_pushplus").placeholder = ACCT.pushplus_set ? "已设置 · 留空 = 不改" : "留空 = 不改";
+  $("#ac_serverchan").placeholder = ACCT.serverchan_set ? "已设置 · 留空 = 不改" : "留空 = 不改";
+  $("#ac_smtppass").placeholder = ACCT.smtpPass_set ? "已设置 · 留空 = 不改" : "留空 = 不改";
+
+  const chans = [
+    ACCT.pushplus_set && "PushPlus",
+    ACCT.serverchan_set && "Server酱",
+    ACCT.smtpPass_set && "邮件",
+  ].filter(Boolean);
+  $("#acctStatus").innerHTML = ACCT.ready
+    ? `<span style="color:var(--ok)">✓ 已配好 ${esc(ACCT.netid)}</span>`
+      + (chans.length ? ` · 通知渠道：${esc(chans.join(" / "))}` : " · ⚠️ 还没配通知渠道")
+    : '<span style="color:var(--err)">✗ 还没配账号，下面的东西都用不了</span>';
+
+  // 没配好就自动展开，配好了就收起
+  $("#acctBody").style.display = ACCT.ready ? "none" : "";
+  $("#acctToggle").textContent = ACCT.ready ? "修改" : "收起";
+  renderBanner();
+}
+
+$("#acctToggle").onclick = ()=>{
+  const b = $("#acctBody");
+  const open = b.style.display === "none";
+  b.style.display = open ? "" : "none";
+  $("#acctToggle").textContent = open ? "收起" : "修改";
+};
+
+$("#acctSave").onclick = async ()=>{
+  const payload = {
+    netid: $("#ac_netid").value.trim(),
+    password: $("#ac_password").value,          // 空 = 不改
+    fbUserId: $("#ac_fbuserid").value.trim(),
+    pushplus: $("#ac_pushplus").value,
+    serverchan: $("#ac_serverchan").value,
+    smtpHost: $("#ac_smtphost").value.trim(),
+    smtpPort: $("#ac_smtpport").value.trim(),
+    smtpUser: $("#ac_smtpuser").value.trim(),
+    smtpPass: $("#ac_smtppass").value,          // 空 = 不改
+    mailTo: $("#ac_mailto").value.trim(),
+  };
+  if(!payload.netid){ say("NetID 不能为空", "err"); return; }
+  say("保存中…", "busy");
+  try{
+    const r = await post("/api/account", payload);
+    ACCT = r.account;
+    fillAccount();
+    say("已保存，正在登录 POSS…", "busy");
+    await post("/api/login", {});
+    say("登录成功", "ok");
+    await loadMeta();
+  }catch(e){
+    say("保存/登录失败：" + e.message, "err");
+    $("#acctBody").style.display = "";
+    $("#acctToggle").textContent = "收起";
+  }
+};
+
+$("#acctTest").onclick = async ()=>{
+  say("发送测试通知中…", "busy");
+  try{
+    const r = await post("/api/notify-test", {});
+    say(`测试通知已发出（${r.channels} 个渠道）`, "ok");
+  }catch(e){ say("测试失败：" + e.message, "err"); }
+};
+
+/* ==================== 启动 ==================== */
+
+(async ()=>{
+  // 配置必须先加载，且**不依赖登录**：config.json 与 POSS 会话无关。
+  // 顺序错了的话，没登录时设置面板是一片空白，一点「保存设置」就把配置清光了。
+  try{ await loadConfig(); }
+  catch(e){ say("读配置失败：" + e.message, "err"); return; }
+
+  try{ await loadAccount(); }
+  catch(e){ say("读账号配置失败：" + e.message, "err"); }
+
+  renderGrid();
+  if(ACCT && ACCT.ready){
+    await loadMeta();
+  }else{
+    say("先填 POSS 账号", "err");
+    renderBanner();
+  }
+})();
 </script>
 </body>
 </html>
@@ -1356,9 +1661,10 @@ def main():
     args = ap.parse_args()
 
     M.load_env_file()
-    if not (os.environ.get("POSS_NETID") and os.environ.get("POSS_PASSWORD")):
-        print("[ui] ⚠️ 没读到 POSS_NETID / POSS_PASSWORD。"
-              "先 `cp .env.example .env` 并填好，再重跑。")
+    env = read_env()
+    if not (env.get("POSS_NETID") and env.get("POSS_PASSWORD")):
+        print(f"[ui] 还没配 POSS 账号。打开页面后在最上面的「登录与通知」里填，"
+              f"会写进 {os.path.abspath(ENV_FILE)}（已 gitignore，不进仓库）。")
 
     url = f"http://127.0.0.1:{args.port}/"
     srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)

@@ -71,13 +71,27 @@ RENOTIFY_AFTER = int(os.environ.get("RENOTIFY_AFTER", 30 * 60))
 FAIL_ALERT_INTERVAL = 60 * 60
 
 # ---- 通知渠道（环境变量 / .env） ----
+# 这些是模块级常量，进程启动时读一次。UI 改完 .env 必须调 reload_notify_env() 刷新，
+# 否则界面上显示"已配置"、实际发的还是旧值（或压根不发）。
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
 SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
 SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
+SMTP_PORT = int(os.environ.get("SMTP_PORT") or "465")   # 空字符串会炸，兜一下
 SMTP_USER = os.environ.get("SMTP_USER", "").strip()
 SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
 MAIL_TO = os.environ.get("MAIL_TO", "").strip()
+
+
+def reload_notify_env():
+    """重新从环境变量读通知渠道配置（UI 写 .env 之后调用）。"""
+    global PUSHPLUS_TOKEN, SERVERCHAN_KEY, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_TO
+    PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
+    SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
+    SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
+    SMTP_PORT = int(os.environ.get("SMTP_PORT") or "465")
+    SMTP_USER = os.environ.get("SMTP_USER", "").strip()
+    SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
+    MAIL_TO = os.environ.get("MAIL_TO", "").strip()
 
 # ---- 内置默认 ----
 DEFAULT_GYMS = [
