@@ -91,7 +91,8 @@ DEFAULT_BOOKING = {
     "lead_days": 7,                  # 抢 7 天后（下周同一天）
     "burst_seconds": 120,            # 爆发抢位持续时长
     "retry_interval": 3,             # 每轮间隔秒数
-    "gyms": [],                      # 空 = 按 gyms 顺序全部尝试
+    "gyms": [],                      # 空 = 按 gyms 顺序全部尝试（仅派生模式用）
+    "targets": [],                   # 显式抢位目标（UI 生成）；非空则不再用派生逻辑
     "from": "16:30",
     "to": "17:30",
     "search_date_format": "%Y-%m-%d",
@@ -172,6 +173,8 @@ def _validate_config(cfg: dict):
     if unknown:
         bad(f"booking.gyms 里有未定义的馆名: {unknown}（可选: {sorted(names)}）")
 
+    _validate_booking_targets(cfg)
+
     steps = load_booking_steps(b)
     if b["enabled"]:
         missing = []
@@ -189,6 +192,34 @@ def _validate_config(cfg: dict):
     dates = cfg["request"].get("searchDates", [])
     if not isinstance(dates, list):
         bad("request.searchDates 必须是日期字符串数组")
+
+
+def _validate_booking_targets(cfg):
+    """校验显式 targets：每项至少要有 date + (gym 或 ctrId)，时段合法。"""
+    b = cfg["booking"]
+    targets = b.get("targets")
+    if targets in (None, [], ""):
+        return
+    if not isinstance(targets, list):
+        raise ValueError("配置错误: booking.targets 必须是数组")
+    names = {g["name"] for g in cfg["gyms"]}
+    for i, t in enumerate(targets):
+        where = f"booking.targets[{i}]"
+        if not isinstance(t, dict):
+            raise ValueError(f"配置错误: {where} 必须是对象")
+        if not _parse_date(t.get("date")):
+            raise ValueError(f"配置错误: {where}.date 缺失或不是日期: {t.get('date')!r}")
+        if not (t.get("gym") or t.get("ctrId")):
+            raise ValueError(f"配置错误: {where} 需要 gym 或 ctrId")
+        if t.get("gym") and t["gym"] not in names:
+            raise ValueError(
+                f"配置错误: {where}.gym 未在顶层 gyms 里定义: {t['gym']}（可选: {sorted(names)}）"
+            )
+        f, to = t.get("from") or b["from"], t.get("to") or b["to"]
+        if not _parse_hm(f) or not _parse_hm(to):
+            raise ValueError(f"配置错误: {where} 的 from/to 必须是 HH:MM: {f}/{to}")
+        if f >= to:
+            raise ValueError(f"配置错误: {where} 时段起点必须早于终点: {f}-{to}")
 
 
 def _validate_targets(targets, where):
@@ -212,12 +243,55 @@ def ctr_of(cfg, gym_name):
 
 
 def fallback_targets(cfg):
-    """蹲守目标时段：显式配置优先，否则由 booking 派生（触发日 + 抢位时段）。"""
+    """蹲守目标时段：显式配置优先，否则由 booking 派生。
+
+    配了 booking.targets 时，蹲守也只盯那些目标（含精确日期），
+    而不是漫无目的地盯所有同星期几的时段。
+    """
     fb = cfg["fallback"]
     if fb.get("targets"):
         return fb["targets"]
     b = cfg["booking"]
+    if b.get("targets"):
+        out = []
+        for t in b["targets"]:
+            d = _parse_date(t.get("date"))
+            if not d:
+                continue
+            out.append({
+                "days": [d.weekday()],
+                "from": t.get("from") or b["from"],
+                "to": t.get("to") or b["to"],
+                "dates": [d.strftime("%Y-%m-%d")],
+            })
+        if out:
+            return out
     return [{"days": list(b["trigger_days"]), "from": b["from"], "to": b["to"]}]
+
+
+def watch_scopes(cfg) -> list:
+    """蹲守要查询的 (场馆, 活动) 组合。
+
+    配了 targets 就按 targets 里实际出现过的组合去查（这样「不同活动」也能被盯上），
+    否则退回 cfg.gyms × 全局 request 参数。
+    """
+    b = cfg["booking"]
+    if b.get("targets"):
+        seen, out = set(), []
+        for t in b["targets"]:
+            try:
+                j = _job_from_target(cfg, t)
+            except ValueError:
+                continue
+            key = (j["ctrId"], j["params"].get("actvId"), j["params"].get("dataSetId"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"name": j["gym"], "ctrId": j["ctrId"], "params": j["params"]})
+        if out:
+            return out
+    return [{"name": g["name"], "ctrId": g["ctrId"], "params": cfg["request"]}
+            for g in cfg["gyms"]]
 
 
 def load_booking_curl(b: dict):
@@ -301,7 +375,13 @@ def hm_to_min(hm: str) -> int:
 def booking_phase(cfg, now: datetime) -> str:
     """'pre'=预热等待 / 'open'=窗口内应抢 / 'closed'=不抢。"""
     b = cfg["booking"]
-    if not b["enabled"] or now.weekday() not in b["trigger_days"]:
+    if not b["enabled"]:
+        return "closed"
+    if b.get("targets"):
+        # 显式目标：由「各自放位时刻」决定要不要干活，不再看 trigger_days
+        if not plan_jobs(cfg, now):
+            return "closed"
+    elif now.weekday() not in b["trigger_days"]:
         return "closed"
     now_m = now.hour * 60 + now.minute
     t0 = hm_to_min(b["trigger_time"])
@@ -310,6 +390,86 @@ def booking_phase(cfg, now: datetime) -> str:
     if t0 - b["warmup_minutes"] <= now_m < t0:
         return "pre"
     return "closed"
+
+
+# ==================== 抢位目标调度 ====================
+# 两种模式：
+#   ① 显式 targets：用户在 UI 里点选的「哪天 / 哪个馆 / 哪个时段」，
+#      放位时刻 = 目标日期 - lead_days 的 trigger_time（POSS 只放 7 天内的场）。
+#   ② 没配 targets：沿用旧的派生逻辑（今天 + lead_days，同星期几，全部馆）。
+
+
+def _target_release_dt(target: dict, b: dict) -> datetime | None:
+    """该目标最早能订的那一刻。解析不出日期返回 None。"""
+    d = _parse_date(target.get("date"))   # 注意：_parse_date 返回 date，不是 datetime
+    if not d:
+        return None
+    h, m = (int(x) for x in b["trigger_time"].split(":"))
+    return datetime(d.year, d.month, d.day, h, m) - timedelta(days=b["lead_days"])
+
+
+def _job_from_target(cfg, t: dict) -> dict:
+    """把一条配置目标补全成可执行的 job（补 ctrId、继承全局时段、合并 activity 参数）。
+
+    gym 必须能在顶层 gyms 里查到才用它推 ctrId；UI 生成的 target 直接带 ctrId，
+    并用 name 字段做显示名（这样任意中心都能选，不受顶层 gyms 限制）。
+    """
+    b = cfg["booking"]
+    gym = (t.get("gym") or "").strip()
+    display = gym or str(t.get("name") or "").strip()
+    ctr = str(t.get("ctrId") or "").strip()
+    if not ctr:
+        if not gym:
+            raise ValueError(f"目标既没 gym 也没 ctrId: {t}")
+        ctr = ctr_of(cfg, gym)
+    params = dict(cfg.get("request") or {})
+    for k in ("actvId", "dataSetId", "bookType"):
+        if t.get(k) not in (None, ""):
+            params[k] = str(t[k])
+    return {
+        "gym": display or f"ctr{ctr}",
+        "ctrId": ctr,
+        "date": str(t["date"]),
+        "from": t.get("from") or b["from"],
+        "to": t.get("to") or b["to"],
+        "activity": t.get("activity") or "",
+        "params": params,
+    }
+
+
+def plan_jobs(cfg, now: datetime) -> list:
+    """当前这一刻该抢的目标列表。"""
+    b = cfg["booking"]
+    if not b["enabled"]:
+        return []
+    if b.get("targets"):
+        return [
+            _job_from_target(cfg, t)
+            for t in b["targets"]
+            if (_target_release_dt(t, b) or datetime.max).date() == now.date()
+        ]
+    if now.weekday() not in b["trigger_days"]:
+        return []
+    date = (now.date() + timedelta(days=b["lead_days"])).isoformat()
+    names = b["gyms"] or [g["name"] for g in cfg["gyms"]]
+    return [
+        _job_from_target(cfg, {"gym": n, "date": date, "from": b["from"], "to": b["to"]})
+        for n in names
+    ]
+
+
+def slot_matches_job(slot, job) -> bool:
+    """时段是否属于该目标：日期必须对上（能解析时），时间要有交集。"""
+    d, jd = _parse_date(slot["date"]), _parse_date(job["date"])   # 都是 date 对象
+    if d and jd and d != jd:
+        return False
+    st = _parse_hm(slot["start"])
+    if not st:
+        return False
+    et = _parse_hm(slot["end"]) if slot.get("end") else None
+    if et:
+        return st < job["to"] and et > job["from"]
+    return job["from"] <= st < job["to"]
 
 
 def wait_until_trigger(cfg):
@@ -335,14 +495,37 @@ LEFT_HINTS = [
     "vacancy", "vacant", "quotaleft", "left", "remain", "available", "avail",
     "nofavail", "empty", "free", "slotleft", "canslot",
 ]
+# 价格 / 押金 / 状态：用于把时段渲染成 POSS 那张彩色网格
+# （灰=不可用，洋红=$0 + $10 可退押金，蓝=$10）
+PRICE_HINTS = ["chrg", "charge", "price", "amount", "amt", "cost", "rate", "fee"]
+DEPOSIT_HINTS = ["deposit", "refund", "reservfee", "reservationfee", "secfee", "dep"]
+STATUS_HINTS = ["status", "state", "remark", "reason", "msg", "ind"]
+# 价格键里要排除的（这些不是钱）
+PRICE_EXCLUDE = ["id", "no", "num", "code", "type", "desc", "name"]
 
 
 class ParseNeedsCalibration(Exception):
     """JSON 结构超出启发式能力 —— 需要先跑 --dump 校准。"""
 
 
+def _pick_number(d: dict, hints, exclude=()) -> float | None:
+    """按 key 提示找第一个像金额/数字的标量。排除 id/no/code 这类同前缀陷阱。"""
+    for k, v in d.items():
+        kl = k.lower()
+        if any(x in kl for x in hints) and not any(x in kl for x in exclude):
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                return float(v)
+            if isinstance(v, str):
+                m = re.search(r"-?\d+(?:\.\d+)?", v)
+                if m:
+                    return float(m.group(0))
+    return None
+
+
 def parse_timetable(data) -> list:
-    """返回 [{date, start, end, left, raw}]。
+    """返回 [{date, start, end, left, price, deposit, status, raw}]。
 
     遍历时**继承祖先节点的标量字段**：POSS 常把 facilityId / ctrId 这类信息挂在
     分组节点上、时段挂在其下，只看叶子节点会漏掉它们，而预订模板正需要 facilityId。
@@ -357,11 +540,15 @@ def parse_timetable(data) -> list:
             date_v = _pick(node, DATE_KEYS)
             start_v = _pick(node, START_KEYS)
             if date_v and start_v:
+                left = _pick_int(node, LEFT_HINTS)
                 found.append({
                     "date": str(date_v),
                     "start": str(start_v),
                     "end": str(_pick(node, END_KEYS) or ""),
-                    "left": _pick_int(node, LEFT_HINTS),
+                    "left": left,
+                    "price": _pick_number(node, PRICE_HINTS, PRICE_EXCLUDE),
+                    "deposit": _pick_number(node, DEPOSIT_HINTS),
+                    "status": str(_pick(node, STATUS_HINTS) or ""),
                     "raw": merged,
                 })
             for v in node.values():
@@ -395,13 +582,17 @@ def _pick_int(d: dict, hints):
 
 
 def slot_matches_target(slot, targets) -> bool:
-    """时段与任一目标窗口有交集（按星期几 + HH:MM）。"""
+    """时段与任一目标窗口有交集（按星期几 + HH:MM，可选精确日期）。"""
     d = _parse_date(slot["date"])
     st = _parse_hm(slot["start"])
     if not d or not st:
         return False
     et = _parse_hm(slot["end"]) if slot.get("end") else None
     for t in targets:
+        if t.get("dates"):
+            wanted = {str(x) for x in t["dates"]}
+            if str(slot["date"]) not in wanted and d.strftime("%Y-%m-%d") not in wanted:
+                continue
         if d.weekday() not in t["days"]:
             continue
         if et:
@@ -546,9 +737,9 @@ def build_booking_payload(b, slot, gym_name, ctr_id, target_date, ctx) -> dict:
     }
 
 
-def pick_best(slots, b):
+def pick_best(slots, from_hm):
     """优先精确命中起点（如 16:30），否则取最早开始的。"""
-    exact = [s for s in slots if _parse_hm(s["start"]) == b["from"]]
+    exact = [s for s in slots if _parse_hm(s["start"]) == from_hm]
     pool = exact or slots
     return sorted(pool, key=lambda s: (_parse_date(s["date"]), _parse_hm(s["start"]) or ""))[0]
 
@@ -725,12 +916,32 @@ def resolve_final_result(client, b, resp, referer, success_keywords=None):
     )
 
 
+def _job_key(job) -> str:
+    """目标唯一键：馆 + 日期 + 起始时刻。用于跨运行去重（防重复扣费）。"""
+    return f"{job['ctrId']}|{job['date']}|{job['from']}"
+
+
+def _job_desc(job) -> str:
+    d = _parse_date(job["date"])
+    wk = "一二三四五六日"[d.weekday()] if d else "?"
+    act = f" 活动 {job['activity']}" if job.get("activity") else ""
+    return f"{job['gym']}(ctrId={job['ctrId']}) {job['date']}（周{wk}） {job['from']}-{job['to']}{act}"
+
+
 def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
-    """爆发式抢位。返回 True = 有结果（抢到 / 已提交待确认），False = 完全没抢到。"""
+    """爆发式抢位。返回 True = 有结果（抢到 / 已提交待确认），False = 完全没抢到。
+
+    支持一次抢多个目标：抢到一个继续抢下一个（抢所有 fitness 就是这个意思）。
+    唯一会立刻收手的理由是「结果不明」——那时候再往下抢就是在赌押金了。
+    """
     b = cfg["booking"]
+    explicit = bool(b.get("targets"))
     today_key = now.date().isoformat()
     booked = state.setdefault("booked", {})
-    if today_key in booked:
+    done = state.setdefault("booked_targets", {})
+
+    if not explicit and today_key in booked:
+        # 派生模式沿用旧的「同一触发日只抢一次」防重复扣费
         prev = booked[today_key]
         note = prev.get("status") or f"{prev.get('gym', '?')} {prev.get('start', '?')}"
         print(f"[booking] {today_key} 已处理过（{note}），跳过（防重复扣费）")
@@ -744,13 +955,22 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
                 "请把 POSS 手动预订那条「提交」请求的 cURL 用 calibrate.py 导入。"
             )
 
-    gym_names = b["gyms"] or [g["name"] for g in cfg["gyms"]]
-    target = now.date() + timedelta(days=b["lead_days"])
-    date_str = target.strftime(b["search_date_format"])
-    window = [{"days": [target.weekday()], "from": b["from"], "to": b["to"]}]
+    jobs = plan_jobs(cfg, now)
+    if not jobs:
+        print("[booking] 当前没有到放位时刻的目标，本轮不抢")
+        return False
+
+    skipped = [j for j in jobs if _job_key(j) in done]
+    jobs = [j for j in jobs if _job_key(j) not in done]
+    if skipped:
+        print(f"[booking] 已有 {len(skipped)} 个目标处理过（成功或结果不明），本次跳过")
+    if not jobs:
+        print("[booking] 目标本日全部处理过，跳过（防重复扣费）")
+        return True
+
     mode_desc = f"{len(steps)} 步 cURL 模板" if len(steps) > 1 else "cURL 模板"
-    print(f"[booking] 目标：{date_str}（周{'一二三四五六日'[target.weekday()]}）"
-          f" {b['from']}-{b['to']}，馆顺序 {gym_names}，提交方式 {mode_desc}")
+    for j in jobs:
+        print(f"[booking] 目标：{_job_desc(j)}，提交方式 {mode_desc}")
 
     deadline = time.time() + (0 if dry_book else b["burst_seconds"])
     attempts = 0
@@ -759,12 +979,19 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
     # 已经被服务端明确拒掉的「馆+时段」：同一轮里别再重复提同一条，
     # 否则 120 秒里对着同一个满位时段提交几十次，除了给风控送素材毫无用处。
     tried: set = set()
+    handled: set = set()
+    job_keys = {_job_key(j) for j in jobs}
+    booked_any = False
+
     while True:
         attempts += 1
-        for gym_name in gym_names:
-            ctr = ctr_of(cfg, gym_name)
+        for job in jobs:
+            key = _job_key(job)
+            if key in handled:
+                continue
+            date_str = (_parse_date(job["date"]) or now).strftime(b["search_date_format"])
             try:
-                raw = client.timetable(ctr, date_str, params=cfg["request"])
+                raw = client.timetable(job["ctrId"], date_str, params=job["params"])
             except SessionExpired:
                 session_failures += 1
                 if session_failures > max_session_failures:
@@ -776,15 +1003,16 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
                 client.save_session(SESSION_FILE)
                 continue
             cands = [s for s in parse_timetable(raw)
-                     if slot_matches_target(s, window) and (s["left"] or 0) > 0
-                     and (gym_name, str(s["date"]), str(s["start"])) not in tried]
+                     if slot_matches_job(s, job) and (s["left"] or 0) > 0
+                     and (job["ctrId"], str(s["date"]), str(s["start"])) not in tried]
             if not cands:
                 continue
-            best = pick_best(cands, b)
-            ctx = build_booking_context(client, b, best, gym_name, ctr, target)
+            best = pick_best(cands, job["from"])
+            ctx = build_booking_context(client, b, best, job["gym"], job["ctrId"],
+                                        _parse_date(job["date"]) or now)
 
             if dry_book:
-                print(f"[dry-book] 候选: {gym_name} {best['date']} {best['start']}-{best['end']} "
+                print(f"[dry-book] 候选: {job['gym']} {best['date']} {best['start']}-{best['end']} "
                       f"(剩 {best['left']})")
                 run_booking_steps(client, b, steps, ctx, dry_book=True)
                 return False
@@ -802,43 +1030,58 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
                 client.login()
                 continue
             session_failures = 0
-            print(f"[booking] 第 {attempts} 轮 {gym_name} {best['start']}: {res.message}")
+            print(f"[booking] 第 {attempts} 轮 {job['gym']} {best['start']}: {res.message}")
 
             if res.ok:
-                booked[today_key] = {
-                    "gym": gym_name, "date": best["date"], "start": best["start"],
-                    "end": best["end"], "at": int(time.time()), "status": "booked",
+                done[key] = {
+                    "gym": job["gym"], "ctrId": job["ctrId"], "date": best["date"],
+                    "start": best["start"], "end": best["end"],
+                    "at": int(time.time()), "status": "booked",
                 }
+                booked.setdefault(today_key, {
+                    "gym": job["gym"], "date": best["date"], "start": best["start"],
+                    "at": int(time.time()), "status": "booked",
+                })
                 save_state(state)
+                handled.add(key)
+                booked_any = True
+                remain = len(job_keys - handled)
                 notify_all(
                     "🎉 POSS 抢到了！",
-                    f"{gym_name} {best['date']} {best['start']}–{best['end']}\n"
-                    f"请登录 POSS 确认预订状态与押金扣除。\n"
+                    f"{job['gym']} {best['date']} {best['start']}–{best['end']}\n"
+                    + (f"还有 {remain} 个目标在抢。\n" if remain else "")
+                    + "请登录 POSS 确认预订状态与押金扣除。\n"
                     f"（{now.strftime('%m-%d %H:%M')} 自动抢位）",
                 )
-                return True
+                continue
 
             if res.inconclusive:
-                booked[today_key] = {
-                    "gym": gym_name, "date": best["date"], "start": best["start"],
-                    "at": int(time.time()), "status": "inconclusive",
+                done[key] = {
+                    "gym": job["gym"], "ctrId": job["ctrId"], "date": best["date"],
+                    "start": best["start"], "at": int(time.time()), "status": "inconclusive",
                 }
                 save_state(state)
                 notify_all(
                     "❓ POSS 抢位结果不明，请立刻确认",
-                    f"{gym_name} {best['date']} {best['start']}–{best['end']}\n"
+                    f"{job['gym']} {best['date']} {best['start']}–{best['end']}\n"
                     f"服务端返回：{res.message}\n"
                     f"脚本已停止重试（避免重复扣费）。请马上去 POSS 看一眼订单状态。\n"
                     f"（结果页原文已存 dumps/，可据此校准 success/failure 关键字）",
                 )
+                # 结果不明时不再继续抢其他目标 —— 那等于在赌押金
                 return True
 
             # 服务端明确说没订上（如时段被别人抢先）：这不是未知数，可以放心试下一个
-            tried.add((gym_name, str(best["date"]), str(best["start"])))
-            print(f"[booking] {gym_name} {best['start']} 被拒，已排除，继续试其他候选")
-        if dry_book or time.time() >= deadline:
+            tried.add((job["ctrId"], str(best["date"]), str(best["start"])))
+            handled.add(key)
+            print(f"[booking] {job['gym']} {best['start']} 被拒，已排除，继续试其他候选")
+
+        if dry_book or time.time() >= deadline or handled >= job_keys:
             break
         time.sleep(b["retry_interval"])
+
+    if booked_any:
+        return True
     print(f"[booking] 爆发 {attempts} 轮未抢到")
     return False
 
@@ -847,11 +1090,17 @@ def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
 
 
 def fetch_timetables(client, cfg):
+    """按 watch_scopes 拉时间表，返回 {scope 名: [raw, ...]}。"""
+    scopes = watch_scopes(cfg)
     dates = cfg["request"].get("searchDates") or [""]
 
     def _grab():
-        return {g["name"]: [client.timetable(g["ctrId"], d, params=cfg["request"]) for d in dates]
-                for g in cfg["gyms"]}
+        out = {}
+        for sc in scopes:
+            out[sc["name"]] = [
+                client.timetable(sc["ctrId"], d, params=sc["params"]) for d in dates
+            ]
+        return out
 
     if client.load_session(SESSION_FILE):
         try:
@@ -870,15 +1119,15 @@ def monitor_fallback(client, cfg, now, args):
     state = load_state()
     slots = state.setdefault("slots", {})
     open_slots = []
-    for gym in cfg["gyms"]:
-        for raw in data[gym["name"]]:
+    for name, raws in data.items():
+        for raw in raws:
             for s in parse_timetable(raw):
                 if not slot_matches_target(s, targets) or (s["left"] or 0) <= 0:
                     continue
                 open_slots.append({
-                    "key": f"{gym['name']}|{s['date']}|{s['start']}",
-                    "gym": gym["name"],
-                    **{k: s[k] for k in ("date", "start", "end", "left")},
+                    "key": f"{name}|{s['date']}|{s['start']}",
+                    "gym": name,
+                    **{k: s[k] for k in ("date", "start", "end", "left", "price")},
                 })
 
     now_ts = int(time.time())
@@ -1030,11 +1279,16 @@ def _booking_failed_alert(cfg, state, now, args):
     state["booking_failed_notified"] = key
     save_state(state)
     b = cfg["booking"]
-    target = (now.date() + timedelta(days=b["lead_days"])).isoformat()
+    jobs = plan_jobs(cfg, now)
+    if jobs:
+        desc = "\n".join(f"· {_job_desc(j)}" for j in jobs)
+    else:
+        target = (now.date() + timedelta(days=b["lead_days"])).isoformat()
+        desc = f"· {target} {b['from']}-{b['to']}（{'/'.join(b['gyms']) or '全部馆'}）"
     if not args.no_notify:
         notify_all(
             "😤 POSS 没抢到，转入蹲守",
-            f"目标：{target} {b['from']}-{b['to']}（{'/'.join(b['gyms']) or '全部馆'}）\n"
+            f"未抢到的目标：\n{desc}\n\n"
             f"已转入蹲守模式：有人取消放出空位会立即提醒你。",
         )
 

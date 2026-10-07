@@ -288,6 +288,47 @@ def mask_secrets(text: str, ctx: dict) -> str:
     return out
 
 
+def classify_select(name: str) -> str:
+    """猜一个下拉框扮演什么角色：activity / dataset / center / date / other。
+
+    POSS 的 make_book.do 上就是那几个 select（actvId / dataSetId / ctrId / searchDate），
+    按名字里的关键词认；认不出就归 other，UI 会照样列出来给人看。
+    """
+    n = (name or "").lower()
+    for role, hints in _ROLE_HINTS:
+        if any(h in n for h in hints):
+            return role
+    return "other"
+
+
+def parse_selects(html: str) -> list:
+    """把页面里所有 <select> 解析出来 → [{name,id,role,options:[{value,label,selected}]}]。
+
+    不做 DOM 解析（不想为这个引入依赖），用正则足够对付服务端渲染的表单。
+    """
+    out = []
+    for m in _SELECT_RE.finditer(html or ""):
+        a = _attrs(m.group(1))
+        options = []
+        for om in _OPTION_RE.finditer(m.group(2)):
+            oa = _attrs(om.group(1))
+            label = html_to_text(om.group(2))
+            options.append({
+                "value": oa.get("value", label),
+                "label": label or oa.get("value", ""),
+                # 裸属性（<option ... selected>）没有 ="..."，正则抓不到，单独判
+                "selected": "selected" in om.group(1).lower(),
+            })
+        name = a.get("name") or a.get("id") or ""
+        out.append({
+            "name": name,
+            "id": a.get("id", ""),
+            "role": classify_select(name),
+            "options": options,
+        })
+    return out
+
+
 class LoginFailed(Exception):
     """账号密码被拒 / 触发额外验证。"""
 
@@ -328,6 +369,21 @@ class BookingResult:
 
 _TAG_RE = re.compile(r"(?s)<[^>]+>")
 _DROP_BLOCK_RE = re.compile(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>")
+
+# 下拉框角色识别（按 name/id 里的关键词）
+_ROLE_HINTS = [
+    ("activity", ("actv", "activity")),
+    ("dataset", ("dataset", "dataclass", "category", "catg")),
+    ("center", ("ctr", "center", "centre", "venue", "site")),
+    ("date", ("date", "day")),
+]
+_SELECT_RE = re.compile(r"(?is)<select\b([^>]*)>(.*?)</select>")
+_OPTION_RE = re.compile(r"(?is)<option\b([^>]*)>(.*?)</option>")
+_ATTR_RE = re.compile(r'([A-Za-z_:][-\w:.]*)\s*=\s*"([^"]*)"')
+
+
+def _attrs(s: str) -> dict:
+    return {k.lower(): v for k, v in _ATTR_RE.findall(s or "")}
 
 
 def html_to_text(html: str) -> str:
@@ -440,6 +496,28 @@ class PossClient:
         if self.debug:
             print(f"[login] make_book.do: {r.status_code}, 找到 {len(tokens)} 个 token")
         return tokens[-1] if tokens else None
+
+    # ---------- 选课 UI 支撑 ----------
+
+    def fetch_make_book_html(self) -> str:
+        """GET 预订页原始 HTML（UI 用来解析 Activity/Date/Center 下拉框）。"""
+        r = self.s.get(MAKE_BOOK, timeout=30)
+        if "loginhome" in r.url or "loginform" in r.text:
+            raise SessionExpired("make_book.do 被挡在登录页（会话失效）")
+        return r.text
+
+    def ensure_login(self) -> bool:
+        """会话还能用就直接复用，否则重新登录。返回是否发生了重新登录。"""
+        try:
+            self.fetch_make_book_html()
+            if not self.api_csrf:
+                self.api_csrf = self._fetch_api_token()
+            if self.api_csrf:
+                return False
+        except (SessionExpired, requests.RequestException):
+            pass
+        self.login()
+        return True
 
     # ---------- 时间表 ----------
 

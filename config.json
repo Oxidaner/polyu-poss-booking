@@ -14,6 +14,7 @@
     "burst_seconds": 120,
     "retry_interval": 3,
     "gyms": ["X123", "X202"],
+    "targets": [],
     "from": "16:30",
     "to": "17:30",
     "search_date_format": "%Y-%m-%d",
