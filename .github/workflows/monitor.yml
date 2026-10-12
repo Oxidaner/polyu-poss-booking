@@ -1,26 +1,22 @@
-name: POSS Slot Monitor
+name: POSS Booking Backup
 
 on:
   schedule:
-    # 常规轮询：每 5 分钟（蹲守提醒用）
-    - cron: "*/5 * * * *"
-    # 抢位预热：香港时间 08:29（UTC 00:29），让脚本准点 08:30:00 开火
-    - cron: "29 0 * * *"
-    # 抢位兜底重试：香港时间 08:35（UTC 00:35）
-    - cron: "35 0 * * *"
-  workflow_dispatch: # 允许手动触发，方便测试
+    # 香港时间 08:20，给启动、登录和预检留出时间；GitHub 不保证准时启动。
+    - cron: "20 0 * * *"
+  workflow_dispatch: # 手动触发只验证账号和余额，不提交预订。
 
 permissions:
-  contents: write # 需要写权限把 state.json / session.json 推回仓库
+  contents: write # 保存跨次运行的预订状态
 
 concurrency:
-  group: poss-monitor
-  cancel-in-progress: false # 上一次没跑完不重叠，排队即可
+  group: poss-booking
+  cancel-in-progress: false
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -32,19 +28,12 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Run monitor
+      - name: Verify accounts or wait for release
         env:
           POSS_NETID: ${{ secrets.POSS_NETID }}
           POSS_PASSWORD: ${{ secrets.POSS_PASSWORD }}
-          POSS_FB_USER_ID: ${{ vars.POSS_FB_USER_ID }}
-          POSS_CONFIG: ${{ vars.POSS_CONFIG }}
-          # 预订模板：两步流程用 BOOKING_CURL_STEP1 / STEP2；单步可直接用 BOOKING_CURL
-          BOOKING_CURL: ${{ secrets.BOOKING_CURL }}
-          BOOKING_CURL_STEP1: ${{ secrets.BOOKING_CURL_STEP1 }}
-          BOOKING_CURL_STEP2: ${{ secrets.BOOKING_CURL_STEP2 }}
-          # 或把模板文件路径存在 GitHub Variables 里（默认读取仓库根目录 booking.curl）
-          BOOKING_CURL_FILE_STEP1: ${{ vars.BOOKING_CURL_FILE_STEP1 }}
-          BOOKING_CURL_FILE_STEP2: ${{ vars.BOOKING_CURL_FILE_STEP2 }}
+          POSS_NETID_2: ${{ secrets.POSS_NETID_2 }}
+          POSS_PASSWORD_2: ${{ secrets.POSS_PASSWORD_2 }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -52,12 +41,39 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
-        run: python monitor.py
+        run: |
+          for key in POSS_NETID POSS_PASSWORD POSS_NETID_2 POSS_PASSWORD_2; do
+            if [ -z "${!key}" ]; then
+              echo "$key 未配置"
+              exit 1
+            fi
+          done
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            python - <<'PY'
+          from poss_client import account_ids_from_env, client_from_env, transport_reason
+          import requests
 
-      # 抢位提交后，服务端返回的结果页原文会落到 dumps/。
-      # 一旦 success/failure 关键字判错，就靠这个 artifact 回溯并改配置。
-      - name: Upload result dumps
-        if: always()
+          for account_id in account_ids_from_env():
+              try:
+                  client = client_from_env(account_id=account_id)
+                  client.login()
+                  balance = client.deposit_balance()
+                  if balance is None:
+                      raise ValueError("balance_unknown")
+                  print(f"账号 {account_id}: 登录成功，余额 HK${balance['amount']}")
+              except Exception as exc:
+                  reason = (transport_reason(exc) if isinstance(exc, requests.RequestException)
+                            else "balance_unknown" if isinstance(exc, ValueError)
+                            else type(exc).__name__)
+                  raise SystemExit(f"账号 {account_id}: 验证失败 ({reason})") from None
+          PY
+          else
+            python -u monitor.py --wait --today-only
+          fi
+
+      # 保存结构化抢位诊断日志，不包含凭据或原始结果页。
+      - name: Upload booking diagnostics
+        if: always() && github.event_name == 'schedule'
         uses: actions/upload-artifact@v4
         with:
           name: poss-dumps
@@ -65,11 +81,12 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Commit state & session
+      - name: Commit state
+        if: github.event_name == 'schedule'
         run: |
           git config user.name "poss-bot"
           git config user.email "actions@github.com"
-          git add state.json session.json
+          if [ -f state.json ]; then git add state.json; fi
           if git diff --cached --quiet; then
             echo "状态无变化，跳过提交"
           else

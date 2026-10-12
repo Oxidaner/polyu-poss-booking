@@ -1,1356 +1,936 @@
 #!/usr/bin/env python3
-"""
-POSS 抢位器 / 蹲位器 - 主程序
-==============================
-两种模式自动切换：
-
-  ① 抢位（config.booking）：在触发日（默认周二、周四）08:30 前预热等待，
-     到点后爆发式抢「lead_days 天后（默认下周同一天）」的目标时段（默认 16:30–17:30）。
-     抢到 → 立即推送；没抢到 → 推送一次「转入蹲守」。
-  ② 蹲守提醒（config.fallback）：监控目标时段的空位（有人取消就放出来），
-     出现空位立即 微信推送 + 邮件。
-
-用法：
-  python3 monitor.py                # 正常跑（Actions / 本地）
-  python3 monitor.py --dump         # 校准：抓原始数据存 dumps/，不抢不推
-  python3 monitor.py --dry-book     # 演练：演练抢位并打印将要提交的表单，不真提交
-  python3 monitor.py --no-notify    # 静默跑（不发通知，用于测试）
-
-测试用：设 POSS_FAKE_NOW=2026-09-15T08:31 可伪造当前时间（同时跳过等待）。
-"""
+"""POSS monitor and booking runner for the rebuilt client."""
+from __future__ import annotations
 
 import argparse
+import fcntl
 import json
-import locale
 import os
-import re
+import random
 import smtplib
-import sys
+import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.header import Header
 from email.mime.text import MIMEText
 
+import requests
+
 from poss_client import (
-    BASE,
-    BookingNotCalibrated,
-    DEFAULT_FAILURE_KEYWORDS,
-    DEFAULT_SUCCESS_KEYWORDS,
-    LoginFailed,
-    MAKE_BOOK_RESULT,
-    PossClient,
-    SessionExpired,
-    classify_result,
-    find_unresolved,
-    html_to_text,
-    mask_secrets,
-    render_template,
+    BookingAttemptError, PossError, Selection, SessionExpired, booking_release_at,
+    account_ids_from_env, client_from_env, find_slot, load_env, transport_reason, tree_context,
 )
 
-# %b（月份缩写）必须稳定输出英文 "Sep"：POSS 的 startDateTime 形如
-# "18 Sep 2026 14:30"，若跟随系统语言（zh_CN）会变成 "18 9月 2026" 而请求失败。
-try:
-    locale.setlocale(locale.LC_TIME, "C")
-except locale.Error:  # pragma: no cover
-    pass
-
+ROOT = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.environ.get("POSS_CONFIG_FILE", os.path.join(ROOT, "config.json"))
+STATE_FILE = os.environ.get("POSS_STATE_FILE", os.path.join(ROOT, "state.json"))
+LOG_FILE = os.environ.get("POSS_LOG_FILE", os.path.join(ROOT, "dumps", "booking_attempts.jsonl"))
 TZ = timezone(timedelta(hours=8))
+REPORT_LOCK = threading.Lock()
 
-STATE_FILE = os.environ.get("STATE_FILE", "state.json")
-SESSION_FILE = os.environ.get("SESSION_FILE", "session.json")
-DUMP_DIR = os.environ.get("DUMP_DIR", "dumps")
-CONFIG_FILE = os.environ.get("CONFIG_FILE", "config.json")
-# 抓包导入的预订请求模板（calibrate.py 生成）
-BOOKING_CURL_FILE = os.environ.get("BOOKING_CURL_FILE", "booking.curl")
 
-POSS_BOOK_URL = "https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/make_book.do"
+def load_config():
+    with open(CONFIG_FILE, encoding="utf-8") as handle:
+        return json.load(handle)
 
-# 同一空位一直没被抢走时，隔多久再提醒一次（秒）
-RENOTIFY_AFTER = int(os.environ.get("RENOTIFY_AFTER", 30 * 60))
-# 「监控失明」警报的最小间隔（秒）
-FAIL_ALERT_INTERVAL = 60 * 60
 
-# ---- 通知渠道（环境变量 / .env） ----
-# 这些是模块级常量，进程启动时读一次。UI 改完 .env 必须调 reload_notify_env() 刷新，
-# 否则界面上显示"已配置"、实际发的还是旧值（或压根不发）。
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
-SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
-SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
-SMTP_PORT = int(os.environ.get("SMTP_PORT") or "465")   # 空字符串会炸，兜一下
-SMTP_USER = os.environ.get("SMTP_USER", "").strip()
-SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
-MAIL_TO = os.environ.get("MAIL_TO", "").strip()
-
-
-def reload_notify_env():
-    """重新从环境变量读通知渠道配置（UI 写 .env 之后调用）。"""
-    global PUSHPLUS_TOKEN, SERVERCHAN_KEY, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_TO
-    PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "").strip()
-    SERVERCHAN_KEY = os.environ.get("SERVERCHAN_KEY", "").strip()
-    SMTP_HOST = os.environ.get("SMTP_HOST", "").strip()
-    SMTP_PORT = int(os.environ.get("SMTP_PORT") or "465")
-    SMTP_USER = os.environ.get("SMTP_USER", "").strip()
-    SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
-    MAIL_TO = os.environ.get("MAIL_TO", "").strip()
-
-# ---- 内置默认 ----
-DEFAULT_GYMS = [
-    {"name": "X123", "ctrId": "151"},
-    {"name": "X202", "ctrId": "152"},
-]
-DEFAULT_BOOKING = {
-    "enabled": True,
-    "trigger_days": [1, 3],          # 周二、周四（0=周一）
-    "trigger_time": "08:30",
-    "warmup_minutes": 6,             # 触发前多少分钟内到达就原地等待
-    "grace_minutes": 30,             # 触发后多少分钟内仍积极尝试抢
-    "lead_days": 7,                  # 抢 7 天后（下周同一天）
-    "burst_seconds": 120,            # 爆发抢位持续时长
-    "retry_interval": 3,             # 每轮间隔秒数
-    "gyms": [],                      # 空 = 按 gyms 顺序全部尝试（仅派生模式用）
-    "targets": [],                   # 显式抢位目标（UI 生成）；非空则不再用派生逻辑
-    "from": "16:30",
-    "to": "17:30",
-    "search_date_format": "%Y-%m-%d",
-    "curl_file": "booking.curl",     # 抓包导入的预订请求模板（首选）
-    "curl": "",                      # 也可直接把整段 cURL 写进配置（不推荐，含凭据）
-    "steps": [],                     # 多步预订：每步一个 {"curl_file": "...", "extract": {...}}
-    "endpoint": "",                  # 遗留路径：手工填端点（未用 cURL 时）
-    "params": {},                    # 遗留路径：手工填表单模板
-    # 关键词直接引用 poss_client 里的那一份 —— 否则 UI 显示「空」、代码却用着内置默认，
-    # 用户会以为自己没配失败词，实际配了。
-    "success_keywords": list(DEFAULT_SUCCESS_KEYWORDS),
-    "failure_keywords": list(DEFAULT_FAILURE_KEYWORDS),
-    "result_url": "",                # 空 = poss_client.MAKE_BOOK_RESULT
-}
-
-
-def load_env_file(path=".env"):
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
-
-# ==================== 配置 ====================
-
-
-def load_config() -> dict:
-    """优先级：环境变量 POSS_CONFIG（JSON）> config.json > 内置默认。"""
-    raw = os.environ.get("POSS_CONFIG", "").strip()
-    if raw:
-        cfg = json.loads(raw)
-    elif os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, encoding="utf-8") as f:
-            cfg = json.load(f)
-    else:
-        cfg = {}
-    cfg.setdefault("gyms", DEFAULT_GYMS)
-    booking = dict(DEFAULT_BOOKING)
-    booking.update(cfg.get("booking") or {})
-    cfg["booking"] = booking
-    cfg.setdefault("fallback", {"enabled": True})
-    cfg.setdefault("request", {})
-    _validate_config(cfg)
-    return cfg
-
-
-def _validate_config(cfg: dict):
-    def bad(msg):
-        raise ValueError(f"配置错误: {msg}")
-
-    if not isinstance(cfg["gyms"], list) or not cfg["gyms"]:
-        bad('gyms 必须是非空数组，例: [{"name": "X123", "ctrId": "151"}]')
-    names = set()
-    for g in cfg["gyms"]:
-        if not isinstance(g, dict) or not g.get("name") or not g.get("ctrId"):
-            bad(f"每个 gym 需要 name 和 ctrId: {g}")
-        if g["name"] in names:
-            bad(f"gym 名称重复: {g['name']}")
-        names.add(g["name"])
-
-    b = cfg["booking"]
-    for d in b["trigger_days"]:
-        if not isinstance(d, int) or not 0 <= d <= 6:
-            bad(f"booking.trigger_days 取值 0-6（0=周一）: {d}")
-    if not _parse_hm(b["trigger_time"]):
-        bad(f"booking.trigger_time 必须是 HH:MM: {b['trigger_time']}")
-    if not _parse_hm(b["from"]) or not _parse_hm(b["to"]):
-        bad(f"booking.from/to 必须是 HH:MM: {b['from']}/{b['to']}")
-    if b["from"] >= b["to"]:
-        bad(f"booking 时段起点必须早于终点: {b['from']}-{b['to']}")
-    for k in ("warmup_minutes", "grace_minutes", "lead_days", "burst_seconds", "retry_interval"):
-        if not isinstance(b[k], int) or b[k] < 0:
-            bad(f"booking.{k} 必须是非负整数: {b[k]}")
-    unknown = [g for g in b["gyms"] if g not in names]
-    if unknown:
-        bad(f"booking.gyms 里有未定义的馆名: {unknown}（可选: {sorted(names)}）")
-
-    _validate_booking_targets(cfg)
-
-    steps = load_booking_steps(b)
-    if b["enabled"]:
-        missing = []
-        for i, step in enumerate(steps):
-            if not load_step_curl(step, b, i):
-                missing.append(i + 1)
-        if missing:
-            print(f"[warn] 预订模板未配置完整（缺步骤 {missing}）—— 抢位将无法执行（仅蹲守提醒）。"
-                  "请抓取手动预订那条「提交」请求的 cURL，"
-                  "运行 `python3 calibrate.py --import <文件>` 生成 booking.curl。")
-
-    if cfg["fallback"].get("enabled", True) and cfg["fallback"].get("targets"):
-        _validate_targets(cfg["fallback"]["targets"], where="fallback.targets")
-
-    dates = cfg["request"].get("searchDates", [])
-    if not isinstance(dates, list):
-        bad("request.searchDates 必须是日期字符串数组")
-
-
-def _validate_booking_targets(cfg):
-    """校验显式 targets：每项至少要有 date + (gym 或 ctrId)，时段合法。"""
-    b = cfg["booking"]
-    targets = b.get("targets")
-    if targets in (None, [], ""):
-        return
-    if not isinstance(targets, list):
-        raise ValueError("配置错误: booking.targets 必须是数组")
-    names = {g["name"] for g in cfg["gyms"]}
-    for i, t in enumerate(targets):
-        where = f"booking.targets[{i}]"
-        if not isinstance(t, dict):
-            raise ValueError(f"配置错误: {where} 必须是对象")
-        if not _parse_date(t.get("date")):
-            raise ValueError(f"配置错误: {where}.date 缺失或不是日期: {t.get('date')!r}")
-        if not (t.get("gym") or t.get("ctrId")):
-            raise ValueError(f"配置错误: {where} 需要 gym 或 ctrId")
-        if t.get("gym") and t["gym"] not in names:
-            raise ValueError(
-                f"配置错误: {where}.gym 未在顶层 gyms 里定义: {t['gym']}（可选: {sorted(names)}）"
-            )
-        f, to = t.get("from") or b["from"], t.get("to") or b["to"]
-        if not _parse_hm(f) or not _parse_hm(to):
-            raise ValueError(f"配置错误: {where} 的 from/to 必须是 HH:MM: {f}/{to}")
-        if f >= to:
-            raise ValueError(f"配置错误: {where} 时段起点必须早于终点: {f}-{to}")
-
-
-def _validate_targets(targets, where):
-    if not isinstance(targets, list) or not targets:
-        raise ValueError(f"配置错误: {where} 必须是非空数组")
-    for t in targets:
-        if not isinstance(t, dict) or not {"days", "from", "to"} <= set(t):
-            raise ValueError(f"配置错误: {where} 每项需要 days/from/to: {t}")
-        for d in t["days"]:
-            if not isinstance(d, int) or not 0 <= d <= 6:
-                raise ValueError(f"配置错误: {where} 的 days 取值 0-6（0=周一）: {t}")
-        if not _parse_hm(t["from"]) or not _parse_hm(t["to"]):
-            raise ValueError(f"配置错误: {where} 的 from/to 必须是 HH:MM: {t}")
-
-
-def ctr_of(cfg, gym_name):
-    for g in cfg["gyms"]:
-        if g["name"] == gym_name:
-            return g["ctrId"]
-    raise ValueError(f"配置里没有馆: {gym_name}")
-
-
-def fallback_targets(cfg):
-    """蹲守目标时段：显式配置优先，否则由 booking 派生。
-
-    配了 booking.targets 时，蹲守也只盯那些目标（含精确日期），
-    而不是漫无目的地盯所有同星期几的时段。
-    """
-    fb = cfg["fallback"]
-    if fb.get("targets"):
-        return fb["targets"]
-    b = cfg["booking"]
-    if b.get("targets"):
-        out = []
-        for t in b["targets"]:
-            d = _parse_date(t.get("date"))
-            if not d:
-                continue
-            out.append({
-                "days": [d.weekday()],
-                "from": t.get("from") or b["from"],
-                "to": t.get("to") or b["to"],
-                "dates": [d.strftime("%Y-%m-%d")],
-            })
-        if out:
-            return out
-    return [{"days": list(b["trigger_days"]), "from": b["from"], "to": b["to"]}]
-
-
-def watch_scopes(cfg) -> list:
-    """蹲守要查询的 (场馆, 活动) 组合。
-
-    配了 targets 就按 targets 里实际出现过的组合去查（这样「不同活动」也能被盯上），
-    否则退回 cfg.gyms × 全局 request 参数。
-    """
-    b = cfg["booking"]
-    if b.get("targets"):
-        seen, out = set(), []
-        for t in b["targets"]:
-            try:
-                j = _job_from_target(cfg, t)
-            except ValueError:
-                continue
-            key = (j["ctrId"], j["params"].get("actvId"), j["params"].get("dataSetId"))
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({"name": j["gym"], "ctrId": j["ctrId"], "params": j["params"]})
-        if out:
-            return out
-    return [{"name": g["name"], "ctrId": g["ctrId"], "params": cfg["request"]}
-            for g in cfg["gyms"]]
-
-
-def load_booking_curl(b: dict):
-    """取预订请求模板。优先级：环境变量 BOOKING_CURL > 配置内联 curl > curl_file 文件。"""
-    text = os.environ.get("BOOKING_CURL", "").strip()
-    if text:
-        return text
-    if (b.get("curl") or "").strip():
-        return b["curl"].strip()
-    path = os.environ.get("BOOKING_CURL_FILE") or b.get("curl_file") or BOOKING_CURL_FILE
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return f.read().strip()
-    return None
-
-
-def load_booking_steps(b: dict) -> list:
-    """返回预订步骤列表。配置了 steps 就用 steps；否则退化成单步（curl_file / curl）。"""
-    steps = b.get("steps")
-    if isinstance(steps, list) and steps:
-        return steps
-    return [{}]
-
-
-def load_step_curl(step: dict, b: dict, idx: int = 0) -> str | None:
-    """取某一步的 cURL 模板。
-
-    优先级：step.curl 内联 > BOOKING_CURL_STEP{n} Secret > BOOKING_CURL_FILE_STEP{n} 文件路径 >
-    step.curl_file / b.curl_file / booking.curl 文件。
-    """
-    text = (step.get("curl") or "").strip()
-    if text:
-        return text
-    text = os.environ.get(f"BOOKING_CURL_STEP{idx + 1}", "").strip()
-    if text:
-        return text
-    path = os.environ.get(f"BOOKING_CURL_FILE_STEP{idx + 1}", "")
-    if not path:
-        path = step.get("curl_file") or b.get("curl_file") or BOOKING_CURL_FILE
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            return f.read().strip()
-    return None
-
-
-# ==================== 时间 ====================
-
-
-def hk_now() -> datetime:
-    fake = os.environ.get("POSS_FAKE_NOW")
-    if fake:
-        return datetime.strptime(fake, "%Y-%m-%dT%H:%M").replace(tzinfo=TZ)
-    return datetime.now(TZ)
-
-
-def _parse_hm(s):
-    s = str(s).strip()
-    for fmt in ("%H:%M:%S", "%H:%M", "%H%M"):
-        try:
-            return datetime.strptime(s, fmt).strftime("%H:%M")
-        except ValueError:
-            continue
-    return None
-
-
-def _parse_date(s):
-    s = str(s).strip()
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            continue
-    return None
-
-
-def hm_to_min(hm: str) -> int:
-    h, m = hm.split(":")
-    return int(h) * 60 + int(m)
-
-
-def booking_phase(cfg, now: datetime) -> str:
-    """'pre'=预热等待 / 'open'=窗口内应抢 / 'closed'=不抢。"""
-    b = cfg["booking"]
-    if not b["enabled"]:
-        return "closed"
-    if b.get("targets"):
-        # 显式目标：由「各自放位时刻」决定要不要干活，不再看 trigger_days
-        if not plan_jobs(cfg, now):
-            return "closed"
-    elif now.weekday() not in b["trigger_days"]:
-        return "closed"
-    now_m = now.hour * 60 + now.minute
-    t0 = hm_to_min(b["trigger_time"])
-    if t0 <= now_m <= t0 + b["grace_minutes"]:
-        return "open"
-    if t0 - b["warmup_minutes"] <= now_m < t0:
-        return "pre"
-    return "closed"
-
-
-# ==================== 抢位目标调度 ====================
-# 两种模式：
-#   ① 显式 targets：用户在 UI 里点选的「哪天 / 哪个馆 / 哪个时段」，
-#      放位时刻 = 目标日期 - lead_days 的 trigger_time（POSS 只放 7 天内的场）。
-#   ② 没配 targets：沿用旧的派生逻辑（今天 + lead_days，同星期几，全部馆）。
-
-
-def _target_release_dt(target: dict, b: dict) -> datetime | None:
-    """该目标最早能订的那一刻。解析不出日期返回 None。"""
-    d = _parse_date(target.get("date"))   # 注意：_parse_date 返回 date，不是 datetime
-    if not d:
-        return None
-    h, m = (int(x) for x in b["trigger_time"].split(":"))
-    return datetime(d.year, d.month, d.day, h, m) - timedelta(days=b["lead_days"])
-
-
-def _job_from_target(cfg, t: dict) -> dict:
-    """把一条配置目标补全成可执行的 job（补 ctrId、继承全局时段、合并 activity 参数）。
-
-    gym 必须能在顶层 gyms 里查到才用它推 ctrId；UI 生成的 target 直接带 ctrId，
-    并用 name 字段做显示名（这样任意中心都能选，不受顶层 gyms 限制）。
-    """
-    b = cfg["booking"]
-    gym = (t.get("gym") or "").strip()
-    display = gym or str(t.get("name") or "").strip()
-    ctr = str(t.get("ctrId") or "").strip()
-    if not ctr:
-        if not gym:
-            raise ValueError(f"目标既没 gym 也没 ctrId: {t}")
-        ctr = ctr_of(cfg, gym)
-    params = dict(cfg.get("request") or {})
-    for k in ("actvId", "dataSetId", "bookType"):
-        if t.get(k) not in (None, ""):
-            params[k] = str(t[k])
-    return {
-        "gym": display or f"ctr{ctr}",
-        "ctrId": ctr,
-        "date": str(t["date"]),
-        "from": t.get("from") or b["from"],
-        "to": t.get("to") or b["to"],
-        "activity": t.get("activity") or "",
-        "params": params,
-    }
-
-
-def plan_jobs(cfg, now: datetime) -> list:
-    """当前这一刻该抢的目标列表。"""
-    b = cfg["booking"]
-    if not b["enabled"]:
-        return []
-    if b.get("targets"):
-        return [
-            _job_from_target(cfg, t)
-            for t in b["targets"]
-            if (_target_release_dt(t, b) or datetime.max).date() == now.date()
-        ]
-    if now.weekday() not in b["trigger_days"]:
-        return []
-    date = (now.date() + timedelta(days=b["lead_days"])).isoformat()
-    names = b["gyms"] or [g["name"] for g in cfg["gyms"]]
-    return [
-        _job_from_target(cfg, {"gym": n, "date": date, "from": b["from"], "to": b["to"]})
-        for n in names
-    ]
-
-
-def slot_matches_job(slot, job) -> bool:
-    """时段是否属于该目标：日期必须对上（能解析时），时间要有交集。"""
-    d, jd = _parse_date(slot["date"]), _parse_date(job["date"])   # 都是 date 对象
-    if d and jd and d != jd:
-        return False
-    st = _parse_hm(slot["start"])
-    if not st:
-        return False
-    et = _parse_hm(slot["end"]) if slot.get("end") else None
-    if et:
-        return st < job["to"] and et > job["from"]
-    return job["from"] <= st < job["to"]
-
-
-def wait_until_trigger(cfg):
-    """原地等到触发时刻（测试环境 POSS_FAKE_NOW 时直接跳过）。"""
-    if os.environ.get("POSS_FAKE_NOW"):
-        return
-    b = cfg["booking"]
-    h, m = (int(x) for x in b["trigger_time"].split(":"))
-    target = hk_now().replace(hour=h, minute=m, second=0, microsecond=0)
-    while hk_now() < target:
-        time.sleep(1)
-    print(f"[booking] 已到触发时刻 {b['trigger_time']}")
-
-
-# ==================== 解析 timetable.json ====================
-# ⚠️ 结构未校准：深度遍历 JSON，收集「像时段」的 dict（日期键 + 时间键 + 数量键）。
-#    拿到真实样本（--dump）后替换为精确解析。⚠️
-
-DATE_KEYS = ["bookdate", "bookingdate", "date", "daydate", "slotdate", "startdate"]
-START_KEYS = ["starttime", "start", "booktime", "timefrom", "from", "bookstart"]
-END_KEYS = ["endtime", "end", "timeto", "to", "bookend"]
-LEFT_HINTS = [
-    "vacancy", "vacant", "quotaleft", "left", "remain", "available", "avail",
-    "nofavail", "empty", "free", "slotleft", "canslot",
-]
-# 价格 / 押金 / 状态：用于把时段渲染成 POSS 那张彩色网格
-# （灰=不可用，洋红=$0 + $10 可退押金，蓝=$10）
-PRICE_HINTS = ["chrg", "charge", "price", "amount", "amt", "cost", "rate", "fee"]
-DEPOSIT_HINTS = ["deposit", "refund", "reservfee", "reservationfee", "secfee", "dep"]
-STATUS_HINTS = ["status", "state", "remark", "reason", "msg", "ind"]
-# 价格键里要排除的（这些不是钱）
-PRICE_EXCLUDE = ["id", "no", "num", "code", "type", "desc", "name"]
-
-
-class ParseNeedsCalibration(Exception):
-    """JSON 结构超出启发式能力 —— 需要先跑 --dump 校准。"""
-
-
-def _pick_number(d: dict, hints, exclude=()) -> float | None:
-    """按 key 提示找第一个像金额/数字的标量。排除 id/no/code 这类同前缀陷阱。"""
-    for k, v in d.items():
-        kl = k.lower()
-        if any(x in kl for x in hints) and not any(x in kl for x in exclude):
-            if isinstance(v, bool):
-                continue
-            if isinstance(v, (int, float)):
-                return float(v)
-            if isinstance(v, str):
-                m = re.search(r"-?\d+(?:\.\d+)?", v)
-                if m:
-                    return float(m.group(0))
-    return None
-
-
-def parse_timetable(data) -> list:
-    """返回 [{date, start, end, left, price, deposit, status, raw}]。
-
-    遍历时**继承祖先节点的标量字段**：POSS 常把 facilityId / ctrId 这类信息挂在
-    分组节点上、时段挂在其下，只看叶子节点会漏掉它们，而预订模板正需要 facilityId。
-    继承来的字段不覆盖节点自身的同名字段。
-    """
-    found = []
-
-    def walk(node, inherited):
-        if isinstance(node, dict):
-            own = {k: v for k, v in node.items() if isinstance(v, (str, int, float))}
-            merged = {**inherited, **own}
-            date_v = _pick(node, DATE_KEYS)
-            start_v = _pick(node, START_KEYS)
-            if date_v and start_v:
-                left = _pick_int(node, LEFT_HINTS)
-                found.append({
-                    "date": str(date_v),
-                    "start": str(start_v),
-                    "end": str(_pick(node, END_KEYS) or ""),
-                    "left": left,
-                    "price": _pick_number(node, PRICE_HINTS, PRICE_EXCLUDE),
-                    "deposit": _pick_number(node, DEPOSIT_HINTS),
-                    "status": str(_pick(node, STATUS_HINTS) or ""),
-                    "raw": merged,
-                })
-            for v in node.values():
-                if isinstance(v, (dict, list)):
-                    walk(v, merged)
-        elif isinstance(node, list):
-            for item in node:
-                walk(item, inherited)
-
-    walk(data, {})
-    if not found:
-        raise ParseNeedsCalibration(
-            "启发式解析颗粒无收：timetable.json 结构未知，请先跑 `python3 monitor.py --dump` "
-            "并把 dumps/ 里的文件交给开发者校准解析器。"
-        )
-    return found
-
-
-def _pick(d: dict, keys):
-    for k in d:
-        if k.lower() in keys:
-            return d[k]
-    return None
-
-
-def _pick_int(d: dict, hints):
-    for k, v in d.items():
-        if any(h in k.lower() for h in hints) and isinstance(v, (int, float)):
-            return int(v)
-    return None
-
-
-def slot_matches_target(slot, targets) -> bool:
-    """时段与任一目标窗口有交集（按星期几 + HH:MM，可选精确日期）。"""
-    d = _parse_date(slot["date"])
-    st = _parse_hm(slot["start"])
-    if not d or not st:
-        return False
-    et = _parse_hm(slot["end"]) if slot.get("end") else None
-    for t in targets:
-        if t.get("dates"):
-            wanted = {str(x) for x in t["dates"]}
-            if str(slot["date"]) not in wanted and d.strftime("%Y-%m-%d") not in wanted:
-                continue
-        if d.weekday() not in t["days"]:
-            continue
-        if et:
-            if st < t["to"] and et > t["from"]:
-                return True
-        elif t["from"] <= st < t["to"]:
-            return True
-    return False
-
-
-# ==================== 通知 ====================
-
-
-def notify_pushplus(title, content) -> bool:
-    try:
-        import requests
-        r = requests.post(
-            "https://www.pushplus.plus/send",
-            json={"token": PUSHPLUS_TOKEN, "title": title, "content": content, "template": "txt"},
-            timeout=15,
-        )
-        ok = r.json().get("code") == 200
-        print(f"[PushPlus] {'OK' if ok else r.text[:200]}")
-        return ok
-    except Exception as e:  # noqa: BLE001
-        print(f"[PushPlus] 失败: {e}")
-        return False
-
-
-def notify_serverchan(title, content) -> bool:
-    try:
-        import requests
-        r = requests.post(
-            f"https://sctapi.ftqq.com/{SERVERCHAN_KEY}.send",
-            data={"title": title, "desp": content},
-            timeout=15,
-        )
-        ok = r.json().get("code") == 0
-        print(f"[Server酱] {'OK' if ok else r.text[:200]}")
-        return ok
-    except Exception as e:  # noqa: BLE001
-        print(f"[Server酱] 失败: {e}")
-        return False
-
-
-def notify_email(subject, content) -> bool:
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASS and MAIL_TO):
-        return False
-    try:
-        msg = MIMEText(content, "plain", "utf-8")
-        msg["Subject"] = Header(subject, "utf-8")
-        msg["From"] = SMTP_USER
-        msg["To"] = MAIL_TO
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as s:
-            s.login(SMTP_USER, SMTP_PASS)
-            s.sendmail(SMTP_USER, [MAIL_TO], msg.as_string())
-        print("[邮件] OK")
-        return True
-    except Exception as e:  # noqa: BLE001
-        print(f"[邮件] 失败: {e}")
-        return False
-
-
-def notify_all(title, content):
-    channels = 0
-    if PUSHPLUS_TOKEN:
-        channels += 1
-        notify_pushplus(title, content)
-    if SERVERCHAN_KEY:
-        channels += 1
-        notify_serverchan(title, content)
-    if notify_email(title, content):
-        channels += 1
-    if channels == 0:
-        print("[warn] 没有任何通知渠道可用（消息仅打印在日志）")
-    return channels
-
-
-# ==================== 状态 ====================
-
-
-def load_state() -> dict:
+def load_state():
     if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            pass
-    return {"slots": {}, "booked": {}}
+        with open(STATE_FILE, encoding="utf-8") as handle:
+            return json.load(handle)
+    return {"processed": {}}
 
 
-def save_state(state: dict):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-
-# ==================== 抢位引擎 ====================
-
-
-def safe_format(template: str, ctx: dict) -> str:
-    """占位符替换（支持 {key} 与 {key:%d/%m/%Y}）；未知占位符原样保留。"""
-    return render_template(template, ctx)
-
-
-def build_booking_context(client, b, slot, gym_name, ctr_id, target_date) -> dict:
-    """组装占位符上下文：场馆 / 时段 / 日期 + timetable 原始字段 + 会话令牌。
-
-    日期时间统一归一化成 ISO（"2026-09-18 14:30"），模板里用
-    {startDateTime:url:%d %b %Y %H:%M} 这样的写法来控制最终呈现格式 ——
-    格式只写在抓包模板里，不在代码里再搞一份，避免两处不一致。
-    """
-    d = _parse_date(slot["date"])
-    date_iso = d.strftime("%Y-%m-%d") if d else str(slot["date"])
-    start_iso = _parse_hm(slot["start"]) or str(slot["start"])
-    end_iso = _parse_hm(slot["end"]) or str(slot["end"] or slot["start"])
-    ctx = {
-        "gym": gym_name,
-        "ctrId": str(ctr_id),
-        "date": date_iso,
-        "startDate": date_iso,
-        "rawDate": str(slot["date"]),
-        "startTime": start_iso,
-        "endTime": end_iso,
-        "startDateTime": f"{date_iso} {start_iso}",
-        "endDateTime": f"{date_iso} {end_iso}",
-        "searchDate": target_date.strftime(b["search_date_format"]),
-        "fbUserId": getattr(client, "fb_user_id", "") or "",
-        "csrf": getattr(client, "api_csrf", "") or "",
-    }
-    # timetable 返回的原始字段也注入（如 slotId/facilityId），供 {同名} 占位符使用
-    for k, v in (slot.get("raw") or {}).items():
-        if isinstance(v, (str, int, float)):
-            ctx.setdefault(str(k), str(v))
-    return ctx
-
-
-def build_booking_payload(b, slot, gym_name, ctr_id, target_date, ctx) -> dict:
-    """遗留路径：按 config.booking.params 模板组装表单。"""
-    return {
-        k: (safe_format(v, ctx) if isinstance(v, str) else v)
-        for k, v in (b.get("params") or {}).items()
-    }
-
-
-def pick_best(slots, from_hm):
-    """优先精确命中起点（如 16:30），否则取最早开始的。"""
-    exact = [s for s in slots if _parse_hm(s["start"]) == from_hm]
-    pool = exact or slots
-    return sorted(pool, key=lambda s: (_parse_date(s["date"]), _parse_hm(s["start"]) or ""))[0]
-
-
-def _follow_redirects(client, url, headers, max_hops: int = 3):
-    """中间步骤若返回 302，按 Location 跟进（最多 max_hops 次）。"""
-    for _ in range(max_hops):
-        r = client.s.get(url, headers=headers, allow_redirects=False, timeout=30)
-        if r.status_code not in (301, 302):
-            return r
-        loc = r.headers.get("Location", "")
-        if not loc:
-            return r
-        if "login" in loc.lower() or "loginhome" in loc.lower():
-            raise SessionExpired(f"跟进确认页时被踢到登录页（302 → {loc}）")
-        url = loc if loc.startswith("http") else BASE + loc
-    return r
-
-
-def run_booking_steps(client, b: dict, steps: list, ctx: dict, dry_book: bool = False,
-                      success_keywords: list | None = None):
-    """按顺序执行预订步骤。返回最后一步的 BookingResult。
-
-    中间步骤的响应可配置 extract 正则，把捕获值写回 ctx 供后续步骤使用。
-    """
-    from poss_client import BookingResult
-
-    last_req = None
-    for idx, step in enumerate(steps):
-        step_no = idx + 1
-        curl_text = load_step_curl(step, b, idx)
-        if not curl_text:
-            raise BookingNotCalibrated(f"步骤 {step_no} 缺少 cURL 模板")
-        req = client.build_booking_request(curl_text, ctx)
-        leftover = find_unresolved(req["url"])
-        if "json" not in (req["content_type"] or "").lower():
-            leftover += find_unresolved(req["body"])
-        if leftover:
-            raise BookingNotCalibrated(
-                f"步骤 {step_no} 模板里有取不到值的占位符: {', '.join(leftover)}"
-            )
-
-        if dry_book:
-            print(f"[dry-book] --- 步骤 {step_no}/{len(steps)} ---")
-            print(f"[dry-book] {req['method']} {mask_secrets(req['url'], ctx)}")
-            for k, v in req["headers"].items():
-                print(f"[dry-book]   {k}: {mask_secrets(v, ctx)}")
-            if req["body"]:
-                print(f"[dry-book] body: {mask_secrets(req['body'], ctx)}")
-            if leftover:
-                print(f"[dry-book] ❌ 占位符缺值: {leftover}")
-            else:
-                print(f"[dry-book] ✓ 占位符齐全")
-            last_req = req
-            continue
-
-        kwargs = {"headers": req["headers"], "allow_redirects": False, "timeout": 30}
-        if req["method"].upper() == "GET":
-            r = client.s.get(req["url"], **kwargs)
-        else:
-            r = client.s.post(req["url"], data=req["body"], **kwargs)
-
-        if r.status_code in (301, 302):
-            loc = r.headers.get("Location", "")
-            if "login" in loc.lower() or "loginhome" in loc.lower():
-                raise SessionExpired(f"步骤 {step_no} 被重定向到登录页（302 → {loc}）")
-            if idx == len(steps) - 1:
-                # 提交后的 302 = PRG 跳转：服务端的判定结果挂在目标页上，
-                # 跟着走一步就能拿到答案，不用再麻烦人去 POSS 里瞅一眼。
-                return resolve_final_result(client, b, r, req["url"], success_keywords)
-            # 中间步骤：跟进到确认页
-            url = loc if loc.startswith("http") else BASE + loc
-            r = _follow_redirects(client, url, req["headers"])
-
-        # 从当前响应提取字段给下一步用
-        for key, pattern in step.get("extract", {}).items():
-            m = re.search(pattern, r.text or "")
-            if m:
-                ctx[key] = m.group(1)
-                print(f"[booking] 步骤 {step_no} 提取 {key} = {m.group(1)[:20]}...")
-
-        if idx == len(steps) - 1:
-            return resolve_final_result(client, b, r, req["url"], success_keywords)
-
-    if dry_book:
-        # 演练只打印，不返回真实结果
-        return BookingResult(False, "dry-book", "")
-    # 正常流程不会到达这里（最后一步已返回）
-    return BookingResult(False, "步骤执行异常", "")
-
-
-def _dump_result_page(label: str, text: str) -> str:
-    """结果页原文存盘。关键字判定一旦判错，全靠这个文件回溯真相。"""
+def save_state(state):
+    directory = os.path.dirname(os.path.abspath(STATE_FILE))
+    temporary = None
     try:
-        os.makedirs(DUMP_DIR, exist_ok=True)
-        safe = re.sub(r"[^\w-]", "_", label)[:60]
-        p = os.path.join(DUMP_DIR, f"booking_result_{safe}.html")
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(text or "")
-        return p
-    except OSError:
-        return ""
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=directory,
+                                         prefix=".poss-state-", delete=False) as handle:
+            temporary = handle.name
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, STATE_FILE)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
-def resolve_final_result(client, b, resp, referer, success_keywords=None):
-    """读「预订结果页」，判定抢到了没有 → BookingResult。
+def report_attempt(report):
+    """Write only structured, non-secret diagnostics to disk and Actions."""
+    with REPORT_LOCK:
+        os.makedirs(os.path.dirname(os.path.abspath(LOG_FILE)), exist_ok=True)
+        with open(LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(report, ensure_ascii=False) + "\n")
+        brief = (f"{report['target']} | {report['status']} | {report['stage']} | "
+                 f"{report['reason_code']} | {report['message']} | "
+                 f"放位后 {report['release_lag_ms']} ms | 尝试 {report['attempts']} 次")
+        print(f"[booking] {brief}", flush=True)
+        for event in report["events"]:
+            print(f"  [{event['stage']}] "
+                  + " ".join(f"{key}={value}" for key, value in event.items()
+                             if key not in ("stage", "at")), flush=True)
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write(f"- {brief.replace('|', ' / ')}\n")
 
-    POSS 提交后是 PRG 模式：make_book_submit.do 处理完 → 302 到
-    make_book_result.do（结果由会话里取出来渲染）。所以：
 
-      · 提交步返回 302 → 跟着跳到结果页去判（等于浏览器自动跳转）；
-      · 提交步直接返回 200 → 就判这一页；
-      · 都判不出来、且没发生跳转、正文又短得像空壳（<200 字节）→
-        再直开一次结果页兜底（有些流程结果只挂在会话里）。
-
-    判定结果：ok / confirmed_failure（服务端明说没订上，可放心试下一个）/
-    inconclusive（看不出来，停手报警）。三种都会把原文存进 dumps/。
-    """
-    from poss_client import BookingResult
-
-    kws_ok = success_keywords or b.get("success_keywords") or None
-    kws_fail = b.get("failure_keywords") or None
-    result_url = b.get("result_url") or MAKE_BOOK_RESULT
-
-    pages = []  # [(来源说明, HTTP 状态, 正文)]
-    loc = (resp.headers.get("Location") or "") if resp.status_code in (301, 302) else ""
-    followed = bool(loc)
-    if followed:
-        target = loc if loc.startswith("http") else BASE + loc
-        r = client.open_result_page(target, referer=referer)
-        pages.append((f"跟随 302 → {target}", r.status_code, r.text or ""))
-    else:
-        pages.append((f"提交响应 HTTP {resp.status_code}", resp.status_code, resp.text or ""))
-
-    def _check(items):
-        for where_, status_, body in items:
-            v, m = classify_result(body, kws_ok, kws_fail)
-            if v != "unknown":
-                return v, m, where_, status_, body
-        return None
-
-    hit = _check(pages)
-    if hit is None and not followed and len(pages[0][2]) < 200:
-        # 没跳转、正文又短得像个空壳：结果很可能只挂在会话里，直接问结果页要答案
+def notify(title, body):
+    """Use configured channels; never print tokens or passwords in failures."""
+    env = {**load_env(os.path.join(ROOT, ".env")), **os.environ}
+    token = env.get("PUSHPLUS_TOKEN", "")
+    key = env.get("SERVERCHAN_KEY", "")
+    delivered = False
+    if token:
         try:
-            r = client.open_result_page(result_url, referer=referer)
-            pages.append((f"直开结果页 {result_url}", r.status_code, r.text or ""))
-            hit = _check(pages[1:])
-        except SessionExpired:
-            raise
+            response = requests.post(
+                "https://www.pushplus.plus/send",
+                json={"token": token, "title": title, "content": body, "template": "txt"},
+                timeout=15,
+            )
+            response.raise_for_status()
+            delivered |= response.json().get("code") == 200
+        except (requests.RequestException, ValueError) as exc:
+            print(f"[notify] PushPlus 失败: {type(exc).__name__}")
+    if key:
+        try:
+            response = requests.post(f"https://sctapi.ftqq.com/{key}.send",
+                                     data={"title": title, "desp": body}, timeout=15)
+            response.raise_for_status()
+            delivered |= response.json().get("code") == 0
+        except (requests.RequestException, ValueError) as exc:
+            print(f"[notify] Server酱 失败: {type(exc).__name__}")
+    if all(env.get(name) for name in ("SMTP_HOST", "SMTP_USER", "SMTP_PASS", "MAIL_TO")):
+        try:
+            msg = MIMEText(body, "plain", "utf-8")
+            msg["Subject"] = Header(title, "utf-8")
+            msg["From"] = env["SMTP_USER"]
+            msg["To"] = env["MAIL_TO"]
+            with smtplib.SMTP_SSL(env["SMTP_HOST"], int(env.get("SMTP_PORT") or 465),
+                                  timeout=20) as server:
+                server.login(env["SMTP_USER"], env["SMTP_PASS"])
+                server.sendmail(env["SMTP_USER"], [env["MAIL_TO"]], msg.as_string())
+            delivered = True
+        except (OSError, smtplib.SMTPException, ValueError) as exc:
+            print(f"[notify] 邮件失败: {type(exc).__name__}")
+    return delivered
 
-    if hit:
-        verdict, matched, where, status, text = hit
-    else:
-        verdict, matched = "unknown", []
-        where, status, text = pages[0]
 
-    dump = _dump_result_page(where, text)
-    if dump:
-        print(f"[booking] 结果页已存盘: {dump}（关键字判错时照这个文件改配置）")
-    snippet = html_to_text(text)[:300]
-
-    if verdict == "ok":
-        return BookingResult(True, f"预订成功（{where}｜命中 {matched}）", text[:4000])
-    if verdict == "fail":
-        return BookingResult(
-            False,
-            f"服务端明确拒绝：命中 {matched}（{where}）｜页面：{snippet}",
-            text[:4000], confirmed_failure=True,
-        )
-    return BookingResult(
-        False, f"结果不明（{where}｜HTTP {status}）｜页面：{snippet}",
-        text[:4000], inconclusive=True,
+def target_selection(target):
+    return Selection(
+        dataset_id=str(target.get("datasetId") or target.get("dataSetId") or "18"),
+        activity_id=str(target.get("activityId") or target.get("actvId") or ""),
+        center_id=str(target.get("centerId") or target.get("ctrId") or ""),
+        facility_id=str(target.get("facilityId") or ""),
+        date=str(target["date"]),
+        start=str(target.get("from") or target.get("start")),
+        end=str(target.get("to") or target.get("end")),
+        activity_name=str(target.get("activity") or target.get("activityName") or ""),
+        center_name=str(target.get("center") or target.get("centerName") or target.get("name") or ""),
+        facility_name=str(target.get("facility") or target.get("facilityName") or ""),
+        book_type=str(target.get("bookType") or "INDV"),
     )
 
 
-def _job_key(job) -> str:
-    """目标唯一键：馆 + 日期 + 起始时刻。用于跨运行去重（防重复扣费）。"""
-    return f"{job['ctrId']}|{job['date']}|{job['from']}"
+def _target_key(target):
+    item = target_selection(target)
+    return "|".join((item.dataset_id, item.activity_id, item.center_id,
+                     item.facility_id, item.date, item.start, item.end, item.book_type))
 
 
-def _job_desc(job) -> str:
-    d = _parse_date(job["date"])
-    wk = "一二三四五六日"[d.weekday()] if d else "?"
-    act = f" 活动 {job['activity']}" if job.get("activity") else ""
-    return f"{job['gym']}(ctrId={job['ctrId']}) {job['date']}（周{wk}） {job['from']}-{job['to']}{act}"
+def _court_key(target, facility_id):
+    return f"{_target_key({**target, 'facilityId': ''})}|court:{facility_id}"
 
 
-def attempt_booking(client, cfg, state, now, dry_book=False) -> bool:
-    """爆发式抢位。返回 True = 有结果（抢到 / 已提交待确认），False = 完全没抢到。
+def _account_activity(account_id, selection):
+    return f"{account_id}|{selection.date}|{selection.dataset_id}|{selection.activity_id}"
 
-    支持一次抢多个目标：抢到一个继续抢下一个（抢所有 fitness 就是这个意思）。
-    唯一会立刻收手的理由是「结果不明」——那时候再往下抢就是在赌押金了。
-    """
-    b = cfg["booking"]
-    explicit = bool(b.get("targets"))
-    today_key = now.date().isoformat()
-    booked = state.setdefault("booked", {})
-    done = state.setdefault("booked_targets", {})
 
-    if not explicit and today_key in booked:
-        # 派生模式沿用旧的「同一触发日只抢一次」防重复扣费
-        prev = booked[today_key]
-        note = prev.get("status") or f"{prev.get('gym', '?')} {prev.get('start', '?')}"
-        print(f"[booking] {today_key} 已处理过（{note}），跳过（防重复扣费）")
-        return True
+def _eligible_accounts(target, accounts):
+    assigned = str(target.get("accountId") if target.get("accountId") is not None else "")
+    if assigned and assigned not in accounts:
+        raise PossError(f"目标指定的账号 {assigned} 尚未配置")
+    return [assigned] if assigned else accounts
 
-    steps = load_booking_steps(b)
-    for i, step in enumerate(steps):
-        if not load_step_curl(step, b, i):
-            raise BookingNotCalibrated(
-                f"预订模板不完整：步骤 {i + 1} 缺少 cURL。"
-                "请把 POSS 手动预订那条「提交」请求的 cURL 用 calibrate.py 导入。"
-            )
 
-    jobs = plan_jobs(cfg, now)
-    if not jobs:
-        print("[booking] 当前没有到放位时刻的目标，本轮不抢")
-        return False
+def _readiness_key(account_id, target):
+    key = _target_key(target)
+    return key if account_id == "1" else f"account:{account_id}|{key}"
 
-    skipped = [j for j in jobs if _job_key(j) in done]
-    jobs = [j for j in jobs if _job_key(j) not in done]
-    if skipped:
-        print(f"[booking] 已有 {len(skipped)} 个目标处理过（成功或结果不明），本次跳过")
-    if not jobs:
-        print("[booking] 目标本日全部处理过，跳过（防重复扣费）")
-        return True
 
-    mode_desc = f"{len(steps)} 步 cURL 模板" if len(steps) > 1 else "cURL 模板"
-    for j in jobs:
-        print(f"[booking] 目标：{_job_desc(j)}，提交方式 {mode_desc}")
+def _claimed_court(claims, selection, facility_id):
+    return any(
+        row.get("center_id") == selection.center_id
+        and row.get("facility_id") == facility_id
+        and row.get("date") == selection.date
+        and row.get("start", "") < selection.end
+        and selection.start < row.get("end", "")
+        for row in claims.values()
+    )
 
-    deadline = time.time() + (0 if dry_book else b["burst_seconds"])
-    attempts = 0
-    session_failures = 0
-    max_session_failures = 3
-    # 已经被服务端明确拒掉的「馆+时段」：同一轮里别再重复提同一条，
-    # 否则 120 秒里对着同一个满位时段提交几十次，除了给风控送素材毫无用处。
-    tried: set = set()
-    handled: set = set()
-    job_keys = {_job_key(j) for j in jobs}
-    booked_any = False
 
+def release_at(target, config):
+    rule = {
+        "leadDays": int(config.get("booking", {}).get("lead_days", 7)),
+        "openTime": config.get("booking", {}).get("trigger_time", "08:30"),
+    }
+    return booking_release_at(target["date"], rule)
+
+
+def wait_for_nearby_release(client, targets, config, now, force=False, wait_long=False,
+                            on_ready=None, on_status=None):
+    """Login before a nearby release and keep the session warm while waiting."""
+    if force:
+        return now
+    future = [release_at(target, config) for target in targets
+              if release_at(target, config) > now]
+    if not future:
+        return now
+    release = min(future)
+    wait_seconds = (release - now).total_seconds()
+    if wait_seconds > 10 * 60 and not wait_long:
+        return now
+    logged_in = False
+    next_check = time.monotonic()
+    failed_check = ""
+    final_refresh_due = False
+    final_refresh_done = False
+    connection_refresh_done = False
+    prepared = False
+    print(f"等待放位时间 {release:%Y-%m-%d %H:%M}，约 {wait_seconds:.0f} 秒")
     while True:
-        attempts += 1
-        for job in jobs:
-            key = _job_key(job)
-            if key in handled:
-                continue
-            date_str = (_parse_date(job["date"]) or now).strftime(b["search_date_format"])
+        remaining = (release - datetime.now(TZ)).total_seconds()
+        if remaining <= 0:
+            return datetime.now(TZ)
+        if remaining <= 3 * 60 and not final_refresh_due:
+            next_check = min(next_check, time.monotonic())
+            final_refresh_due = True
+        if remaining <= 60 and not connection_refresh_done:
+            next_check = min(next_check, time.monotonic())
+            connection_refresh_done = True
+        if time.monotonic() >= next_check:
+            check = "heartbeat" if logged_in else "login"
             try:
-                raw = client.timetable(job["ctrId"], date_str, params=job["params"])
-            except SessionExpired:
-                session_failures += 1
-                if session_failures > max_session_failures:
-                    raise SessionExpired(
-                        f"连续 {session_failures} 次会话失效，已放弃本轮抢位（继续重登会触发风控）"
-                    )
-                print(f"[booking] 查询时会话失效 → 重新登录（第 {session_failures} 次）")
-                client.login()
-                client.save_session(SESSION_FILE)
-                continue
-            cands = [s for s in parse_timetable(raw)
-                     if slot_matches_job(s, job) and (s["left"] or 0) > 0
-                     and (job["ctrId"], str(s["date"]), str(s["start"])) not in tried]
-            if not cands:
-                continue
-            best = pick_best(cands, job["from"])
-            ctx = build_booking_context(client, b, best, job["gym"], job["ctrId"],
-                                        _parse_date(job["date"]) or now)
+                if logged_in:
+                    try:
+                        client.heartbeat(force=True)
+                        print("[warmup] POSS 会话保活成功", flush=True)
+                    except SessionExpired:
+                        logged_in = False
+                        check = "login"
+                        client.login()
+                        print("[warmup] POSS 会话已过期，重新登录成功", flush=True)
+                else:
+                    client.login()
+                    print("[warmup] POSS 登录成功", flush=True)
+                logged_in = True
+                if on_ready and remaining <= 10 * 60 and (
+                    not prepared or (final_refresh_due and not final_refresh_done)
+                ):
+                    check = "prepare"
+                    on_ready(client)
+                    prepared = True
+                next_check = time.monotonic() + 4 * 60
+                if final_refresh_due and not final_refresh_done:
+                    print("[warmup] 放位前 3 分钟已确认 POSS 登录态", flush=True)
+                    final_refresh_done = True
+                if failed_check:
+                    report_attempt({
+                        "target": "POSS 预热", "status": "recovered",
+                        "stage": check, "reason_code": "session_ready",
+                        "message": "预热连接已恢复", "release_lag_ms": round(-remaining * 1000),
+                        "attempts": 0, "events": [],
+                    })
+                    failed_check = ""
+                if on_status:
+                    on_status("ready", check, "session_ready")
+            except (PossError, requests.RequestException) as exc:
+                if isinstance(exc, SessionExpired):
+                    logged_in = False
+                reason = (transport_reason(exc) if isinstance(exc, requests.RequestException)
+                          else type(exc).__name__)
+                failed_check = check
+                report_attempt({
+                    "target": "POSS 预热", "status": "retrying", "stage": check,
+                    "reason_code": reason, "message": f"{type(exc).__name__}: 预热请求失败",
+                    "release_lag_ms": round(-remaining * 1000), "attempts": 0,
+                    "events": [{"stage": check, "error": type(exc).__name__,
+                                "retry_in_seconds": 30}],
+                })
+                print(f"[warmup] {'预备球场' if check == 'prepare' else '保活' if logged_in else '登录'}失败："
+                      f"{reason}；30 秒后重试，不退出抢位任务", flush=True)
+                if on_status:
+                    on_status("retrying", check, reason)
+                next_check = time.monotonic() + 30
+        time.sleep(min(1, remaining))
 
-            if dry_book:
-                print(f"[dry-book] 候选: {job['gym']} {best['date']} {best['start']}-{best['end']} "
-                      f"(剩 {best['left']})")
-                run_booking_steps(client, b, steps, ctx, dry_book=True)
-                return False
 
+def run_parallel_group(targets, config, state, args):
+    """Race accounts independently, stopping after one booking per account/activity/day."""
+    release = release_at(targets[0], config)
+    group_key = f"{targets[0]['date']}|{release.isoformat()}"
+    campaigns = state.setdefault("campaigns", {})
+    processed = state.setdefault("processed", {})
+    accounts = account_ids_from_env(os.path.join(ROOT, ".env"))
+    if not accounts:
+        raise PossError("没有配置完整的 POSS 账号")
+    account_activities = state.setdefault("account_activities", {})
+    claims = state.setdefault("court_claims", {})
+    for court_key, row in [*campaigns.items(), *processed.items()]:
+        if (row.get("status") in ("booked", "final_sent")
+                or row.get("status") == "unknown"
+                and row.get("stage") in ("final_submit", "verify_record")):
+            parts = (row.get("target") or court_key).split("|")
+            if len(parts) > 4:
+                activity_key = f"{row.get('account_id', '1')}|{parts[4]}|{parts[0]}|{parts[1]}"
+                record = {
+                    "status": "booked" if row["status"] == "booked" else "unknown",
+                    "court_key": court_key,
+                }
+                if row["status"] == "booked":
+                    account_activities[activity_key] = record
+                else:
+                    account_activities.setdefault(activity_key, record)
+                if len(parts) == 9 and parts[8].startswith("court:"):
+                    facility_id = parts[8].removeprefix("court:")
+                    claim_key = f"{parts[4]}|{parts[2]}|{facility_id}|{parts[5]}|{parts[6]}"
+                    claims.setdefault(claim_key, {
+                        "date": parts[4], "center_id": parts[2],
+                        "facility_id": facility_id, "start": parts[5], "end": parts[6],
+                        "account_id": row.get("account_id", "1"),
+                    })
+    pending = [target for target in targets
+               if any(account_activities.get(_account_activity(account, target_selection(target)), {}).get(
+                   "status") not in ("booked", "unknown")
+                   for account in _eligible_accounts(target, accounts))]
+    if not pending:
+        print(f"{targets[0]['date']} 的目标已处理，跳过")
+        return
+    now = datetime.now(TZ)
+    if not args.force and now > release + timedelta(
+        minutes=max(0, int(config["booking"].get("grace_minutes", 30)))
+    ):
+        for raw in pending:
+            selection = target_selection(raw)
+            report_attempt({
+                "target": f"{selection.activity_name} {selection.center_name} "
+                          f"{selection.date} {selection.start}-{selection.end}",
+                "status": "failed", "stage": "schedule",
+                "reason_code": "missed_release_window",
+                "message": "超过放位宽限时间，未发送预订请求",
+                "release_lag_ms": round((now - release).total_seconds() * 1000),
+                "attempts": 0, "events": [],
+            })
+            if not args.dry_run:
+                processed[_target_key(raw)] = {
+                    "at": int(time.time()), "status": "failed",
+                    "reason_code": "missed_release_window", "stage": "schedule",
+                }
+        if not args.dry_run:
+            save_state(state)
+        return
+    if not args.force and not args.wait and (release - now).total_seconds() > 10 * 60:
+        print(f"等待下次放位：{release:%Y-%m-%d %H:%M}")
+        return
+
+    stops = {_account_activity(account, target_selection(target)): threading.Event()
+             for target in pending for account in _eligible_accounts(target, accounts)}
+    commit_locks = {}
+    state_lock = threading.Lock()
+    run_id = f"{release.isoformat()}:{os.getpid()}:{time.time_ns()}"
+    state["active_run"] = {"id": run_id, "release_at": release.isoformat(),
+                           "log_offset": os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0,
+                           "targets": [_target_key(target) for target in pending],
+                           "accounts": accounts}
+    state["readiness"] = {}
+    if not args.dry_run:
+        save_state(state)
+
+    def emit(report, key, account_id):
+        report_attempt({
+            **report, "run_id": run_id, "target_key": key, "account_id": account_id,
+            "at": report.get("at") or datetime.now(TZ).isoformat(timespec="milliseconds"),
+        })
+
+    active_courts = set()
+    explicit_courts = {}
+    for target in pending:
+        selection = target_selection(target)
+        if selection.facility_id:
+            wildcard = {**target, "facilityId": ""}
+            explicit_courts.setdefault(_target_key(wildcard), set()).add(selection.facility_id)
+    burst = max(0, int(config["booking"].get("burst_seconds", 120)))
+    retry_interval = max(1, int(config["booking"].get("retry_interval", 3)))
+    preferred = {}
+    load = {}
+    for target in pending:
+        if target.get("accountId"):
+            selection = target_selection(target)
+            group = (selection.date, selection.dataset_id, selection.activity_id)
+            load[(group, target["accountId"])] = load.get((group, target["accountId"]), 0) + 1
+    for target in pending:
+        if target.get("accountId"):
+            continue
+        selection = target_selection(target)
+        group = (selection.date, selection.dataset_id, selection.activity_id)
+        candidates = [account for account in accounts
+                      if account_activities.get(_account_activity(
+                          account, selection), {}).get("status")
+                      not in ("booked", "unknown")]
+        if candidates:
+            owner = min(candidates, key=lambda account: (load.get((group, account), 0),
+                                                          accounts.index(account)))
+            preferred[_target_key(target)] = owner
+            load[(group, owner)] = load.get((group, owner), 0) + 1
+
+    def worker(raw, account_id, lane=0, lanes=1):
+        selection = target_selection(raw)
+        key = _target_key(raw)
+        base_key = _target_key({**raw, "facilityId": ""})
+        activity_key = _account_activity(account_id, selection)
+        stop = stops[activity_key]
+        cached = state.setdefault("prepared_courts", {}).get(key, [])
+        cached_ids = cached.get("facility_ids", []) if isinstance(cached, dict) else []
+        if not isinstance(cached_ids, list):
+            cached_ids = []
+        cached_ids = list(dict.fromkeys(str(item) for item in cached_ids if item))
+        excluded_explicit = explicit_courts.get(base_key, set()) if not selection.facility_id else set()
+        candidates = _eligible_accounts(raw, accounts)
+
+        def distribute(ids):
+            ids = [str(item) for item in ids if str(item) and str(item) not in excluded_explicit]
+            if not ids:
+                return []
+            offset = candidates.index(account_id) % len(ids)
+            ordered = ids[offset:] + ids[:offset]
+            if len(ids) <= len(candidates):
+                return ordered if lane == 0 else []
+            if len(ids) >= len(candidates) * lanes:
+                return ids[(candidates.index(account_id) * lanes + lane)::len(candidates) * lanes]
+            return ordered[lane::lanes]
+
+        prepared_ids = distribute(cached_ids)
+        reports = []
+        entry = {
+            "target": f"{selection.activity_name} {selection.center_name} "
+                      f"{selection.date} {selection.start}-{selection.end}"
+                      + (f" Area lane {lane + 1}" if lanes > 1 else ""),
+            "target_key": key,
+            "account_id": account_id,
+            "attempts": 0, "events": [], "attempt_failures": [],
+            "prepared_source": "cache" if prepared_ids else "timetable",
+        }
+
+        def next_court():
+            entry["events"] = []
+            entry["attempt_failures"] = []
+            for field in ("first_step_started_at", "first_step_response_at",
+                          "first_step_error_at", "first_step_timeout",
+                          "final_submit_started_at"):
+                entry.pop(field, None)
+
+        def readiness(status, stage, reason="", court_ids=None):
+            with state_lock:
+                record = state["readiness"].setdefault(
+                    _readiness_key(account_id, raw), {"run_id": run_id, "lanes": {}})
+                previous = record["lanes"].get(str(lane), {})
+                courts = len(court_ids) if court_ids is not None else previous.get("courts", 0)
+                next_value = {
+                    "status": status, "stage": stage, "reason_code": reason,
+                    "courts": courts,
+                    "at": datetime.now(TZ).isoformat(timespec="milliseconds"),
+                }
+                if any(previous.get(field) != next_value[field] for field in (
+                    "status", "stage", "reason_code", "courts"
+                )):
+                    record["lanes"][str(lane)] = next_value
+                    if not args.dry_run:
+                        save_state(state)
+
+        def valid_courts(client, ids):
+            if not hasattr(client, "tree"):
+                return ids
+            return [court_id for court_id in ids if tree_context(
+                client.tree, selection.dataset_id, selection.activity_id,
+                selection.center_id, court_id,
+            )["facility"] is not None]
+
+        def prepare(client):
+            table = client.timetable(
+                selection.dataset_id, selection.activity_id, selection.center_id,
+                selection.facility_id, selection.book_type,
+            )
+            slot = find_slot(table, selection.date, selection.start, selection.end)
+            if slot is None:
+                raise PossError("预备时目标时段不在官方时间表中")
+            ids = list(dict.fromkeys(str(item) for item in slot["facilityIds"]
+                                     if item and str(item) not in excluded_explicit))
+            if selection.facility_id:
+                ids = [selection.facility_id] if selection.facility_id in ids else []
+            ids = valid_courts(client, ids)
+            if not ids:
+                raise PossError("目标时段没有可预备的球场编号")
+            with state_lock:
+                state["prepared_courts"][key] = {
+                    "facility_ids": ids, "at": int(time.time()),
+                }
+                save_state(state)
+            prepared_ids[:] = distribute(ids)
+            entry["prepared_source"] = "live"
+            readiness("ready", "prepare", "courts_validated", prepared_ids)
+            print(f"[warmup] {selection.center_name} {selection.start}-{selection.end} "
+                  f"已预备 {len(ids)} 块球场（通道 {lane + 1}/{lanes}）", flush=True)
+
+        def warmup_status(status, stage, reason):
+            if status == "ready":
+                with state_lock:
+                    current = dict(state["readiness"].get(
+                        _readiness_key(account_id, raw), {}).get("lanes", {}).get(str(lane), {}))
+                if current.get("status") == "ready":
+                    readiness("ready", stage, reason)
+                elif current.get("status") == "cached" or current.get("courts"):
+                    readiness("cached", stage, reason)
+                else:
+                    readiness("waiting", stage, reason)
+                return
             try:
-                res = run_booking_steps(client, b, steps, ctx, success_keywords=b["success_keywords"])
-            except SessionExpired as e:
-                session_failures += 1
-                if session_failures > max_session_failures:
-                    raise SessionExpired(
-                        f"提交预订连续 {session_failures} 次会话失效，已放弃本轮"
-                        f"（继续重登会触发风控）"
-                    ) from e
-                print(f"[booking] 提交时会话失效: {e} → 重新登录（第 {session_failures} 次）")
-                client.login()
-                continue
-            session_failures = 0
-            print(f"[booking] 第 {attempts} 轮 {job['gym']} {best['start']}: {res.message}")
+                valid = valid_courts(client, prepared_ids)
+            except PossError:
+                valid = []
+            prepared_ids[:] = valid
+            readiness("cached" if valid else "retrying", stage, reason, valid)
 
-            if res.ok:
-                done[key] = {
-                    "gym": job["gym"], "ctrId": job["ctrId"], "date": best["date"],
-                    "start": best["start"], "end": best["end"],
-                    "at": int(time.time()), "status": "booked",
+        readiness("checking", "login")
+        try:
+            client = (client_from_env(os.path.join(ROOT, ".env"))
+                      if account_id == "1" else
+                      client_from_env(os.path.join(ROOT, ".env"), account_id=account_id))
+            started = wait_for_nearby_release(
+                client, [raw], config, datetime.now(TZ), args.force, args.wait,
+                on_ready=prepare, on_status=warmup_status,
+            )
+        except (PossError, requests.RequestException) as exc:
+            entry.update(status="failed", stage="warmup_login",
+                         reason_code=transport_reason(exc) if isinstance(
+                             exc, requests.RequestException) else type(exc).__name__,
+                         message=f"{type(exc).__name__}: 登录或保活失败")
+            entry["attempt_failures"].append({
+                "stage": "warmup_login", "reason_code": entry["reason_code"],
+            })
+            entry["release_lag_ms"] = round((datetime.now(TZ) - release).total_seconds() * 1000)
+            readiness("failed", "warmup_login", entry["reason_code"])
+            return [entry]
+        if not args.force and started < release:
+            return []
+        if (not args.force and not args.dry_run and not raw.get("accountId")
+                and account_id != preferred.get(key)):
+            if stop.wait(0.35):
+                return []
+        if lanes > 1 and lane > 0 and not prepared_ids:
+            entry.update(status="skipped", stage="prepared",
+                         reason_code="no_second_court",
+                         message="本时段没有第二块已预备的球场",
+                         release_lag_ms=round((datetime.now(TZ) - release).total_seconds() * 1000))
+            return [entry]
+        deadline = time.monotonic() + (
+            0 if args.dry_run else burst if args.force else max(
+                0, (release + timedelta(seconds=burst) - started).total_seconds()
+            )
+        )
+        while not stop.is_set() and (entry["attempts"] == 0 or time.monotonic() < deadline):
+            with state_lock:
+                done_ids = {
+                    court_id for court_id in cached_ids
+                    if state["campaigns"].get(_court_key(raw, court_id), {}).get("status")
+                    in ("final_sent", "booked", "unknown")
+                    or state["processed"].get(_court_key(raw, court_id), {}).get("status")
+                    in ("booked", "unknown")
                 }
-                booked.setdefault(today_key, {
-                    "gym": job["gym"], "date": best["date"], "start": best["start"],
-                    "at": int(time.time()), "status": "booked",
-                })
-                save_state(state)
-                handled.add(key)
-                booked_any = True
-                remain = len(job_keys - handled)
-                notify_all(
-                    "🎉 POSS 抢到了！",
-                    f"{job['gym']} {best['date']} {best['start']}–{best['end']}\n"
-                    + (f"还有 {remain} 个目标在抢。\n" if remain else "")
-                    + "请登录 POSS 确认预订状态与押金扣除。\n"
-                    f"（{now.strftime('%m-%d %H:%M')} 自动抢位）",
+                done_ids.update(
+                    court_key.removeprefix(f"{base_key}|court:") for court_key, record
+                    in campaigns.items() if court_key.startswith(f"{base_key}|court:")
+                    and record.get("status") in ("final_sent", "booked", "unknown")
                 )
-                continue
-
-            if res.inconclusive:
-                done[key] = {
-                    "gym": job["gym"], "ctrId": job["ctrId"], "date": best["date"],
-                    "start": best["start"], "at": int(time.time()), "status": "inconclusive",
+                done_ids.update(excluded_explicit)
+                if campaigns.get(key, {}).get("status") in ("final_sent", "booked", "unknown"):
+                    done_ids.update(cached_ids)
+                done_ids.update(
+                    court_id for court_id in cached_ids
+                    if _claimed_court(claims, selection, court_id)
+                )
+                excluded_ids = done_ids | {
+                    court_key.removeprefix(f"{base_key}|court:")
+                    for court_key in active_courts if court_key.startswith(f"{base_key}|court:")
                 }
-                save_state(state)
-                notify_all(
-                    "❓ POSS 抢位结果不明，请立刻确认",
-                    f"{job['gym']} {best['date']} {best['start']}–{best['end']}\n"
-                    f"服务端返回：{res.message}\n"
-                    f"脚本已停止重试（避免重复扣费）。请马上去 POSS 看一眼订单状态。\n"
-                    f"（结果页原文已存 dumps/，可据此校准 success/failure 关键字）",
+            prepared_ids[:] = [court_id for court_id in prepared_ids
+                               if court_id not in excluded_ids]
+            if lane > 0 and not prepared_ids:
+                break
+            entry["attempts"] += 1
+            lag_ms = round((datetime.now(TZ) - release).total_seconds() * 1000)
+            entry.setdefault("first_attempt_lag_ms", lag_ms)
+            entry["release_lag_ms"] = lag_ms
+            claimed = False
+            prepared_id = prepared_ids.pop(0) if prepared_ids else ""
+            current_id = prepared_id or selection.facility_id
+            current_key = _court_key(raw, current_id) if current_id else key
+            active_key = ""
+            claim_key = ""
+            gate = None
+            if not prepared_id:
+                entry["prepared_source"] = "timetable"
+
+            def select_court(facility_id):
+                nonlocal current_id, current_key, active_key, claim_key
+                current_id = str(facility_id)
+                current_key = _court_key(raw, current_id) if current_id else key
+                with state_lock:
+                    if (current_id in excluded_explicit
+                            or current_key in active_courts
+                            or _claimed_court(claims, selection, current_id)
+                            or campaigns.get(current_key, {}).get("status")
+                            in ("final_sent", "booked", "unknown")
+                            or processed.get(current_key, {}).get("status")
+                            in ("booked", "unknown")):
+                        raise BookingAttemptError(
+                            "该球场已有请求或预约，跳过重复请求",
+                            "prepared", "court_already_attempted", [])
+                    if not args.dry_run:
+                        claim_key = (f"{selection.date}|{selection.center_id}|{current_id}|"
+                                     f"{selection.start}|{selection.end}")
+                        claims[claim_key] = {
+                            "date": selection.date, "center_id": selection.center_id,
+                            "facility_id": current_id, "start": selection.start,
+                            "end": selection.end, "account_id": account_id,
+                            "at": int(time.time()), "run_id": run_id,
+                        }
+                        save_state(state)
+                    active_courts.add(current_key)
+                    active_key = current_key
+
+            def mark_first_step():
+                emit({
+                    "target": entry["target"], "status": "sending", "stage": "first_step",
+                    "reason_code": "request_start",
+                    "message": "第一步请求即将发送",
+                    "release_lag_ms": lag_ms, "attempts": entry["attempts"],
+                    "at": datetime.now(TZ).isoformat(timespec="milliseconds"),
+                    "events": [{"stage": "first_step", "court_id": current_id,
+                                "prepared_source": entry["prepared_source"]}],
+                }, key, account_id)
+
+            def mark_final_sent():
+                nonlocal claimed, gate
+                with state_lock:
+                    gate = commit_locks.setdefault(activity_key, threading.Lock())
+                gate.acquire()
+                try:
+                    with state_lock:
+                        already_done = (
+                            account_activities.get(activity_key, {}).get("status")
+                            in ("booked", "unknown")
+                            or
+                            campaigns.get(current_key, {}).get("status")
+                            in ("final_sent", "booked", "unknown")
+                            or processed.get(current_key, {}).get("status")
+                            in ("booked", "unknown")
+                        )
+                    if stop.is_set() or already_done:
+                        raise BookingAttemptError(
+                            "该球场已提交或结果待确认，停止重复提交",
+                            "final_submit", "group_stopped", [],
+                        )
+                    with state_lock:
+                        campaigns[current_key] = {
+                            "at": int(time.time()), "status": "final_sent",
+                            "target": current_key, "stage": "final_submit",
+                            "run_id": run_id, "account_id": account_id,
+                        }
+                        save_state(state)
+                    claimed = True
+                except BaseException:
+                    gate.release()
+                    raise
+
+            retry_after = None
+            status = "unknown"
+            try:
+                outcome = client.book(
+                    selection, dry_run=args.dry_run,
+                    on_final_submit=None if args.dry_run else mark_final_sent,
+                    prepared_facility_id=prepared_id,
+                    on_first_step=None if args.dry_run else mark_first_step,
+                    on_court_selected=None if args.dry_run else select_court,
+                    excluded_facility_ids=excluded_ids,
                 )
-                # 结果不明时不再继续抢其他目标 —— 那等于在赌押金
-                return True
-
-            # 服务端明确说没订上（如时段被别人抢先）：这不是未知数，可以放心试下一个
-            tried.add((job["ctrId"], str(best["date"]), str(best["start"])))
-            handled.add(key)
-            print(f"[booking] {job['gym']} {best['start']} 被拒，已排除，继续试其他候选")
-
-        if dry_book or time.time() >= deadline or handled >= job_keys:
-            break
-        time.sleep(b["retry_interval"])
-
-    if booked_any:
-        return True
-    print(f"[booking] 爆发 {attempts} 轮未抢到")
-    return False
-
-
-# ==================== 蹲守提醒 ====================
-
-
-def fetch_timetables(client, cfg):
-    """按 watch_scopes 拉时间表，返回 {scope 名: [raw, ...]}。"""
-    scopes = watch_scopes(cfg)
-    dates = cfg["request"].get("searchDates") or [""]
-
-    def _grab():
-        out = {}
-        for sc in scopes:
-            out[sc["name"]] = [
-                client.timetable(sc["ctrId"], d, params=sc["params"]) for d in dates
-            ]
-        return out
-
-    if client.load_session(SESSION_FILE):
-        try:
-            return _grab()
-        except SessionExpired:
-            pass
-    client.login()
-    client.save_session(SESSION_FILE)
-    return _grab()
-
-
-def monitor_fallback(client, cfg, now, args):
-    targets = fallback_targets(cfg)
-    data = fetch_timetables(client, cfg)
-
-    state = load_state()
-    slots = state.setdefault("slots", {})
-    open_slots = []
-    for name, raws in data.items():
-        for raw in raws:
-            for s in parse_timetable(raw):
-                if not slot_matches_target(s, targets) or (s["left"] or 0) <= 0:
-                    continue
-                open_slots.append({
-                    "key": f"{name}|{s['date']}|{s['start']}",
-                    "gym": name,
-                    **{k: s[k] for k in ("date", "start", "end", "left", "price")},
+                status, stage, reason, message = (
+                    outcome.status, outcome.stage,
+                    outcome.reason_code or outcome.status, outcome.message,
+                )
+                entry["events"].extend(outcome.events)
+            except BookingAttemptError as exc:
+                status, stage, reason, message = (
+                    "unknown" if exc.uncertain else "failed",
+                    exc.stage, exc.reason_code, str(exc),
+                )
+                retry_after = exc.retry_after
+                entry["events"].extend(exc.events)
+            except (PossError, requests.RequestException) as exc:
+                status, stage, reason, message = (
+                    "unknown", "final_submit" if claimed else "runner",
+                    "unexpected_error",
+                    str(exc) if isinstance(exc, PossError)
+                    else f"{type(exc).__name__}: POSS 网络请求失败",
+                )
+                entry["events"].extend(getattr(client, "last_attempt_events", []))
+            except Exception as exc:  # noqa: BLE001
+                status, stage, reason, message = (
+                    "unknown", "final_submit" if claimed else "runner",
+                    "internal_error", f"{type(exc).__name__}: 抢位流程异常",
+                )
+            except BaseException:
+                # The marker is already durable at this point. Stop every
+                # sibling before releasing the gate, even for an unexpected
+                # worker-level abort, so no second final POST can slip through.
+                if claimed:
+                    stop.set()
+                    gate.release()
+                    claimed = False
+                raise
+            finally:
+                if active_key:
+                    with state_lock:
+                        active_courts.discard(active_key)
+                        if status == "failed" and claim_key and not claimed:
+                            claims.pop(claim_key, None)
+                            if not args.dry_run:
+                                save_state(state)
+            entry.update(status=status, stage=stage, reason_code=reason, message=message)
+            entry["court_id"] = current_id
+            if status == "failed":
+                entry["attempt_failures"].append({
+                    "stage": stage, "reason_code": reason, "court_id": current_id,
                 })
+            for event in entry["events"]:
+                if event.get("stage") == "first_step" and event.get("state") == "sending":
+                    entry.setdefault("first_step_started_at", event.get("at"))
+                if event.get("stage") == "first_step" and "duration_ms" in event:
+                    field = ("first_step_response_at" if "http_status" in event
+                             else "first_step_error_at")
+                    entry[field] = event.get("at")
+                    entry["first_step_timeout"] = event.get("error") in ("ReadTimeout", "Timeout")
+                if event.get("stage") == "final_submit" and event.get("state") == "sending":
+                    entry.setdefault("final_submit_started_at", event.get("at"))
+            final_uncertain = status == "unknown" and (
+                claimed or stage == "final_submit"
+            )
+            if claimed:
+                try:
+                    with state_lock:
+                        if status in ("booked", "unknown"):
+                            campaigns[current_key] = {
+                                "at": int(time.time()), "status": status,
+                                "target": current_key, "reason_code": reason,
+                                "stage": stage, "run_id": run_id, "account_id": account_id,
+                            }
+                        else:
+                            campaigns.pop(current_key, None)
+                            if claim_key:
+                                claims.pop(claim_key, None)
+                        if status == "booked" or final_uncertain:
+                            account_activities[activity_key] = {
+                                "at": int(time.time()),
+                                "status": "booked" if status == "booked" else "unknown",
+                                "court_key": current_key, "run_id": run_id,
+                            }
+                            stop.set()
+                        save_state(state)
+                except OSError:
+                    stop.set()
+                    raise
+                finally:
+                    gate.release()
+            if status == "booked" or final_uncertain:
+                if status == "booked" or final_uncertain:
+                    stop.set()
+                if not args.dry_run:
+                    with state_lock:
+                        if not claimed:
+                            campaigns[current_key] = {
+                                "at": int(time.time()), "status": status,
+                                "target": current_key, "reason_code": reason,
+                                "stage": stage, "run_id": run_id, "account_id": account_id,
+                            }
+                        if status == "booked" or final_uncertain:
+                            account_activities[activity_key] = {
+                                "at": int(time.time()),
+                                "status": "booked" if status == "booked" else "unknown",
+                                "court_key": current_key, "run_id": run_id,
+                            }
+                        processed[current_key] = {
+                            "at": int(time.time()), "status": status,
+                            "reason_code": reason, "stage": stage, "run_id": run_id,
+                            "account_id": account_id,
+                        }
+                        save_state(state)
+                completed = dict(entry, events=list(entry["events"]))
+                emit(completed, key, account_id)
+                reports.append(completed)
+                next_court()
+                if stop.is_set() or (not prepared_ids and (
+                    lane > 0 or not current_id or time.monotonic() >= deadline
+                )):
+                    break
+                continue
+            if status == "unknown":
+                with state_lock:
+                    if processed.get(current_key, {}).get("status") != "booked":
+                        processed[current_key] = {
+                            "at": int(time.time()), "status": "unknown",
+                            "reason_code": reason, "stage": stage, "run_id": run_id,
+                            "account_id": account_id,
+                        }
+                        save_state(state)
+                completed = dict(entry, events=list(entry["events"]))
+                emit(completed, key, account_id)
+                reports.append(completed)
+                next_court()
+                if not current_id or selection.facility_id or (not prepared_ids and (
+                    lane > 0 or time.monotonic() >= deadline
+                )):
+                    break
+                continue
+            if args.dry_run or reason == "group_stopped":
+                break
+            retryable = (
+                (stage == "availability" and reason in ("no_vacancy", "slot_missing"))
+                or (stage == "prepared" and reason == "request_rejected" and bool(prepared_id))
+                or (stage == "prepared" and reason == "court_already_attempted")
+                or (stage in ("timetable", "prepared") and reason in (
+                    "network_error", "connect_timeout", "read_timeout", "timeout",
+                    "tls_error", "tls_connection_closed", "tls_handshake_error",
+                    "proxy_error", "rate_limited", "transient_http", "session_expired",
+                ))
+                or reason in ("slot_taken", "not_open")
+            )
+            if not retryable:
+                break
+            if stage == "prepared" and reason == "request_rejected":
+                if lanes > 1 and lane > 0 and not prepared_ids:
+                    break
+                delay = 0 if prepared_ids else 0.3
+            elif reason == "court_already_attempted":
+                if lanes > 1 and lane > 0 and not prepared_ids:
+                    break
+                delay = 0 if prepared_ids else 0.5
+            elif reason == "slot_taken":
+                if lanes > 1 and lane > 0 and not prepared_ids:
+                    break
+                delay = 0 if prepared_ids else 0.5
+            elif reason == "rate_limited" or retry_after is not None:
+                delay = max(retry_interval, retry_after or 0)
+            elif stage == "timetable":
+                delay = random.uniform(0.3, min(3.0, 0.8 * 2 ** min(entry["attempts"] - 1, 3)))
+            else:
+                delay = retry_interval
+            if time.monotonic() + delay >= deadline:
+                break
+            time.sleep(delay)
+        if not entry["attempts"]:
+            entry.update(status="skipped", stage="coordination",
+                         reason_code="other_target_finished",
+                         message="同一目标的另一球场已成功或结果待确认",
+                         release_lag_ms=round((datetime.now(TZ) - release).total_seconds() * 1000))
+        if not reports or entry.get("status") not in ("booked", "unknown"):
+            reports.append(entry)
+        return reports
 
-    now_ts = int(time.time())
-    to_alert = []
-    for s in open_slots:
-        prev = slots.get(s["key"], {})
-        if prev.get("left", 0) <= 0 or now_ts - prev.get("last_notified", 0) > RENOTIFY_AFTER:
-            to_alert.append(s)
-
-    if to_alert:
-        lines = [f"🔥 {s['gym']} {s['date']} {s['start']}–{s['end'] or '?'}：剩 {s['left']} 个名额"
-                 for s in sorted(to_alert, key=lambda x: (x["date"], x["start"]))]
-        content = "\n".join(lines) + f"\n\n抢位入口：{POSS_BOOK_URL}\n" \
-                                     f"（{now.strftime('%m-%d %H:%M')} 抓到，手速就是一切）"
-        print(f"发现空位！\n{content}")
-        if not args.no_notify:
-            notify_all("🏀 POSS 有空位啦，快抢！", content)
-    else:
-        print(f"[{now.strftime('%m-%d %H:%M')}] 目标时段暂无空位，继续蹲……")
-
-    for key in list(slots):
-        if not any(s["key"] == key for s in open_slots):
-            slots[key]["left"] = 0
-    for s in open_slots:
-        e = slots.setdefault(s["key"], {})
-        e["left"] = s["left"]
-        if any(t["key"] == s["key"] for t in to_alert):
-            e["last_notified"] = now_ts
-    save_state(state)
-
-
-# ==================== 主流程 ====================
-
-
-def build_client():
-    netid = os.environ.get("POSS_NETID", "").strip()
-    password = os.environ.get("POSS_PASSWORD", "").strip()
-    fb_user_id = os.environ.get("POSS_FB_USER_ID", "657032").strip()
-    return PossClient(netid, password, fb_user_id)
-
-
-def _report_template_gaps(client, cfg, steps: list, dumped: dict):
-    """--dump 收尾：核对预订模板需要的占位符，真实时间表数据能否填上。"""
-    b = cfg["booking"]
-    target = hk_now().date() + timedelta(days=b["lead_days"])
-    print("\n[calibrate] 预订模板占位符可用性检查")
-    for gym in cfg["gyms"]:
-        raw = dumped.get(gym["name"])
-        if raw is None:
-            continue
-        try:
-            slots = parse_timetable(raw)
-        except ParseNeedsCalibration as e:
-            print(f"  {gym['name']}: ❌ {e}")
-            continue
-        slot = slots[0]
-        ctx = build_booking_context(client, b, slot, gym["name"], gym["ctrId"], target)
-        all_leftover = []
-        try:
-            for idx, step in enumerate(steps):
-                curl_text = load_step_curl(step, b, idx)
-                if not curl_text:
-                    all_leftover.append(f"步骤{idx + 1}无模板")
+    jobs = []
+    for account_id in accounts:
+        for target in pending:
+            if account_id not in _eligible_accounts(target, accounts):
+                continue
+            if account_activities.get(_account_activity(account_id, target_selection(target)), {}).get(
+                "status") in ("booked", "unknown"):
+                continue
+            lanes = 1 if args.force or target_selection(target).facility_id else 2
+            jobs.extend((target, account_id, lane, lanes) for lane in range(lanes))
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        results = list(executor.map(lambda job: worker(*job), jobs))
+    reports = [report for result in results for report in result]
+    for report in reports:
+        if report["status"] not in ("booked", "unknown"):
+            emit(report, report["target_key"], report["account_id"])
+    if not args.dry_run and reports:
+        notified = state.setdefault("failure_notified", {})
+        target_by_key = {_target_key(target): target_selection(target) for target in pending}
+        for account_id in accounts:
+            for activity_key in {_account_activity(account_id, target_selection(target))
+                                 for target in pending
+                                 if account_id in _eligible_accounts(target, accounts)}:
+                own = [report for report in reports if report["account_id"] == account_id
+                       and _account_activity(account_id, target_by_key[report["target_key"]])
+                       == activity_key]
+                failure_key = f"{group_key}|{activity_key}"
+                if (not own or account_activities.get(activity_key, {}).get("status") == "booked"
+                        or failure_key in notified):
                     continue
-                req = client.build_booking_request(curl_text, ctx)
-                leftover = find_unresolved(req["url"])
-                if "json" not in (req["content_type"] or "").lower():
-                    leftover += find_unresolved(req["body"])
-                if leftover:
-                    all_leftover.append(f"步骤{idx + 1}: {', '.join(leftover)}")
-                # 模拟从当前响应提取（没有真实响应，所以不覆盖 ctx）
-        except Exception as e:  # noqa: BLE001
-            print(f"  {gym['name']}: ❌ 模板渲染失败: {e}")
-            continue
-        verdict = "✓ 占位符全部可填，可上线" if not all_leftover else "❌ " + "; ".join(all_leftover)
-        print(f"  {gym['name']}: 解析到 {len(slots)} 个时段 → {verdict}")
-        print(f"    数据样本字段: {sorted(slot['raw'].keys())[:14]}")
-    print("[calibrate] 若字段名与预期不符，把 dumps/ 里的 JSON 发给开发者校准解析器。")
+                reasons = "; ".join(
+                    f"{report['target']}: {report['reason_code']}" for report in own
+                )
+                activity_name = target_by_key[own[0]["target_key"]].activity_name
+                if notify(f"POSS 账号 {account_id} {activity_name} 抢位待确认/未抢到", reasons):
+                    notified[failure_key] = int(time.time())
+                    save_state(state)
+    if not args.dry_run:
+        state["active_run"]["finished_at"] = int(time.time())
+        save_state(state)
 
 
 def run(args):
-    cfg = load_config()
-    now = hk_now()
-    client = build_client()
-
-    # ---- 校准模式 ----
-    if args.dump:
-        fetch_timetables(client, cfg)  # 登录 + 建会话
-        os.makedirs(DUMP_DIR, exist_ok=True)
-        dates = cfg["request"].get("searchDates") or [""]
-        dumped = {}
-        for gym in cfg["gyms"]:
-            safe = re.sub(r"[^\w-]", "_", gym["name"])
-            for d in dates:
-                raw = client.timetable(gym["ctrId"], d, params=cfg["request"])
-                dumped[gym["name"]] = raw
-                suffix = "" if d == "" else f"@{d}"
-                p = os.path.join(DUMP_DIR, f"timetable_{safe}{suffix}.json")
-                with open(p, "w", encoding="utf-8") as f:
-                    json.dump(raw, f, ensure_ascii=False, indent=2)
-                print(f"[dump] {p}")
-        r = client.s.get(POSS_BOOK_URL, timeout=30)
-        with open(os.path.join(DUMP_DIR, "make_book.html"), "w", encoding="utf-8") as f:
-            f.write(r.text)
-        print(f"[dump] {DUMP_DIR}/make_book.html ({len(r.text)} bytes)")
-
-        # 顺带核对：预订模板要的占位符，真实时间表数据给不给得起
-        steps = load_booking_steps(cfg["booking"])
-        if all(load_step_curl(s, cfg["booking"], i) for i, s in enumerate(steps)):
-            _report_template_gaps(client, cfg, steps, dumped)
-        else:
-            print("[calibrate] 还没有完整 booking 模板，"
-                  "抓一条「提交预订」请求后跑 calibrate.py --import")
+    config = load_config()
+    if not config.get("booking", {}).get("enabled", True):
+        print("booking.enabled=false，跳过抢位")
         return
-
-    # ---- 抢位 ----
-    phase = booking_phase(cfg, now)
-    if phase != "closed":
-        if phase == "pre":
-            print(f"[booking] 预热：等待至 {cfg['booking']['trigger_time']}")
-            wait_until_trigger(cfg)
-            now = hk_now()
-        state = load_state()
-        try:
-            got = attempt_booking(client, cfg, state, now, dry_book=args.dry_book)
-            if not got and not args.dry_book:
-                _booking_failed_alert(cfg, state, now, args)
-        except BookingNotCalibrated as e:
-            print(f"[booking] 无法抢位：{e}")
-            if not args.no_notify:
-                notify_all("⚠️ POSS 抢位尚未校准", f"{e}\n\n本次仅执行蹲守提醒。")
-    elif args.dry_book:
-        print("[dry-book] 当前不在抢位窗口，仍演示抢位流程（查询 + 打印表单）")
-        try:
-            attempt_booking(client, cfg, load_state(), now, dry_book=True)
-        except BookingNotCalibrated as e:
-            print(f"[dry-book] {e}")
-
-    # ---- 蹲守提醒 ----
-    if cfg["fallback"].get("enabled", True):
-        monitor_fallback(client, cfg, now, args)
-
-
-def _booking_failed_alert(cfg, state, now, args):
-    """「没抢到」提醒：每个触发日只推一次。"""
-    key = now.date().isoformat()
-    if state.get("booking_failed_notified") == key:
+    targets = config.get("booking", {}).get("targets") or []
+    if getattr(args, "today_only", False):
+        today = datetime.now(TZ).date()
+        targets = [target for target in targets
+                   if release_at(target, config).date() == today]
+    if not targets:
+        print("今天没有放位目标" if getattr(args, "today_only", False)
+              else "没有配置 booking.targets；请先在 poss_ui.py 选择目标")
         return
-    state["booking_failed_notified"] = key
-    save_state(state)
-    b = cfg["booking"]
-    jobs = plan_jobs(cfg, now)
-    if jobs:
-        desc = "\n".join(f"· {_job_desc(j)}" for j in jobs)
-    else:
-        target = (now.date() + timedelta(days=b["lead_days"])).isoformat()
-        desc = f"· {target} {b['from']}-{b['to']}（{'/'.join(b['gyms']) or '全部馆'}）"
-    if not args.no_notify:
-        notify_all(
-            "😤 POSS 没抢到，转入蹲守",
-            f"未抢到的目标：\n{desc}\n\n"
-            f"已转入蹲守模式：有人取消放出空位会立即提醒你。",
-        )
+    state = load_state()
+    groups = {}
+    for target in targets:
+        group = groups.setdefault(release_at(target, config), {})
+        group[_target_key(target)] = target
+    for _, group in sorted(groups.items()):
+        run_parallel_group(list(group.values()), config, state, args)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="POSS 抢位器 / 蹲位器")
-    parser.add_argument("--dump", action="store_true", help="校准模式：抓原始数据存 dumps/")
-    parser.add_argument("--dry-book", action="store_true", help="演练抢位并打印表单，不真提交")
-    parser.add_argument("--no-notify", action="store_true", help="不发通知（测试用）")
+    parser = argparse.ArgumentParser(description="POSS monitor")
+    parser.add_argument("--dry-run", action="store_true", help="只验证目标，不提交预订")
+    parser.add_argument("--force", action="store_true", help="忽略放位时间和已处理状态")
+    parser.add_argument("--wait", action="store_true",
+                        help="本地测试用：提前登录并保活，等待目标放位时间")
+    parser.add_argument("--today-only", action="store_true",
+                        help="只处理今天放位的目标，供每日云端运行使用")
     args = parser.parse_args()
-
-    load_env_file()
-
-    try:
+    os.makedirs(os.path.join(ROOT, "dumps"), exist_ok=True)
+    with open(os.path.join(ROOT, "dumps", "booking-runner.lock"), "a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("本地抢位程序已在运行，跳过重复实例", flush=True)
+            return
         run(args)
-    except LoginFailed as e:
-        print(f"[FATAL] 登录失败: {e}")
-        _fail_alert(f"POSS 登录失败: {e}", args)
-        sys.exit(1)
-    except (SessionExpired, ParseNeedsCalibration) as e:
-        print(f"[FATAL] {e}")
-        _fail_alert(f"POSS 监控失明: {e}", args)
-        sys.exit(1)
-    except ValueError as e:  # 配置错误
-        print(f"[FATAL] {e}")
-        _fail_alert(f"POSS 配置错误: {e}", args)
-        sys.exit(1)
-    except Exception as e:  # noqa: BLE001
-        print(f"[FATAL] 未知错误: {type(e).__name__}: {e}")
-        _fail_alert(f"POSS 未知错误: {type(e).__name__}: {e}", args)
-        sys.exit(1)
-
-
-def _fail_alert(msg, args):
-    if args.no_notify:
-        return
-    state = load_state()
-    now_ts = int(time.time())
-    if now_ts - state.get("last_fail_alert", 0) < FAIL_ALERT_INTERVAL:
-        print("[fail-alert] 距上次警报太近，跳过")
-        return
-    state["last_fail_alert"] = now_ts
-    save_state(state)
-    notify_all("🚨 POSS 蹲位器失明了", msg + "\n\n请检查 GitHub Secrets / 账号状态 / 配置。")
 
 
 if __name__ == "__main__":

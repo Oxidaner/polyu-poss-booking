@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""
-POSS 会话客户端：自动登录 + 抓取预订时间表
-================================================
-链路（2026-09-14 实测设计）：
-  ① GET /poss/secure/login/loginhome.do   → 提取登录页 CSRFToken
-  ② POST /poss/j_security_check           → NetID/NetPassword 登录（表单层无 MFA）
-  ③ GET /starspossfbstud/.../make_book.do → 提取接口用 CSRFToken（LtpaToken2 跨应用 SSO）
-  ④ POST .../timetable.json               → 预订时间表（POST，参数在 body）
+"""PolyU POSS client based on the site's real page data and JSON contracts.
 
-会话复用：登录成功后把 cookie 序列化到 session.json，
-下次运行先试旧会话，302/失效才重新登录（避免每 5 分钟登录一次触发风控）。
+The site exposes the selection tree in ``dependentJson`` on make_book.do and
+returns availability as ``facilityIds - occupiedFacilityIds`` in timetable.json.
+This module keeps those contracts explicit instead of guessing from arbitrary
+JSON keys or empty HTML selects.
 """
 
+from __future__ import annotations
+
+import html as html_lib
 import json
 import os
 import re
-import shlex
 import time
-from datetime import datetime
-from urllib.parse import quote_plus
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
+from typing import Any, Callable
+from urllib.parse import urlencode, urljoin
 
 import requests
 
@@ -26,702 +28,1116 @@ BASE = "https://www40.polyu.edu.hk"
 LOGIN_PAGE = f"{BASE}/poss/secure/login/loginhome.do"
 LOGIN_POST = f"{BASE}/poss/j_security_check"
 MAKE_BOOK = f"{BASE}/starspossfbstud/secure/ui_make_book/make_book.do"
-MAKE_BOOK_RESULT = f"{BASE}/starspossfbstud/secure/ui_make_book/make_book_result.do"
 TIMETABLE = f"{BASE}/starspossfbstud/secure/ui_make_book/timetable.json"
+RESULT_PAGE = f"{BASE}/starspossfbstud/secure/ui_make_book/make_book_result.do"
+MY_RECORD = f"{BASE}/starspossfbstud/secure/ui_my_record/my_record.do"
+MAKE_DEPOSIT = f"{BASE}/starspossfbstud/secure/ui_make_dep/make_dep.do"
+VIEW_BOOK_DAYS = f"{BASE}/starspossfbstud/secure/ui_make_book/view_book_days.json"
+TZ = timezone(timedelta(hours=8))
+SESSION_HEARTBEAT_SECONDS = 5 * 60
+PAGE_TIMEOUT = (3.05, 10)
+TIMETABLE_TIMEOUT = (3.05, 8)
+CONFIRMATION_TIMEOUT = (3.05, 45)
+FINAL_TIMEOUT = (3.05, 30)
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 )
-
-# timetable.json 请求体的默认参数（可被 config.json 的 request 段覆盖）
-DEFAULT_BODY = {
-    "bookType": "INDV",
-    "dataSetId": "18",
-    "actvId": "101",
-    "facilityId": "",
-    "showCourtAreaDetails": "true",
-}
-# 这些键**不许**被外部参数覆盖：会话令牌、用户身份，以及由函数参数显式传入的
-# ctrId / searchDate。放行它们等于让人从 UI 里改会话身份。
-PROTECTED_BODY_KEYS = {"CSRFToken", "fbUserId", "ctrId", "searchDate"}
-
 UUID_RE = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
 
-def _decode_ansic(s: str) -> str:
-    r"""把 shell 的 $'...' ANSI-C 引号解码成真实字符（\r \n \xHH 等）。"""
-    if s.startswith("$'") and s.endswith("'"):
-        inner = s[2:-1]
-        try:
-            return inner.encode("latin1").decode("unicode_escape")
-        except UnicodeDecodeError:
-            pass
-    return s
+class PossError(RuntimeError):
+    """Base error for a user-actionable POSS failure."""
 
 
-def _decode_ansic_loose(token: str) -> str:
-    """shlex 会把 $'...' 的外层单引号剥掉只剩 $body\\r\\n，这里做兜底解码。"""
-    if not token.startswith("$"):
-        return token
-    body = token[1:]
-    if not any(seq in body for seq in ("\\r", "\\n", "\\t", "\\x", "\\0")):
-        return token
-    try:
-        return body.encode("latin1").decode("unicode_escape")
-    except UnicodeDecodeError:
-        return token
+class LoginError(PossError):
+    pass
 
 
-def _ansic_escape(s: str) -> str:
-    """把含换行/控制字符的字符串编码成 $'...' 形式，便于写回 cURL 文件。"""
-    out = []
-    for ch in s:
-        if ch == "\\":
-            out.append("\\\\")
-        elif ch == "'":
-            out.append("\\'")
-        elif ch == "\n":
-            out.append("\\n")
-        elif ch == "\r":
-            out.append("\\r")
-        elif ch == "\t":
-            out.append("\\t")
-        elif ord(ch) < 32 or ord(ch) > 126:
-            out.append("\\x%02x" % ord(ch))
-        else:
-            out.append(ch)
-    return "$'" + "".join(out) + "'"
+class SessionExpired(PossError):
+    pass
 
 
-# ==================== cURL 解析与模板渲染 ====================
-# 用途：浏览器「Copy as cURL」导出的原始请求 → 结构化请求要素 → 占位符模板，
-# 这样校准预订接口时只需粘贴一次，无需人工映射字段名。
-
-# 由 requests 自行管理 / 属于浏览器指纹的头，转发时丢弃；cookie 由会话自己维护
-DROP_HEADERS = {"host", "content-length", "connection", "accept-encoding", "cookie"}
-
-# 需要读取下一个 token 作为值的 curl 选项
-_CURL_VALUE_FLAGS = {
-    "-H", "--header", "-b", "--cookie", "-d", "--data", "--data-raw", "--data-binary",
-    "--data-urlencode", "-X", "--request", "--url", "-A", "--user-agent",
-    "-e", "--referer", "-o", "--output", "-u", "--user", "--connect-timeout", "--max-time",
-}
-# 无需值的开关选项
-_CURL_BARE_FLAGS = {
-    "--compressed", "-k", "--insecure", "-s", "--silent", "-L", "--location",
-    "-i", "--include", "-g", "--globoff", "-v", "--verbose", "-N", "--no-buffer",
-    "--fail", "-f", "--tlsv1.2", "--http1.1",
-}
-
-_DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%d-%m-%Y", "%Y%m%d", "%d/%m/%y",
-                 "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S")
-_TIME_FORMATS = ("%H:%M:%S", "%H:%M", "%H%M")
+class TimetableError(PossError):
+    def __init__(self, message: str, http_status: int | None = None,
+                 retry_after: float | None = None):
+        super().__init__(message)
+        self.http_status = http_status
+        self.retry_after = retry_after
 
 
-def parse_flexible(value):
-    """把值尽可能解析成 datetime（日期 / 时间 / 日期时间）。失败返回 None。"""
-    s = str(value).strip()
-    if not s:
+class BookingError(PossError):
+    pass
+
+
+class BookingAttemptError(BookingError):
+    def __init__(self, message: str, stage: str, reason_code: str,
+                 events: list[dict[str, Any]], uncertain: bool = False,
+                 retry_after: float | None = None):
+        super().__init__(message)
+        self.stage = stage
+        self.reason_code = reason_code
+        self.events = list(events)
+        self.uncertain = uncertain
+        self.retry_after = retry_after
+
+
+def transport_reason(exc: requests.RequestException) -> str:
+    """Classify transport failures without logging URLs, tokens or response bodies."""
+    if isinstance(exc, requests.exceptions.ProxyError):
+        return "proxy_error"
+    if isinstance(exc, requests.exceptions.SSLError):
+        detail = str(exc).lower()
+        if "proxy" in detail:
+            return "proxy_error"
+        if "certificate verify failed" in detail or "hostname mismatch" in detail:
+            return "tls_certificate_error"
+        if "eof" in detail or "connection reset" in detail:
+            return "tls_connection_closed"
+        if "handshake" in detail:
+            return "tls_handshake_error"
+        return "tls_error"
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return "connect_timeout"
+    if isinstance(exc, requests.exceptions.ReadTimeout):
+        return "read_timeout"
+    if isinstance(exc, requests.exceptions.Timeout):
+        return "timeout"
+    return "network_error"
+
+
+def retry_after_seconds(value: str | None) -> float | None:
+    if not value:
         return None
-    for fmt in _DATE_FORMATS:
+    try:
+        return max(0.0, float(value))
+    except ValueError:
         try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    for fmt in _TIME_FORMATS:
+            delay = parsedate_to_datetime(value) - datetime.now(timezone.utc)
+            return max(0.0, delay.total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+
+@dataclass(frozen=True)
+class Selection:
+    dataset_id: str
+    activity_id: str
+    center_id: str
+    facility_id: str
+    date: str
+    start: str
+    end: str
+    activity_name: str = ""
+    center_name: str = ""
+    facility_name: str = ""
+    book_type: str = "INDV"
+
+
+@dataclass
+class BookingOutcome:
+    status: str
+    message: str
+    stage: str = ""
+    reason_code: str = ""
+    center: str = ""
+    facility: str = ""
+    date: str = ""
+    start: str = ""
+    end: str = ""
+    charge: Any = None
+    refundable_fee: Any = None
+    http_status: int | None = None
+    response_url: str = ""
+    result_html: str = ""
+    verified: bool = False
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+
+class _FormParser(HTMLParser):
+    """Small form parser for the server-rendered confirmation page."""
+
+    def __init__(self):
+        super().__init__()
+        self.forms: list[dict[str, Any]] = []
+        self._form: dict[str, Any] | None = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag.lower() == "form":
+            self._form = {"attrs": attrs, "fields": []}
+            self.forms.append(self._form)
+        elif tag.lower() == "input" and self._form is not None:
+            name = attrs.get("name")
+            if not name:
+                return
+            kind = (attrs.get("type") or "text").lower()
+            if kind in {"submit", "button", "image", "reset", "file"}:
+                return
+            if kind in {"checkbox", "radio"} and "checked" not in attrs:
+                return
+            self._form["fields"].append((name, attrs.get("value", "")))
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "form":
+            self._form = None
+
+
+def html_to_text(value: str) -> str:
+    value = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", value or "")
+    value = re.sub(r"(?s)<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", html_lib.unescape(value)).strip()
+
+
+def parse_deposit_balance(page: str) -> str | None:
+    match = re.search(
+        r"\b(?:Current\s+)?Deposit\s+Balance\s*:\s*(?:HK\s*)?\$\s*"
+        r"([0-9][0-9,]*(?:\.[0-9]{1,2})?)\b",
+        html_to_text(page), re.I,
+    )
+    return f"{Decimal(match.group(1).replace(',', '')):.2f}" if match else None
+
+
+def parse_hm(value: str) -> str | None:
+    for fmt in ("%H:%M", "%H:%M:%S", "%H%M"):
         try:
-            return datetime.strptime(s, fmt)
+            return datetime.strptime(str(value).strip(), fmt).strftime("%H:%M")
         except ValueError:
-            continue
+            pass
     return None
 
 
-def parse_curl(text: str) -> dict:
-    """解析 `Copy as cURL` 文本 → {method, url, headers, data, content_type}。
+def parse_date(value: str | date | datetime) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d %b %Y", "%d %B %Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
 
-    支持 \\ 换行续行（含 Windows 的 ^）、单/双引号、--url / -H / -b /
-    --data-raw / --data / --data-urlencode / -d / -X。cookie 一律丢弃。
-    """
-    cleaned = re.sub(r"[\\^][ \t]*\r?\n", " ", text.strip())
+
+def display_date(value: str | date | datetime) -> str:
+    parsed = parse_date(value)
+    if not parsed:
+        raise ValueError(f"invalid date: {value}")
+    return f"{parsed.day:02d} {parsed.strftime('%b')} {parsed.year}"
+
+
+def iso_date(value: str | date | datetime) -> str:
+    parsed = parse_date(value)
+    if not parsed:
+        raise ValueError(f"invalid date: {value}")
+    return parsed.isoformat()
+
+
+def booking_rule_from_message(message: str) -> dict[str, Any]:
+    """Read POSS's authoritative booking horizon from its banner text."""
+    match = re.search(
+        r"up to\s+(\d+)\s+days?\s+in advance\s+from\s+(\d{1,2}:\d{2})",
+        html_to_text(message),
+        re.I,
+    )
+    if not match:
+        return {"leadDays": 7, "openTime": "08:30"}
+    return {"leadDays": int(match.group(1)), "openTime": parse_hm(match.group(2)) or "08:30"}
+
+
+def booking_release_at(target_date: str | date | datetime,
+                       rule: dict[str, Any] | None = None) -> datetime:
+    """Return the exact Hong Kong time when a target date becomes bookable."""
+    parsed = parse_date(target_date)
+    if not parsed:
+        raise BookingError(f"目标日期无效: {target_date}")
+    rule = rule or {"leadDays": 7, "openTime": "08:30"}
+    open_time = parse_hm(str(rule.get("openTime") or "08:30")) or "08:30"
+    hour, minute = (int(part) for part in open_time.split(":"))
+    return datetime.combine(
+        parsed - timedelta(days=int(rule.get("leadDays", 7))),
+        datetime.min.time(),
+        tzinfo=TZ,
+    ).replace(hour=hour, minute=minute)
+
+
+def _extract_assignment(text: str, variable: str) -> Any:
+    """Decode a JSON value assigned to a JS variable, including nested arrays."""
+    marker = re.compile(
+        rf"{re.escape(variable)}\s*=\s*", re.I
+    ).search(text or "")
+    if not marker:
+        raise PossError(f"make_book.do 没找到 {variable}")
+    decoder = json.JSONDecoder()
     try:
-        tokens = shlex.split(cleaned)
-    except ValueError as e:
-        raise ValueError(f"cURL 文本无法分词（引号不配对？）: {e}") from e
+        value, _ = decoder.raw_decode(text[marker.end():].lstrip())
+    except json.JSONDecodeError as exc:
+        raise PossError(f"无法解析 POSS 的 {variable}: {exc}") from exc
+    return value
 
-    method = None
-    url = None
-    headers = {}
-    datas = []
 
-    i = 1 if tokens and tokens[0].endswith("curl") else 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t in _CURL_VALUE_FLAGS:
-            val = tokens[i + 1] if i + 1 < len(tokens) else ""
-            if t in ("-H", "--header"):
-                if ":" in val:
-                    k, v = val.split(":", 1)
-                    headers[k.strip()] = v.strip()
-            elif t in ("-d", "--data", "--data-raw", "--data-binary", "--data-urlencode"):
-                datas.append(val)
-            elif t in ("-X", "--request"):
-                method = val.upper()
-            elif t == "--url":
-                url = val
-            elif t in ("-A", "--user-agent"):
-                headers.setdefault("User-Agent", val)
-            elif t in ("-e", "--referer"):
-                headers.setdefault("Referer", val)
-            elif t in ("-b", "--cookie"):
-                # 保留以便报告，但实际发送前会被 DROP_HEADERS 过滤掉
-                headers.setdefault("Cookie", val)
-            i += 2
-            continue
-        if t in _CURL_BARE_FLAGS:
-            if t == "--compressed":
-                headers.setdefault("Accept-Encoding", "gzip, deflate")
-            i += 1
-            continue
-        if not t.startswith("-") and url is None:
-            url = t
-        i += 1
+def _normalise_tree(nodes: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    out = []
+    for node in nodes or []:
+        value = str(node.get("value", ""))
+        label = html_lib.unescape(str(node.get("label", value))).strip()
+        children = _normalise_tree(node.get("boSelectOptionChildren"))
+        out.append({"value": value, "label": label, "children": children})
+    return out
 
-    if not url:
-        raise ValueError("cURL 文本里找不到 URL（请确认整条命令都复制全了）")
-    content_type = next((v for k, v in headers.items() if k.lower() == "content-type"), "")
-    decoded = [_decode_ansic_loose(_decode_ansic(d)) for d in datas]
-    if decoded and "multipart/form-data" in content_type.lower():
-        data = "".join(decoded)
-    else:
-        data = "&".join(decoded)
-    if method is None:
-        method = "POST" if data else "GET"
+
+def _find_node(nodes: list[dict[str, Any]], value: str) -> dict[str, Any] | None:
+    return next((node for node in nodes if str(node["value"]) == str(value)), None)
+
+
+def option_tree(html: str) -> list[dict[str, Any]]:
+    return _normalise_tree(_extract_assignment(html, 'dependentJson["boDataSetOptionsJson"]'))
+
+
+def tree_options(tree: list[dict[str, Any]], dataset_id: str) -> dict[str, Any]:
+    dataset = _find_node(tree, dataset_id)
+    if not dataset:
+        raise PossError(f"POSS 没有找到 Facility / Category {dataset_id}")
+    return dataset
+
+
+def tree_context(tree: list[dict[str, Any]], dataset_id: str, activity_id: str,
+                 center_id: str, facility_id: str = "") -> dict[str, Any]:
+    dataset = tree_options(tree, dataset_id)
+    activity = _find_node(dataset["children"], activity_id)
+    if not activity:
+        raise PossError(f"当前 Category 下没有 Activity {activity_id}")
+    center = _find_node(activity["children"], center_id)
+    if not center:
+        raise PossError(f"当前 Activity 下没有 Center {center_id}")
+    facility = _find_node(center["children"], facility_id) if facility_id else None
+    return {"dataset": dataset, "activity": activity, "center": center, "facility": facility}
+
+
+def _available_facilities(slot: dict[str, Any]) -> list[str]:
+    occupied = {str(value) for value in slot.get("occupiedFacilityIds") or []}
+    return list(dict.fromkeys(
+        str(value) for value in slot.get("facilityIds") or []
+        if str(value) not in occupied
+    ))
+
+
+def _timestamp_date(value: Any) -> str:
+    try:
+        return datetime.fromtimestamp(float(value) / 1000, TZ).date().isoformat()
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def normalize_timetable(payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert POSS's official timetable shape without inventing availability."""
+    if payload.get("error"):
+        message = ((payload.get("data") or {}).get("message")
+                   if isinstance(payload.get("data"), dict) else None)
+        raise TimetableError(message or "POSS 拒绝了时间表请求")
+    data = payload.get("data") or {}
+    columns = []
+    for column in data.get("timeSlotColumns") or []:
+        slots = []
+        column_date = _timestamp_date(column.get("date"))
+        for raw in column.get("timeSlots") or []:
+            scheme = raw.get("chargingScheme") or {}
+            available = _available_facilities(raw)
+            statuses = []
+            if raw.get("hasMaintenance"):
+                statuses.append("维护");
+            if raw.get("hasExam"):
+                statuses.append("考试占用")
+            if raw.get("hasReservation"):
+                statuses.append("已有预订")
+            if raw.get("hasConfirmation"):
+                statuses.append("已有确认")
+            slots.append({
+                "date": column_date,
+                "title": column.get("title", ""),
+                "centerAlias": column.get("centerAlias"),
+                "facilityAlias": column.get("facilityAlias"),
+                "start": parse_hm(raw.get("fromTime", "")) or str(raw.get("fromTime", "")),
+                "end": parse_hm(raw.get("toTime", "")) or str(raw.get("toTime", "")),
+                "left": len(available),
+                "facilityIds": [str(value) for value in raw.get("facilityIds") or []],
+                "availableFacilityIds": available,
+                "charge": scheme.get("charge"),
+                "refundableFee": scheme.get("rfndRsvFee"),
+                "color": scheme.get("colorCode"),
+                "status": " / ".join(statuses),
+                "hasMaintenance": bool(raw.get("hasMaintenance")),
+                "hasExam": bool(raw.get("hasExam")),
+                "raw": raw,
+            })
+        columns.append({
+            "date": column_date,
+            "title": column.get("title", ""),
+            "centerAlias": column.get("centerAlias"),
+            "facilityAlias": column.get("facilityAlias"),
+            "slots": slots,
+        })
     return {
-        "method": method,
-        "url": url,
-        "headers": headers,
-        "data": data,
-        "content_type": content_type,
+        "message": html_to_text(data.get("advanceBookMsg", "")),
+        "bookingRule": booking_rule_from_message(data.get("advanceBookMsg", "")),
+        "advanceBookDate": data.get("advanceBookDate"),
+        "advanceBookStartDate": data.get("advanceBookStartDate"),
+        "duration": data.get("duration") or 1,
+        "columns": columns,
+        "charges": data.get("timeSlotCharges") or [],
+        "flags": {
+            key: bool(data.get(key))
+            for key in ("hasMaintenance", "hasExam", "hasReservation", "hasConfirmation")
+        },
+        "raw": payload,
     }
 
 
-_PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][\w-]*)(?::([^}]*))?\}")
+def iter_slots(table: dict[str, Any]):
+    for column in table.get("columns") or []:
+        yield from column.get("slots") or []
 
 
-def render_template(text: str, ctx: dict) -> str:
-    """替换占位符。
-
-    {key}              → 原值
-    {key:%d/%m/%Y}     → 值按日期/时间解析后重新格式化
-    {key:url}          → 值做 URL 编码（空格→+，冒号→%3A）
-    {key:url:%d %b %Y} → 先格式化再 URL 编码
-    未知 key 原样保留 —— 让错误在 dry-book 里显形，而不是静默发错请求。
-    """
-    def _repl(m):
-        key, spec = m.group(1), m.group(2)
-        if key not in ctx:
-            return m.group(0)
-        val = ctx[key]
-        val = "" if val is None else str(val)
-        if not spec:
-            return val
-        need_url = False
-        fmt = spec
-        if spec == "url" or spec.startswith("url:"):
-            need_url = True
-            fmt = spec[3:].lstrip(":")
-        if fmt:
-            dt = parse_flexible(val)
-            if dt is not None:
-                try:
-                    val = dt.strftime(fmt)
-                except ValueError:
-                    pass
-        return quote_plus(val) if need_url else val
-
-    return _PLACEHOLDER_RE.sub(_repl, text)
-
-
-def _render_body(body: str, ctx: dict) -> str:
-    """渲染请求体。
-
-    有意不做「解码→替换→重编码」：抓包里的 searchFormString 之类字段，
-    其值内部本身含 & 和 =，解码后重新解析会把字段切碎、请求结构就变了。
-    这里只做纯文本替换，浏览器原来的编码字节原样保留；
-    需要编码的占位符用 {key:url} 显式声明。
-    """
-    return render_template(body, ctx)
-
-
-def find_unresolved(text: str) -> list:
-    """找出渲染后仍残留的占位符 —— 它们会被原样发给服务器，必须拦下来。"""
-    return sorted({m.group(0) for m in _PLACEHOLDER_RE.finditer(text or "")})
-
-
-def to_curl(method: str, url: str, headers: dict, data: str = "") -> str:
-    """把请求要素还原成一段可读的 cURL（用于落盘 / 打印审查）。"""
-
-    def q(s: str) -> str:
-        return "'" + str(s).replace("'", "'\\''") + "'"
-
-    parts = ["curl --url " + q(url)]
-    if method and method.upper() != ("POST" if data else "GET"):
-        parts.append(f"-X {method.upper()}")
-    for k, v in headers.items():
-        parts.append("-H " + q(f"{k}: {v}"))
-    if data:
-        # multipart 请求体含换行和 boundary，普通单引号包不住，写成 $'...'
-        if "\n" in data or "\r" in data or "'" in data or any(ord(c) < 32 for c in data):
-            parts.append("--data-raw " + _ansic_escape(data))
-        else:
-            parts.append("--data-raw " + q(data))
-    return " \\\n  ".join(parts)
-
-
-def mask_secrets(text: str, ctx: dict) -> str:
-    """打印前遮掉 token 类值，避免日志泄漏会话凭据。"""
-    out = str(text)
-    for key in ("csrf", "CSRFToken", "LtpaToken2", "JSESSIONID"):
-        v = ctx.get(key)
-        if v:
-            out = out.replace(str(v), "***")
-    return out
-
-
-def classify_select(name: str) -> str:
-    """猜一个下拉框扮演什么角色：activity / dataset / center / date / other。
-
-    POSS 的 make_book.do 上就是那几个 select（actvId / dataSetId / ctrId / searchDate），
-    按名字里的关键词认；认不出就归 other，UI 会照样列出来给人看。
-    """
-    n = (name or "").lower()
-    for role, hints in _ROLE_HINTS:
-        if any(h in n for h in hints):
-            return role
-    return "other"
-
-
-def parse_selects(html: str) -> list:
-    """把页面里所有 <select> 解析出来 → [{name,id,role,options:[{value,label,selected}]}]。
-
-    不做 DOM 解析（不想为这个引入依赖），用正则足够对付服务端渲染的表单。
-    """
-    out = []
-    for m in _SELECT_RE.finditer(html or ""):
-        a = _attrs(m.group(1))
-        options = []
-        for om in _OPTION_RE.finditer(m.group(2)):
-            oa = _attrs(om.group(1))
-            label = html_to_text(om.group(2))
-            options.append({
-                "value": oa.get("value", label),
-                "label": label or oa.get("value", ""),
-                # 裸属性（<option ... selected>）没有 ="..."，正则抓不到，单独判
-                "selected": "selected" in om.group(1).lower(),
-            })
-        name = a.get("name") or a.get("id") or ""
-        out.append({
-            "name": name,
-            "id": a.get("id", ""),
-            "role": classify_select(name),
-            "options": options,
-        })
-    return out
-
-
-class LoginFailed(Exception):
-    """账号密码被拒 / 触发额外验证。"""
-
-
-class SessionExpired(Exception):
-    """会话失效（302 / 登录页），需要重新登录。"""
-
-
-class BookingNotCalibrated(Exception):
-    """预订接口尚未校准（缺少真实抓包的 endpoint / params）。"""
-
-
-class BookingFailed(Exception):
-    """提交预订被服务端拒绝。"""
-
-
-class BookingResult:
-    def __init__(self, ok: bool, message: str, raw: str = "", inconclusive: bool = False,
-                 confirmed_failure: bool = False):
-        self.ok = ok
-        self.message = message
-        self.raw = raw
-        # 结果不明（如 HTTP 302 且拿不到结果页）：既不能当成抢到，也绝不能再重试 ——
-        # 防止重复扣费。此时只能推人去看一眼。
-        self.inconclusive = inconclusive
-        # 服务端明确说「这次没订上」（如时段已被别人抢走）：这不是赌博，是事实，
-        # 所以可以放心去试下一个候选，不算重复扣费风险。
-        self.confirmed_failure = confirmed_failure
-
-    def __repr__(self):
-        return f"BookingResult(ok={self.ok}, message={self.message!r})"
-
-
-# ---- 结果页判定 ----
-# POSS 提交后走 PRG（POST→Redirect→GET）模式：make_book_submit.do 处理完 → 302 到
-# make_book_result.do → 结果（成功/失败）存在会话里由该页渲染出来。
-# 所以「跟着 302 走一步」就能拿到权威结论，不用再让用户人工去查。
-
-_TAG_RE = re.compile(r"(?s)<[^>]+>")
-_DROP_BLOCK_RE = re.compile(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>")
-
-# 下拉框角色识别（按 name/id 里的关键词）
-_ROLE_HINTS = [
-    ("activity", ("actv", "activity")),
-    ("dataset", ("dataset", "dataclass", "category", "catg")),
-    ("center", ("ctr", "center", "centre", "venue", "site")),
-    ("date", ("date", "day")),
-]
-_SELECT_RE = re.compile(r"(?is)<select\b([^>]*)>(.*?)</select>")
-_OPTION_RE = re.compile(r"(?is)<option\b([^>]*)>(.*?)</option>")
-_ATTR_RE = re.compile(r'([A-Za-z_:][-\w:.]*)\s*=\s*"([^"]*)"')
-
-
-def _attrs(s: str) -> dict:
-    return {k.lower(): v for k, v in _ATTR_RE.findall(s or "")}
-
-
-def html_to_text(html: str) -> str:
-    """粗剥 HTML，留下可比对的可见文本（不做完整 DOM 解析，够用即可）。"""
-    import html as _html
-
-    s = _DROP_BLOCK_RE.sub(" ", html or "")
-    s = _TAG_RE.sub(" ", s)
-    s = _html.unescape(s)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-# 默认「明确失败」标志。刻意选不会误伤成功页的短语：
-# 英文 "unsuccessful" 本身含 "success"，所以判定时必须先看失败词再看成功词。
-DEFAULT_FAILURE_KEYWORDS = [
-    "unsuccessful", "not successful", "booking failed", "cannot be booked",
-    "unable to book", "no longer available", "not available", "already been booked",
-    "already booked", "have been booked", "was booked", "duplicate",
-    "不成功", "失败", "額滿", "额满", "名額已滿", "名额已满", "已被", "已經被", "已经被",
-    "餘額不足", "余额不足", "押金不足",
-]
-DEFAULT_SUCCESS_KEYWORDS = ["success", "successful", "成功", "confirmed", "已確認", "已确认"]
-
-
-def classify_result(text: str, success_keywords=None, failure_keywords=None):
-    """判定结果页 → (verdict, matched)
-
-    verdict ∈ {"ok", "fail", "unknown"}
-
-    顺序很重要：**先判失败**。英文结果页里「unsuccessful」包含「success」子串，
-    若先判成功，一次失败的预订会被读成抢到了 —— 我们就此收工，然后你要自己
-    发现问题。反过来判错的代价只是多试一次，安全得多。
-
-    只比对「去掉了 script/style 的内容」：既不漏掉藏在隐藏字段/属性里的结果标志，
-    也不会因为某个 JS 库里恰巧有 "success" 三个字就把失败读成成功。
-    """
-    visible = html_to_text(text)
-    without_js = _DROP_BLOCK_RE.sub(" ", text or "")
-    low = (visible + "\n" + without_js).lower()
-    fails = [k for k in (failure_keywords or DEFAULT_FAILURE_KEYWORDS) if k.lower() in low]
-    if fails:
-        return "fail", fails
-    oks = [k for k in (success_keywords or DEFAULT_SUCCESS_KEYWORDS) if k.lower() in low]
-    if oks:
-        return "ok", oks
-    return "unknown", []
-
+def find_slot(table: dict[str, Any], target_date: str, start: str, end: str = "") -> dict[str, Any] | None:
+    target = iso_date(target_date)
+    for slot in iter_slots(table):
+        if slot["date"] == target and slot["start"] == start and (not end or slot["end"] == end):
+            return slot
+    return None
 
 
 class PossClient:
     def __init__(self, netid: str, password: str, fb_user_id: str = "657032"):
         if not netid or not password:
-            raise LoginFailed("未配置 POSS_NETID / POSS_PASSWORD")
+            raise LoginError("请先配置 POSS NetID 和 NetPassword")
         self.netid = netid
         self.password = password
-        self.fb_user_id = fb_user_id
-        self.s = requests.Session()
-        self.s.headers.update({
+        self.fb_user_id = str(fb_user_id or "657032")
+        self.session = requests.Session()
+        self.session.headers.update({
             "User-Agent": UA,
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Accept": "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
         })
-        self.api_csrf = None
-        self.debug = os.environ.get("POSS_DEBUG") == "1"
+        self.csrf = ""
+        self.page_html = ""
+        self.tree: list[dict[str, Any]] = []
+        self._last_session_check = 0.0
 
-    # ---------- 登录 ----------
+    @staticmethod
+    def _is_login_page(response) -> bool:
+        url = str(response.url).lower()
+        text = str(response.text or "").lower()
+        return (
+            "loginhome" in url
+            or "j_security_check" in text
+            or bool(re.search(r'<input[^>]+name=["\']j_username["\']', text))
+        )
 
-    def login(self):
-        """①→③ 完整登录，成功后 api_csrf 可用。"""
-        r = self.s.get(LOGIN_PAGE, timeout=30)
-        r.raise_for_status()
-        m = re.search(r'name="CSRFToken"\s+value="(' + UUID_RE + r')"', r.text)
-        if not m:
-            raise LoginFailed("登录页上找不到 CSRFToken（页面结构可能变了）")
-        login_token = m.group(1)
-
-        r = self.s.post(
+    def login(self) -> dict[str, Any]:
+        response = self.session.get(LOGIN_PAGE, timeout=PAGE_TIMEOUT)
+        response.raise_for_status()
+        match = re.search(r'name=["\']CSRFToken["\']\s+value=["\'](' + UUID_RE + r')', response.text)
+        if not match:
+            raise LoginError("登录页缺少 CSRFToken，POSS 页面结构可能已变化")
+        response = self.session.post(
             LOGIN_POST,
             data={
                 "j_username": self.netid,
                 "j_password": self.password,
                 "otheruser": "N",
                 "buttonAction": "loginButton",
-                "CSRFToken": login_token,
+                "CSRFToken": match.group(1),
             },
             headers={"Referer": LOGIN_PAGE, "Origin": BASE},
             allow_redirects=True,
-            timeout=30,
+            timeout=PAGE_TIMEOUT,
         )
-        # 登录失败会带回登录表单；成功则落在 home 页
-        if "j_security_check" in r.text or "loginform" in r.text:
-            raise LoginFailed(
-                "登录被拒：回到登录页（账号密码错误，或该账号触发了额外验证）"
-            )
-        if self.debug:
-            print(f"[login] 登录后落地: {r.url}")
-            print(f"[login] cookies: {sorted(self.s.cookies.get_dict().keys())}")
+        if self._is_login_page(response):
+            raise LoginError("登录失败：NetID 或 NetPassword 不正确，或账号需要额外验证")
+        return self.load_booking_page()
 
-        self.api_csrf = self._fetch_api_token()
-        if not self.api_csrf:
-            raise LoginFailed("make_book.do 页面上找不到接口 CSRFToken")
+    def load_booking_page(self) -> dict[str, Any]:
+        response = self.session.get(MAKE_BOOK, timeout=PAGE_TIMEOUT)
+        if self._is_login_page(response):
+            raise SessionExpired("POSS 会话已失效，请重新登录")
+        response.raise_for_status()
+        self.page_html = response.text
+        tokens = re.findall(r"CSRFToken[\"'=:\s]+(" + UUID_RE + r")", response.text)
+        if not tokens:
+            raise PossError("预订页缺少接口 CSRFToken")
+        self.csrf = tokens[-1]
+        self.tree = option_tree(response.text)
+        match = re.search(
+            r'<input\b[^>]*\bname=["\']fbUserId["\'][^>]*\bvalue=["\'](\d+)["\']',
+            response.text, re.I,
+        )
+        if not match:
+            raise PossError("预订页缺少当前账号的 fbUserId")
+        self.fb_user_id = match.group(1)
+        self._last_session_check = time.monotonic()
+        return self.metadata()
+
+    def heartbeat(self, force: bool = False) -> bool:
+        """Touch the authenticated POSS session and refresh page-scoped data."""
+        if not force and time.monotonic() - self._last_session_check < SESSION_HEARTBEAT_SECONDS:
+            return False
+        self.load_booking_page()
         return True
 
-    def _fetch_api_token(self):
-        """③ 打开预订页，提取 timetable.json 用的 CSRFToken。"""
-        r = self.s.get(MAKE_BOOK, timeout=30)
-        if "loginhome" in r.url or "loginform" in r.text:
-            raise SessionExpired("make_book.do 仍被挡在登录页（LTPA 未生效？）")
-        tokens = re.findall(r"CSRFToken[\"'=:\s]+(" + UUID_RE + r")", r.text)
-        if self.debug:
-            print(f"[login] make_book.do: {r.status_code}, 找到 {len(tokens)} 个 token")
-        return tokens[-1] if tokens else None
-
-    # ---------- 选课 UI 支撑 ----------
-
-    def fetch_make_book_html(self) -> str:
-        """GET 预订页原始 HTML（UI 用来解析 Activity/Date/Center 下拉框）。"""
-        r = self.s.get(MAKE_BOOK, timeout=30)
-        if "loginhome" in r.url or "loginform" in r.text:
-            raise SessionExpired("make_book.do 被挡在登录页（会话失效）")
-        return r.text
-
-    def ensure_login(self) -> bool:
-        """会话还能用就直接复用，否则重新登录。返回是否发生了重新登录。"""
+    def ensure_ready(self) -> dict[str, Any]:
+        if not self.csrf or not self.tree:
+            return self.login()
         try:
-            self.fetch_make_book_html()
-            if not self.api_csrf:
-                self.api_csrf = self._fetch_api_token()
-            if self.api_csrf:
-                return False
+            self.heartbeat()
         except (SessionExpired, requests.RequestException):
-            pass
-        self.login()
-        return True
+            return self.login()
+        return self.metadata()
 
-    # ---------- 时间表 ----------
-
-    def timetable(self, ctr_id: str, search_date: str = "", params: dict | None = None):
-        """④ POST timetable.json，返回原始 JSON。会话失效抛 SessionExpired。
-
-        ctr_id / search_date 必填逻辑在这；其余 body 参数由 params 透传
-        （来自 config.json 的 request 段，或 UI 上抓到的下拉框）。
-        只挡 PROTECTED_BODY_KEYS —— 白名单校验交给调用方（UI 那边只放行
-        页面上真实存在的 select 名），这里再挡一道令牌级别的。
-        """
-        if not self.api_csrf:
-            raise SessionExpired("尚未登录（无接口 CSRFToken）")
-        body = dict(DEFAULT_BODY)
-        for k, v in (params or {}).items():
-            if k in PROTECTED_BODY_KEYS or v is None:
-                continue
-            body[k] = str(v)
-        body.update({
-            "CSRFToken": self.api_csrf,
-            "fbUserId": self.fb_user_id,
-            "searchDate": search_date,
-            "ctrId": str(ctr_id),
-        })
-        r = self.s.post(
-            f"{TIMETABLE}?CSRFToken={self.api_csrf}",
-            data=body,
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": MAKE_BOOK,
-                "Origin": BASE,
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            },
-            allow_redirects=False,  # 302 = 会话失效的明确信号
-            timeout=30,
-        )
-        if r.status_code != 200:
-            raise SessionExpired(f"timetable.json HTTP {r.status_code}")
-        try:
-            return r.json()
-        except ValueError as e:
-            raise SessionExpired(f"返回非 JSON（疑似登录页/错误页）: {str(e)[:100]}") from e
-
-    # ---------- 提交预订 ----------
-
-    def book(self, payload: dict, endpoint: str = "",
-             success_keywords: list | None = None) -> BookingResult:
-        """⑤ 提交预订。
-
-        ⚠️ 端点与字段必须先按真实抓包校准（config.booking.endpoint / params）。
-        凭猜测去 POST 一个会扣押金的接口是不负责任的，因此未校准时直接抛错。
-
-        payload 由 monitor 按 config.booking.params 模板 + 时段上下文组装。
-        """
-        if not endpoint:
-            raise BookingNotCalibrated(
-                "预订接口尚未校准：请在 POSS 手动预订一次并抓取那条提交请求的 cURL，"
-                "把 URL 路径填到 config.booking.endpoint，表单字段填到 config.booking.params。"
-            )
-        if not self.api_csrf:
-            raise SessionExpired("尚未登录（无接口 CSRFToken）")
-        body = dict(payload)
-        body.setdefault("CSRFToken", self.api_csrf)
-        url = endpoint if endpoint.startswith("http") else BASE + endpoint
-        r = self.s.post(
-            url,
-            data=body,
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": MAKE_BOOK,
-                "Origin": BASE,
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            },
-            allow_redirects=False,
-            timeout=30,
-        )
-        if r.status_code == 302:
-            loc = r.headers.get("Location", "?")
-            if "login" in loc.lower() or "loginhome" in loc.lower():
-                raise SessionExpired(f"提交预订被重定向到登录页（HTTP 302 → {loc}）")
-            # 非登录跳转：可能已经下单成功。绝不能重试，交给人去确认。
-            return BookingResult(False, f"HTTP 302 → {loc}（结果不明，请人工确认）",
-                                 inconclusive=True)
-        text = r.text or ""
-        ok_http = r.status_code == 200
-        kws = success_keywords or ["success", "successful", "成功"]
-        hit = any(k.lower() in text.lower() for k in kws)
-        ok = ok_http and hit
-        msg = "预订成功" if ok else f"HTTP {r.status_code} 未匹配成功标志: {text[:200]}"
-        return BookingResult(ok, msg, text[:2000])
-
-    # ---------- 提交预订（cURL 模板路径，2026-09-14 起为主路径） ----------
-
-    def build_booking_request(self, curl_text: str, ctx: dict) -> dict:
-        """把 cURL 模板 + 上下文渲染成 {method,url,headers,body,content_type}。
-
-        ctx 里未显式给出的 csrf / fbUserId 用当前会话值兜底。
-        """
-        parsed = parse_curl(curl_text)
-        full_ctx = dict(ctx)
-        full_ctx.setdefault("csrf", self.api_csrf or "")
-        full_ctx.setdefault("fbUserId", self.fb_user_id)
-        url = render_template(parsed["url"], full_ctx)
-        body = _render_body(parsed["data"], full_ctx)
-        headers = {k: v for k, v in parsed["headers"].items()
-                   if k.lower() not in DROP_HEADERS}
-        if not url.startswith("http"):
-            url = BASE + url
+    def metadata(self) -> dict[str, Any]:
         return {
-            "method": parsed["method"],
-            "url": url,
-            "headers": headers,
-            "body": body,
-            "content_type": parsed["content_type"],
+            "csrf": self.csrf,
+            "datasets": [
+                {"value": node["value"], "label": node["label"]}
+                for node in self.tree
+            ],
+            "tree": self.tree,
+            "today": datetime.now(TZ).date().isoformat(),
+            "windowDays": 15,
         }
 
-    def book_via_curl(self, curl_text: str, ctx: dict,
-                      success_keywords: list | None = None) -> BookingResult:
-        """按抓包模板提交预订。body 原样转发（表单或 JSON 都不动）。"""
-        if not self.api_csrf:
-            raise SessionExpired("尚未登录（无接口 CSRFToken）")
-        req = self.build_booking_request(curl_text, ctx)
+    def deposit_balance(self) -> dict[str, str] | None:
+        """Read the authenticated account's HKD deposit without changing it."""
+        if not self.page_html:
+            self.ensure_ready()
+        amount = parse_deposit_balance(self.page_html)
+        if amount is None:
+            response = self.session.get(MAKE_DEPOSIT, timeout=PAGE_TIMEOUT)
+            if self._is_login_page(response):
+                raise SessionExpired("POSS 会话已失效，无法读取余额")
+            response.raise_for_status()
+            amount = parse_deposit_balance(response.text)
+        return {"amount": amount, "currency": "HKD"} if amount is not None else None
 
-        # 安全闸门：占位符没解析出来就绝不发出去 —— 宁可报错，也不往学校服务器
-        # 发一条带着 {facilityId} 字面量的请求。
-        leftover = find_unresolved(req["url"])
-        if "json" not in (req["content_type"] or "").lower():
-            leftover += find_unresolved(req["body"])
-        if leftover:
-            raise BookingNotCalibrated(
-                "预订模板里有取不到值的占位符: " + ", ".join(leftover)
-                + "。通常是 timetable 数据里没提供该字段（如 facilityId），"
-                  "需要先跑 --dump 看清时间表结构再调整解析器。"
+    def _post_timetable(self, values: dict[str, Any]) -> dict[str, Any]:
+        response = self.session.post(
+            f"{TIMETABLE}?CSRFToken={self.csrf}",
+            data=values,
+            headers={
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": MAKE_BOOK,
+                "Origin": BASE,
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+            },
+            allow_redirects=False,
+            timeout=TIMETABLE_TIMEOUT,
+        )
+        if response.status_code in (301, 302, 303, 307, 308) or self._is_login_page(response):
+            raise SessionExpired("时间表请求的会话已失效，请重新登录")
+        if response.status_code != 200:
+            raise TimetableError(
+                f"时间表接口 HTTP {response.status_code}",
+                http_status=response.status_code,
+                retry_after=retry_after_seconds(response.headers.get("Retry-After"))
+                if response.status_code in (429, 503) else None,
             )
-
-        kwargs = {"headers": req["headers"], "allow_redirects": False, "timeout": 30}
-        if req["method"].upper() == "GET":
-            r = self.s.get(req["url"], **kwargs)
-        else:
-            # 传原始字符串：Content-Type 用抓包里的原值，不做重新编码
-            kwargs["data"] = req["body"]
-            r = self.s.post(req["url"], **kwargs)
-        if r.status_code == 302:
-            loc = r.headers.get("Location", "?")
-            if "login" in loc.lower() or "loginhome" in loc.lower():
-                raise SessionExpired(f"提交预订被重定向到登录页（HTTP 302 → {loc}）")
-            return BookingResult(False, f"HTTP 302 → {loc}（结果不明，请人工确认）",
-                                 inconclusive=True)
-        text = r.text or ""
-        kws = success_keywords or ["success", "successful", "成功", "已确认"]
-        ok = r.status_code == 200 and any(k.lower() in text.lower() for k in kws)
-        msg = "预订成功" if ok else f"HTTP {r.status_code} 未匹配成功标志: {text[:200]}"
-        return BookingResult(ok, msg, text[:2000])
-
-    # ---------- 预订结果页 ----------
-
-    def open_result_page(self, url: str, referer: str = "", max_hops: int = 3):
-        """跟着 302 打开预订结果页（PRG 的最后一步，等价于浏览器自动跳转）。
-
-        返回最终响应对象；中途被踢到登录页抛 SessionExpired。
-        """
-        r = None
-        for _ in range(max_hops):
-            headers = {"Referer": referer} if referer else {}
-            r = self.s.get(url, headers=headers, allow_redirects=False, timeout=30)
-            if r.status_code not in (301, 302):
-                return r
-            loc = r.headers.get("Location", "")
-            if not loc:
-                return r
-            if "login" in loc.lower() or "loginhome" in loc.lower():
-                raise SessionExpired(f"打开结果页时被踢到登录页（302 → {loc}）")
-            url = loc if loc.startswith("http") else BASE + loc
-        return r
-
-    # ---------- 会话持久化 ----------
-    def save_session(self, path: str):
-        """把 cookie 序列化到文件（保留 domain/path，跨运行复用）。"""
-        cookies = [
-            {"name": c.name, "value": c.value, "domain": c.domain, "path": c.path}
-            for c in self.s.cookies
-        ]
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump({"t": time.time(), "cookies": cookies}, f)
-
-    def load_session(self, path: str, max_age: int = 90 * 60) -> bool:
-        """尝试恢复旧会话；成功且未超龄返回 True。"""
-        if not os.path.exists(path):
-            return False
         try:
-            with open(path, encoding="utf-8") as f:
-                blob = json.load(f)
-            if time.time() - blob.get("t", 0) > max_age:
-                return False
-            self.s.cookies.clear()
-            for c in blob["cookies"]:
-                self.s.cookies.set(
-                    c["name"], c["value"], domain=c.get("domain"), path=c.get("path", "/")
+            return response.json()
+        except ValueError as exc:
+            raise TimetableError("时间表接口返回的不是 JSON") from exc
+
+    def timetable(self, dataset_id: str, activity_id: str, center_id: str,
+                  facility_id: str = "", book_type: str = "INDV") -> dict[str, Any]:
+        """Fetch the site's complete official window.
+
+        The real page sends an empty searchDate for the full window. A concrete
+        searchDate changes the response into a single column, so the UI filters
+        the returned official window locally instead of sending a fake date.
+        """
+        self.ensure_ready()
+        tree_context(self.tree, dataset_id, activity_id, center_id, facility_id)
+        request_data = {
+            "CSRFToken": self.csrf,
+            "fbUserId": self.fb_user_id,
+            "bookType": book_type,
+            "dataSetId": str(dataset_id),
+            "actvId": str(activity_id),
+            "searchDate": "",
+            "ctrId": str(center_id),
+            "facilityId": str(facility_id or ""),
+            "showCourtAreaDetails": "true",
+        }
+        try:
+            payload = self._post_timetable(request_data)
+        except SessionExpired:
+            self.login()
+            request_data["CSRFToken"] = self.csrf
+            payload = self._post_timetable(request_data)
+        return normalize_timetable(payload)
+
+    def _selection_context(self, selection: Selection) -> dict[str, Any]:
+        self.ensure_ready()
+        return tree_context(
+            self.tree, selection.dataset_id, selection.activity_id,
+            selection.center_id, selection.facility_id,
+        )
+
+    def _search_form_string(self, selection: Selection) -> str:
+        # This is the exact form serialization used by ui_book_control_indv.js.
+        values = [
+            ("fbUserId", self.fb_user_id),
+            ("bookType", selection.book_type),
+            ("dataSetId", selection.dataset_id),
+            ("actvId", selection.activity_id),
+            ("searchDate", ""),
+            ("ctrId", selection.center_id),
+            ("facilityId", ""),
+        ]
+        return urlencode(values)
+
+    @staticmethod
+    def _date_time(value: str, hm: str) -> str:
+        parsed = parse_date(value)
+        if not parsed or not parse_hm(hm):
+            raise BookingError(f"目标日期或时间无效: {value} {hm}")
+        return f"{parsed.day:02d} {parsed.strftime('%b')} {parsed.year} {parse_hm(hm)}"
+
+    def _first_step_data(self, selection: Selection, facility_id: str) -> dict[str, Any]:
+        return {
+            "brcdNo": "",
+            "phone": "",
+            "extlPtyDclrId": "",
+            "dataSetId": selection.dataset_id,
+            "actvId": selection.activity_id,
+            "onBehalfOfFbUserId": "",
+            "byPassQuota": "false",
+            "byPassChrgSchm": "false",
+            "byPassBookingDaysLimit": "false",
+            "repeatOccurrence": "false",
+            "grpFacilityIds": "",
+            "searchFormString": self._search_form_string(selection),
+            "boMakeBookFacilities[0].ctrId": selection.center_id,
+            "boMakeBookFacilities[0].facilityId": facility_id,
+            "boMakeBookFacilities[0].startDateTime": self._date_time(selection.date, selection.start),
+            "boMakeBookFacilities[0].endDateTime": self._date_time(selection.date, selection.end),
+            "CSRFToken": self.csrf,
+        }
+
+    @staticmethod
+    def _booking_facility_name(context: dict[str, Any]) -> str:
+        """Use the short Area/Court label shown on POSS's confirmation page."""
+        label = str((context.get("facility") or {}).get("label") or "")
+        return label.rsplit(" - ", 1)[-1].strip()
+
+    def _confirmation_data(self, selection: Selection, facility_id: str,
+                           context: dict[str, Any], csrf: str) -> dict[str, str]:
+        """Build the exact multipart fields emitted by POSS's browser script."""
+        return {
+            "dataSetId": selection.dataset_id,
+            "boBookingType.id": "1",
+            "boBookingType.value": selection.book_type,
+            "boBookingMode.value": "SPORT",
+            "boBookingMode.id": "1",
+            "userRefNum": "",
+            "fbUserId": self.fb_user_id,
+            "grpFacilityIds": "",
+            "repeatOccurrence": "false",
+            "startDate": "",
+            "startTime": "",
+            "endDate": "",
+            "endTime": "",
+            "dayOfWeeks": "",
+            "functionsAvailable": "false",
+            "brcdNo": "",
+            "phone": "",
+            "onBehalfOfFbUserId": "",
+            "byPassQuota": "false",
+            "byPassChrgSchm": "false",
+            "byPassBookingDaysLimit": "false",
+            "searchFormString": self._search_form_string(selection),
+            "extlPtyDclrId": "",
+            "boMakeBookFacilities[0].ctrId": selection.center_id,
+            "boMakeBookFacilities[0].centerName": context["center"]["label"],
+            "boMakeBookFacilities[0].facilityId": facility_id,
+            "boMakeBookFacilities[0].facilityName": self._booking_facility_name(context),
+            "boMakeBookFacilities[0].startDateTime": self._date_time(selection.date, selection.start),
+            "boMakeBookFacilities[0].endDateTime": self._date_time(selection.date, selection.end),
+            "declare": "on",
+            "CSRFToken": csrf,
+        }
+
+    def preview_booking(self, selection: Selection, table: dict[str, Any] | None = None,
+                        excluded_facility_ids: set[str] | frozenset[str] = frozenset()
+                        ) -> dict[str, Any]:
+        """Validate a target and return the exact request without posting it."""
+        context = self._selection_context(selection)
+        if table is None:
+            table = self.timetable(selection.dataset_id, selection.activity_id, selection.center_id,
+                                   selection.facility_id, selection.book_type)
+        slot = find_slot(table, selection.date, selection.start, selection.end)
+        if not slot:
+            raise BookingError("目标时段不在 POSS 当前返回的官方窗口内")
+        available = [court for court in slot["availableFacilityIds"]
+                     if court not in excluded_facility_ids]
+        facility_id = selection.facility_id or (available[0] if available else "")
+        if not facility_id:
+            raise BookingError("目标时段当前没有可用场地；可以保存目标，但不能立即下单")
+        if facility_id not in slot["facilityIds"]:
+            raise BookingError("目标 Area 不属于这个时段")
+        if context["facility"] is None:
+            context = tree_context(
+                self.tree, selection.dataset_id, selection.activity_id,
+                selection.center_id, facility_id,
+            )
+        rule = table.get("bookingRule") or {"leadDays": 7, "openTime": "08:30"}
+        release_at = booking_release_at(selection.date, rule)
+        now = datetime.now(TZ)
+        if now < release_at:
+            raise BookingError(
+                f"POSS 尚未开放该日期：{selection.date} 要到 "
+                f"{release_at:%Y-%m-%d %H:%M} 才能抢（POSS 规则：提前 "
+                f"{rule['leadDays']} 天，{rule['openTime']}）"
+            )
+        return {
+            "selection": selection.__dict__,
+            "facilityId": facility_id,
+            "slot": slot,
+            "context": {
+                "activity": context["activity"]["label"],
+                "center": context["center"]["label"],
+                "facility": context["facility"]["label"] if context["facility"] else "",
+            },
+            "bookingRule": rule,
+            "releaseAt": release_at.isoformat(),
+            "request": {
+                "method": "POST",
+                "url": MAKE_BOOK,
+                "fields": self._first_step_data(selection, facility_id),
+            },
+        }
+
+    def _parse_confirmation(self, html: str) -> tuple[str, str, dict[str, str], str]:
+        parser = _FormParser()
+        parser.feed(html or "")
+        candidates = []
+        for form in parser.forms:
+            attrs = form["attrs"]
+            action = attrs.get("action", "")
+            fields = dict(form["fields"])
+            if "boMakeBookFacilities[0].facilityId" in fields or "declare" in fields:
+                candidates.append((action, attrs.get("method", "post").upper(), fields,
+                                   attrs.get("enctype", "application/x-www-form-urlencoded")))
+        if not candidates:
+            raise BookingError("第一步没有返回确认表单，未执行最终提交")
+        return candidates[-1]
+
+    def _record_contains_booking(self, selection: Selection, center_label: str,
+                                 facility_label: str = "") -> bool:
+        """Verify a success page against My Record before calling it booked."""
+        response = self.session.get(MY_RECORD, timeout=PAGE_TIMEOUT)
+        if self._is_login_page(response):
+            raise SessionExpired("验证预订记录时会话已失效")
+        response.raise_for_status()
+        parsed = parse_date(selection.date)
+        start = datetime.strptime(selection.start, "%H:%M").strftime("%I:%M %p")
+        end = datetime.strptime(selection.end, "%H:%M").strftime("%I:%M %p")
+        date_text = f"{parsed.day:02d} {parsed.strftime('%b')} {parsed.year}"
+        for match in re.finditer(r"(?is)<tr\b[^>]*>.*?</tr>", response.text):
+            row = html_to_text(match.group())
+            if all(value.lower() in row.lower() for value in (
+                center_label, date_text, f"{start} - {end}",
+            )) and (not facility_label or re.search(
+                r"(?<![A-Za-z0-9])" + re.escape(facility_label) + r"(?![A-Za-z0-9])",
+                row, re.IGNORECASE,
+            )):
+                # My Record is newest first; an older confirmed row must not
+                # override a later cancellation of the same target.
+                return "Individual Booking" in row and "(Confirmed)" in row
+        return False
+
+    def _reconcile_record(self, selection: Selection, events: list[dict[str, Any]]) -> bool:
+        center = selection.center_name
+        if not center and self.tree:
+            center = tree_context(self.tree, selection.dataset_id, selection.activity_id,
+                                  selection.center_id)["center"]["label"]
+        for attempt in range(3):
+            started = time.monotonic()
+            try:
+                confirmed = self._record_contains_booking(
+                    selection, center, self._attempt_facility_label
                 )
-            # 接口 CSRFToken 也在会话期内有效，一并恢复
-            self.api_csrf = blob.get("api_csrf")
-            return True
-        except (OSError, KeyError, json.JSONDecodeError):
-            return False
+                events.append({"stage": "reconcile_record", "confirmed": confirmed,
+                               "duration_ms": round((time.monotonic() - started) * 1000)})
+                if confirmed:
+                    return True
+            except (PossError, requests.RequestException) as exc:
+                events.append({"stage": "reconcile_record", "error": type(exc).__name__,
+                               "duration_ms": round((time.monotonic() - started) * 1000)})
+            if attempt < 2:
+                time.sleep(attempt + 1)
+        return False
+
+    def book(self, selection: Selection, dry_run: bool = False,
+             on_final_submit: Callable[[], None] | None = None,
+             prepared_facility_id: str = "",
+             on_first_step: Callable[[], None] | None = None,
+             on_court_selected: Callable[[str], None] | None = None,
+             excluded_facility_ids: set[str] | frozenset[str] = frozenset()
+             ) -> BookingOutcome:
+        """Perform exactly one two-step booking, with no automatic retry after submit."""
+        events: list[dict[str, Any]] = []
+        self.last_attempt_events = events
+        self._attempt_facility_label = ""
+        stage = "timetable"
+
+        def record(name: str, start: float, **details: Any):
+            events.append({
+                "at": datetime.now(TZ).isoformat(timespec="milliseconds"),
+                "stage": name,
+                "duration_ms": round((time.monotonic() - start) * 1000),
+                **details,
+            })
+
+        try:
+            outcome = self._book_once(
+                selection, dry_run, events, record, on_final_submit, prepared_facility_id,
+                on_first_step, on_court_selected, excluded_facility_ids,
+            )
+            if outcome.status == "unknown" and any(
+                event.get("stage") == "final_submit" for event in events
+            ) and self._reconcile_record(selection, events):
+                outcome.status, outcome.reason_code = "booked", "confirmed"
+                outcome.message, outcome.verified = "My Record 已确认这笔订单", True
+            return outcome
+        except BookingAttemptError:
+            raise
+        except (PossError, requests.RequestException) as exc:
+            if events:
+                stage = events[-1]["stage"]
+            reason = (
+                "no_vacancy" if isinstance(exc, BookingError) and "没有可用场地" in str(exc)
+                else "not_open" if isinstance(exc, BookingError) and "尚未开放" in str(exc)
+                else "session_expired" if isinstance(exc, SessionExpired)
+                else "login_failed" if isinstance(exc, LoginError)
+                else ("rate_limited" if exc.http_status == 429 else "transient_http"
+                      if exc.http_status in (408, 500, 502, 503, 504) else "request_rejected")
+                if isinstance(exc, TimetableError) else
+                transport_reason(exc) if isinstance(exc, requests.RequestException)
+                else "request_rejected"
+            )
+            if stage in ("final_submit", "verify_record"):
+                if self._reconcile_record(selection, events):
+                    return BookingOutcome(
+                        "booked", "My Record 已确认这笔订单", stage=stage,
+                        reason_code="confirmed", verified=True, events=events,
+                        center=selection.center_name, date=selection.date,
+                        start=selection.start, end=selection.end,
+                    )
+            raise BookingAttemptError(
+                (str(exc) if isinstance(exc, PossError)
+                 else f"{type(exc).__name__}: POSS 网络请求失败"),
+                stage, reason, events,
+                uncertain=stage in ("first_step", "final_submit", "verify_record"),
+                retry_after=getattr(exc, "retry_after", None),
+            ) from exc
+
+    def _book_once(self, selection: Selection, dry_run: bool,
+                   events: list[dict[str, Any]], record,
+                   on_final_submit: Callable[[], None] | None,
+                   prepared_facility_id: str,
+                   on_first_step: Callable[[], None] | None,
+                   on_court_selected: Callable[[str], None] | None,
+                   excluded_facility_ids: set[str] | frozenset[str]) -> BookingOutcome:
+        if prepared_facility_id:
+            started = time.monotonic()
+            try:
+                self.ensure_ready()
+                context = tree_context(
+                    self.tree, selection.dataset_id, selection.activity_id,
+                    selection.center_id, prepared_facility_id,
+                )
+                if context["facility"] is None:
+                    raise BookingError("预备球场编号不属于目标场馆")
+                preview = {
+                    "facilityId": prepared_facility_id,
+                    "slot": {"charge": None, "refundableFee": None},
+                    "context": {
+                        "center": context["center"]["label"],
+                        "facility": context["facility"]["label"],
+                    },
+                    "request": {"fields": self._first_step_data(
+                        selection, prepared_facility_id,
+                    )},
+                }
+            except (PossError, requests.RequestException) as exc:
+                record("prepared", started, error=type(exc).__name__)
+                raise
+            record("prepared", started, state="ready")
+        else:
+            started = time.monotonic()
+            try:
+                table = self.timetable(selection.dataset_id, selection.activity_id,
+                                       selection.center_id, selection.facility_id, selection.book_type)
+            except (PossError, requests.RequestException) as exc:
+                record("timetable", started, error=type(exc).__name__,
+                       http_status=getattr(exc, "http_status", None))
+                raise
+            record("timetable", started, columns=len(table["columns"]))
+            started = time.monotonic()
+            slot = find_slot(table, selection.date, selection.start, selection.end)
+            if slot is None:
+                record("availability", started, state="slot_missing")
+                raise BookingAttemptError(
+                    "目标时段不在 POSS 返回的时间表中，可能日期/中心/活动不匹配",
+                    "availability", "slot_missing", events,
+                )
+            record("availability", started, available=slot["left"],
+                   facility_available=selection.facility_id in slot["availableFacilityIds"]
+                   if selection.facility_id else bool(slot["availableFacilityIds"]))
+            if selection.facility_id and selection.facility_id not in slot["availableFacilityIds"]:
+                raise BookingAttemptError(
+                    "目标 Area 已被占用或不可用；可能被他人抢先，但无法仅凭时间表断定是速度原因",
+                    "availability", "no_vacancy", events,
+                )
+            available = [court for court in slot["availableFacilityIds"]
+                         if court not in excluded_facility_ids]
+            if not available:
+                raise BookingAttemptError(
+                    "该时段没有可用 Area；可能被他人抢先，但无法仅凭时间表断定是速度原因",
+                    "availability", "no_vacancy", events,
+                )
+            started = time.monotonic()
+            events.append({"at": datetime.now(TZ).isoformat(timespec="milliseconds"),
+                           "stage": "validation", "state": "checking"})
+            if excluded_facility_ids:
+                preview = self.preview_booking(
+                    selection, table, excluded_facility_ids=excluded_facility_ids
+                )
+            else:
+                preview = self.preview_booking(selection, table)
+            record("validation", started, state="ok")
+        slot = preview["slot"]
+        facility_id = preview["facilityId"]
+        context = tree_context(
+            self.tree, selection.dataset_id, selection.activity_id,
+            selection.center_id, facility_id,
+        )
+        self._attempt_facility_label = self._booking_facility_name(context)
+        outcome = BookingOutcome(
+            status="preview" if dry_run else "started",
+            message="已生成第一步请求，未提交" if dry_run else "正在进入确认页",
+            stage="preview" if dry_run else "first_step",
+            center=preview["context"]["center"], facility=preview["context"]["facility"],
+            date=selection.date, start=selection.start, end=selection.end,
+            charge=slot["charge"], refundable_fee=slot["refundableFee"],
+            events=events,
+        )
+        if dry_run:
+            outcome.message = "dry-run：第一步请求参数已验证，未发送预订请求"
+            return outcome
+
+        if on_court_selected:
+            on_court_selected(facility_id)
+        started = time.monotonic()
+        events.append({"at": datetime.now(TZ).isoformat(timespec="milliseconds"),
+                       "stage": "first_step", "state": "sending"})
+        if on_first_step:
+            on_first_step()
+        try:
+            first = self.session.post(
+                MAKE_BOOK,
+                data=preview["request"]["fields"],
+                headers={"Referer": MAKE_BOOK, "Origin": BASE},
+                allow_redirects=False,
+                timeout=CONFIRMATION_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            record("first_step", started, error=type(exc).__name__)
+            raise
+        record("first_step", started, http_status=first.status_code,
+               redirected=first.status_code in (301, 302, 303, 307, 308))
+        if self._is_login_page(first):
+            raise SessionExpired("第一步预订被重定向到登录页")
+        if first.status_code in (301, 302, 303, 307, 308):
+            location = first.headers.get("Location")
+            if not location:
+                raise BookingError("第一步预订返回了没有 Location 的重定向")
+            first = self.session.get(urljoin(BASE, location),
+                                     headers={"Referer": MAKE_BOOK}, timeout=CONFIRMATION_TIMEOUT)
+        if first.status_code != 200:
+            raise BookingError(f"第一步预订 HTTP {first.status_code}，未执行最终提交")
+
+        started = time.monotonic()
+        events.append({"at": datetime.now(TZ).isoformat(timespec="milliseconds"),
+                       "stage": "confirmation_page", "state": "parsing"})
+        try:
+            action, method, confirmation_fields, enctype = self._parse_confirmation(first.text)
+        except BookingError as exc:
+            record("confirmation_page", started, error=type(exc).__name__)
+            if any(word in html_to_text(first.text).lower() for word in (
+                "already been booked", "not available", "cannot be booked",
+                "名額已滿", "額滿", "已被",
+            )):
+                raise BookingAttemptError(
+                    "POSS 明确拒绝了这块球场，未发送最终提交",
+                    "confirmation_page", "slot_taken", events,
+                ) from exc
+            raise
+        record("confirmation_page", started, state="ok",
+               csrf_present=bool(confirmation_fields.get("CSRFToken")))
+        outcome.stage = "confirmation_page"
+        confirmation_context = tree_context(
+            self.tree, selection.dataset_id, selection.activity_id,
+            selection.center_id, facility_id,
+        )
+        csrf = confirmation_fields.get("CSRFToken") or self.csrf
+        fields = self._confirmation_data(
+            selection, facility_id, confirmation_context, csrf
+        )
+        submit_url = urljoin(MAKE_BOOK, action or "make_book_submit.do")
+        if method != "POST":
+            raise BookingError(f"确认表单方法异常: {method}")
+        if on_final_submit:
+            on_final_submit()
+        started = time.monotonic()
+        events.append({"at": datetime.now(TZ).isoformat(timespec="milliseconds"),
+                       "stage": "final_submit", "state": "sending"})
+        try:
+            if "multipart/form-data" in enctype:
+                files = {key: (None, value) for key, value in fields.items()}
+                final = self.session.post(submit_url, files=files,
+                                          headers={"Referer": first.url, "Origin": BASE},
+                                          allow_redirects=False, timeout=FINAL_TIMEOUT)
+            else:
+                final = self.session.post(submit_url, data=fields,
+                                          headers={"Referer": first.url, "Origin": BASE},
+                                          allow_redirects=False, timeout=FINAL_TIMEOUT)
+        except requests.RequestException as exc:
+            record("final_submit", started, error=type(exc).__name__)
+            raise
+        record("final_submit", started, http_status=final.status_code,
+               redirected=final.status_code in (301, 302, 303, 307, 308))
+        if self._is_login_page(final):
+            raise SessionExpired("最终提交被重定向到登录页")
+        outcome.stage = "final_submit"
+        result = final
+        if final.status_code in (301, 302, 303, 307, 308):
+            location = final.headers.get("Location")
+            if not location:
+                return BookingOutcome(
+                    status="unknown",
+                    message="最终提交返回无目标地址的重定向，请人工确认",
+                    stage=outcome.stage,
+                    center=outcome.center,
+                    facility=outcome.facility,
+                    date=outcome.date,
+                    start=outcome.start,
+                    end=outcome.end,
+                    charge=outcome.charge,
+                    refundable_fee=outcome.refundable_fee,
+                    reason_code="missing_result_redirect",
+                    events=events,
+                )
+            result = self.session.get(urljoin(submit_url, location),
+                                      headers={"Referer": submit_url}, timeout=PAGE_TIMEOUT)
+        text = result.text or ""
+        visible = html_to_text(text)
+        lower = visible.lower()
+        failure_words = ("unsuccessful", "not successful", "not available", "already been",
+                         "cannot be booked", "失败", "額滿", "名額已滿", "已被")
+        success_words = ("successful", "booking successful", "confirmed", "成功", "已確認")
+        if result.status_code != 200:
+            status = "unknown"
+            message = f"最终提交结果页 HTTP {result.status_code}，需核对 My Record"
+            reason_code = "result_http_error"
+        elif any(word.lower() in lower for word in failure_words):
+            status = "failed"
+            matched = [word for word in failure_words if word.lower() in lower]
+            message = f"POSS 明确拒绝了这次预订（匹配：{', '.join(matched[:2])}）"
+            reason_code = ("slot_taken" if any(word in lower for word in (
+                "already been", "not available", "cannot be booked",
+                "額滿", "名額已滿", "已被",
+            )) else "server_rejected")
+        elif ("successfully" in lower and "booking" in lower) or any(
+            word.lower() in lower for word in success_words
+        ):
+            # POSS can render a generic success shell with an empty transaction
+            # when required booking fields are missing. Verify My Record before
+            # reporting a paid booking to the caller.
+            started = time.monotonic()
+            events.append({"at": datetime.now(TZ).isoformat(timespec="milliseconds"),
+                           "stage": "verify_record", "state": "checking"})
+            try:
+                verified = self._record_contains_booking(
+                    selection, outcome.center, self._attempt_facility_label
+                )
+            except (PossError, requests.RequestException) as exc:
+                record("verify_record", started, error=type(exc).__name__)
+                raise
+            record("verify_record", started, confirmed=verified)
+            status = "booked" if verified else "unknown"
+            message = ("预订成功，且已在 POSS My Record 中核实"
+                       if verified else
+                       "POSS 返回成功提示，但 My Record 没有这笔订单；不认为已下单")
+            reason_code = "confirmed" if verified else "unverified_result"
+        else:
+            status = "unknown"
+            message = "最终结果无法自动判定，请立即打开 POSS 确认，程序不会重试"
+            reason_code = "unknown_result"
+        return BookingOutcome(
+            status=status,
+            message=message,
+            stage=outcome.stage,
+            reason_code=reason_code,
+            center=outcome.center,
+            facility=outcome.facility,
+            date=outcome.date,
+            start=outcome.start,
+            end=outcome.end,
+            charge=outcome.charge,
+            refundable_fee=outcome.refundable_fee,
+            http_status=result.status_code,
+            response_url=result.url,
+            result_html=text[:10000],
+            verified=verified if "verified" in locals() else False,
+            events=events,
+        )
+
+
+def load_env(path: str = ".env") -> dict[str, str]:
+    values: dict[str, str] = {}
+    if not os.path.exists(path):
+        return values
+    with open(path, encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                values[key.strip()] = value.strip()
+    return values
+
+
+def account_ids_from_env(path: str = ".env") -> list[str]:
+    values = {**os.environ, **load_env(path)}
+    ids = ["1"] if values.get("POSS_NETID") and values.get("POSS_PASSWORD") else []
+    for key in values:
+        match = re.fullmatch(r"POSS_NETID_(\d+)", key)
+        if match and int(match.group(1)) >= 2 and values.get(key) and values.get(f"POSS_PASSWORD_{match.group(1)}"):
+            ids.append(match.group(1))
+    ids = sorted(set(ids), key=int)
+    netids = [values["POSS_NETID" if slot == "1" else f"POSS_NETID_{slot}"] for slot in ids]
+    if len(netids) != len(set(netids)):
+        raise LoginError("多个账号不能使用相同的 NetID")
+    return ids
+
+
+def client_from_env(path: str = ".env", account_id: str = "1") -> PossClient:
+    values = {**os.environ, **load_env(path)}
+    suffix = "" if account_id == "1" else f"_{account_id}"
+    netid = values.get(f"POSS_NETID{suffix}", "")
+    password = values.get(f"POSS_PASSWORD{suffix}", "")
+    fb_user_id = values.get(f"POSS_FB_USER_ID{suffix}", "657032")
+    return PossClient(netid, password, fb_user_id)
