@@ -1,0 +1,37 @@
+{
+  "processed": {
+    "18|101|151||2026-10-20|13:30|14:30|INDV": {
+      "at": 1791874195,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
+    },
+    "18|2|3||2026-10-20|13:30|14:30|INDV": {
+      "at": 1791874195,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
+    },
+    "18|2|1||2026-10-20|13:30|14:30|INDV": {
+      "at": 1791874195,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
+    },
+    "18|2|1||2026-10-20|17:30|18:30|INDV": {
+      "at": 1791874195,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
+    },
+    "18|2|3||2026-10-20|12:30|13:30|INDV": {
+      "at": 1791874195,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
+    }
+  },
+  "campaigns": {},
+  "account_activities": {},
+  "court_claims": {}
+}
