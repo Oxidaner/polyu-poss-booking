@@ -21,15 +21,15 @@ python3 -m venv .venv
 
 也可直接运行 `.venv/bin/python monitor.py --wait`。放位时刻由 `config.json` 的 `booking.lead_days`（默认提前 7 天）与 `booking.trigger_time`（默认香港时间 08:30）决定。程序不会把过期目标自动改到另一天；启动前请核对目标日期。`--dry-run` 只检查请求准备过程，不会下单。
 
-`.env` 保存登录和通知凭据，不能提交到仓库；`config.json` 保存目标和放位设置。UI 的「真实下单测试」只针对手动选中的单笔目标，和自动并行抢位是两种独立操作。此项目目前以本地运行的 `monitor.py` 为准，无需 GitHub 定时任务。
+`.env` 保存登录和通知凭据，不能提交到仓库；`config.json` 保存目标和放位设置。UI 的「真实下单测试」只针对手动选中的单笔目标，和自动并行抢位是两种独立操作。可以通过本地 `monitor.py` 或 GitHub Actions 运行自动抢位，避免两端同时抢同一组账号与目标。
 
-## GitHub Actions 备选运行方式
+## GitHub Actions 运行方式
 
 先建立**私有** GitHub 仓库，再把当前代码和未来日期的 `config.json` 推送到默认分支。不要上传 `.env`、`state.json` 或 `dumps/`；本地已有的预订状态不会自动同步到 GitHub。当前工作流 `.github/workflows/monitor.yml` 每天香港时间 08:20 尝试启动，在云端登录、预检并等到 08:30 放位；GitHub 的定时任务可能延迟，不能保证准点。不要让本地程序和云端工作流同时抢同一组账号与目标，因为两边无法共享球场占用状态。
 
 在仓库 `Settings → Secrets and variables → Actions → Repository secrets` 中分别添加 `POSS_NETID`、`POSS_PASSWORD`、`POSS_NETID_2`、`POSS_PASSWORD_2`。若需要通知，再添加相应的 `PUSHPLUS_TOKEN`、`SERVERCHAN_KEY` 或邮件凭据。密码从本机 `.env` 逐项复制到 GitHub Secret，不要放进代码或 `config.json`。
 
-代码推送后，到 `Actions → POSS Booking Backup → Run workflow` 手动触发一次。**手动触发只登录两个账号并读取余额，不会下单**；在运行日志里核对两个账号的结果。真正的定时运行读取默认分支上的 `config.json`，结束后把 `state.json` 写回仓库，以便下一次运行避开已处理的目标。每次改目标日期，先确认它的放位日尚未过去，再推送更新后的 `config.json`。
+代码推送后，到 `Actions → POSS Booking Backup → Run workflow` 手动启动。手动和定时运行都读取默认分支上的 `config.json`，登录预热、等待当天放位时间并执行抢位；运行结束后上传诊断日志，把 `state.json` 写回仓库，以便下一次运行避开已处理的目标。每次改目标日期，先确认它的放位日尚未过去，再推送更新后的 `config.json`。如当天没有放位目标，程序会直接结束；若启动时已超过放位宽限时间，则记录未发送请求的原因。
 
 ## 放位时的流程
 

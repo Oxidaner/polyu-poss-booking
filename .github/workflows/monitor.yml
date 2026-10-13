@@ -4,7 +4,7 @@ on:
   schedule:
     # 香港时间 08:20，给启动、登录和预检留出时间；GitHub 不保证准时启动。
     - cron: "20 0 * * *"
-  workflow_dispatch: # 手动触发只验证账号和余额，不提交预订。
+  workflow_dispatch: # 手动启动也执行今天的等待放位和抢位流程。
 
 permissions:
   contents: write # 保存跨次运行的预订状态
@@ -28,7 +28,7 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Verify accounts or wait for release
+      - name: Wait for release and book
         env:
           POSS_NETID: ${{ secrets.POSS_NETID }}
           POSS_PASSWORD: ${{ secrets.POSS_PASSWORD }}
@@ -48,32 +48,11 @@ jobs:
               exit 1
             fi
           done
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            python - <<'PY'
-          from poss_client import account_ids_from_env, client_from_env, transport_reason
-          import requests
-
-          for account_id in account_ids_from_env():
-              try:
-                  client = client_from_env(account_id=account_id)
-                  client.login()
-                  balance = client.deposit_balance()
-                  if balance is None:
-                      raise ValueError("balance_unknown")
-                  print(f"账号 {account_id}: 登录成功，余额 HK${balance['amount']}")
-              except Exception as exc:
-                  reason = (transport_reason(exc) if isinstance(exc, requests.RequestException)
-                            else "balance_unknown" if isinstance(exc, ValueError)
-                            else type(exc).__name__)
-                  raise SystemExit(f"账号 {account_id}: 验证失败 ({reason})") from None
-          PY
-          else
-            python -u monitor.py --wait --today-only
-          fi
+          python -u monitor.py --wait --today-only
 
       # 保存结构化抢位诊断日志，不包含凭据或原始结果页。
       - name: Upload booking diagnostics
-        if: always() && github.event_name == 'schedule'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: poss-dumps
@@ -82,7 +61,7 @@ jobs:
           retention-days: 14
 
       - name: Commit state
-        if: github.event_name == 'schedule'
+        if: always()
         run: |
           git config user.name "poss-bot"
           git config user.email "actions@github.com"
