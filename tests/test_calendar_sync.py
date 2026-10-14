@@ -6,6 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
+
 import calendar_sync
 import record_sync
 from poss_client import (PossClient, PossError, SessionExpired, active_record_bookings,
@@ -113,26 +115,25 @@ class RecordsTest(unittest.TestCase):
 
 
 class CalendarTest(unittest.TestCase):
-    def test_only_account_one_and_no_sync_if_untrusted(self):
-        data = {"accounts": {
-            "1": {"status": "ok", "bookings": [{
-                "date": "2026-10-21", "start": "13:30", "end": "14:30",
-                "venue": VENUE, "center": "Shaw Sports Complex",
-                "facility": "Badminton Court No. 5",
-            }]},
-            "2": {"status": "ok", "bookings": [{
-                "date": "2026-10-21", "start": "15:30", "end": "16:30",
-                "venue": "account 2",
-            }]},
-        }}
-        events = calendar_sync.confirmed_bookings(data)
+    def test_direct_read_uses_only_account_one(self):
+        rows = [{
+            "date": "2026-10-21", "start": "13:30", "end": "14:30",
+            "venue": VENUE, "center": "Shaw Sports Complex",
+            "facility": "Badminton Court No. 5",
+        }]
+        with patch.object(calendar_sync, "client_from_env") as client:
+            client.return_value.record_bookings.return_value = rows
+            self.assertEqual(rows, calendar_sync.local_bookings())
+            client.assert_called_once_with(str(calendar_sync.ROOT / ".env"), "1")
+            client.return_value.login.assert_called_once()
+        events = calendar_sync.confirmed_bookings(rows)
         self.assertEqual(1, len(events))
         event = next(iter(events.values()))
         self.assertEqual("1", event["account"])
         args = calendar_sync.event_args(event, "POSS 预约")
         self.assertEqual(16, len(args))
         self.assertIn(event["marker"], args[3])
-        with patch.object(calendar_sync, "remote_data", return_value=data), \
+        with patch.object(calendar_sync, "local_bookings", return_value=rows), \
                 patch.object(calendar_sync, "add_event") as add, \
                 patch.object(calendar_sync, "prune_events", return_value=0) as prune:
             calendar_sync.sync_once("POSS 预约", dry_run=True)
@@ -141,9 +142,19 @@ class CalendarTest(unittest.TestCase):
             calendar_sync.sync_once("POSS 预约")
             add.assert_called_once()
             prune.assert_called_once_with("POSS 预约", [event["marker"]])
-        data["accounts"]["1"]["status"] = "error"
-        with self.assertRaises(ValueError):
-            calendar_sync.confirmed_bookings(data)
+
+    def test_incomplete_direct_read_retries_without_changing_calendar(self):
+        with patch.object(calendar_sync, "client_from_env") as client, \
+                patch.object(calendar_sync.time, "sleep") as sleep, \
+                patch.object(calendar_sync, "add_event") as add, \
+                patch.object(calendar_sync, "prune_events") as prune:
+            client.return_value.record_bookings.side_effect = requests.ReadTimeout()
+            with self.assertRaises(requests.ReadTimeout):
+                calendar_sync.sync_once("POSS 预约")
+            self.assertEqual(3, client.call_count)
+            self.assertEqual(2, sleep.call_count)
+            add.assert_not_called()
+            prune.assert_not_called()
 
 
 if __name__ == "__main__":

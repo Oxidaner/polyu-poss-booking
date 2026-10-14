@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
-import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import requests
+
+from poss_client import LoginError, SessionExpired, client_from_env, transport_reason
 
 ROOT = Path(__file__).resolve().parent
 HONG_KONG = ZoneInfo("Asia/Hong_Kong")
@@ -87,28 +90,27 @@ end run
 """
 
 
-def git(*args: str) -> str:
-    result = subprocess.run(
-        ["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=90,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-    )
-    if result.returncode:
-        raise RuntimeError((result.stderr or result.stdout).strip())
-    return result.stdout.strip()
+def local_bookings() -> list[dict[str, str]]:
+    """Read account 1 directly; a failed page must never reach Calendar."""
+    for attempt in range(3):
+        try:
+            client = client_from_env(str(ROOT / ".env"), "1")
+            client.login()
+            return client.record_bookings()
+        except LoginError:
+            raise
+        except (SessionExpired, requests.RequestException) as exc:
+            reason = (transport_reason(exc) if isinstance(exc, requests.RequestException)
+                      else "session_expired")
+            print(f"POSS 读取失败（{reason}，第 {attempt + 1}/3 次）", file=sys.stderr, flush=True)
+            if attempt == 2:
+                raise
+            time.sleep(3 * (attempt + 1))
 
 
-def remote_data() -> dict:
-    git("fetch", "--quiet", "origin", "main")
-    revision = git("rev-parse", "refs/remotes/origin/main")
-    return json.loads(git("show", f"{revision}:bookings.json"))
-
-
-def confirmed_bookings(snapshot: dict) -> dict[str, dict]:
+def confirmed_bookings(records: list[dict[str, str]]) -> dict[str, dict]:
     bookings = {}
-    account = snapshot.get("accounts", {}).get("1", {})
-    if account.get("status") != "ok":
-        raise ValueError("账号 1 的 My Record 尚未成功完成整页核实")
-    for row in account["bookings"]:
+    for row in records:
         marker = "POSS-ID:" + hashlib.sha256(
             f"1|{row['date']}|{row['start']}|{row['end']}|{row['venue'].casefold()}".encode()
         ).hexdigest()[:24]
@@ -160,7 +162,7 @@ def prune_events(calendar_name: str, markers: list[str]) -> int:
 
 
 def sync_once(calendar_name: str, dry_run: bool = False) -> None:
-    bookings = confirmed_bookings(remote_data())
+    bookings = confirmed_bookings(local_bookings())
     if not bookings:
         print("账号 1 当前没有待同步的有效预约", flush=True)
     for booking in bookings.values():
@@ -182,7 +184,9 @@ def main() -> None:
     try:
         sync_once(args.calendar, args.dry_run)
     except (OSError, RuntimeError, ValueError, KeyError) as exc:
-        print(f"日历同步失败：{exc}", file=sys.stderr, flush=True)
+        detail = (transport_reason(exc) if isinstance(exc, requests.RequestException)
+                  else str(exc))
+        print(f"日历同步失败（{type(exc).__name__}）：{detail}", file=sys.stderr, flush=True)
         raise SystemExit(1) from exc
 
 
