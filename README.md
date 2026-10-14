@@ -51,4 +51,10 @@ UI 每约 3 秒刷新一次逐目标的预检状态、已确认/待确认球场�
 
 `no_vacancy` 表示查询时无可订球场，不足以单独证明被抢先；`read_timeout` 表示响应等待超时；`slot_taken` 表示 POSS 明确拒绝某块球场；`unknown` 表示请求可能已被处理，需到 POSS 的 `My Record` 核查。日志不会写入密码、Cookie、CSRF 或完整结果页。
 
+## Apple 日历同步
+
+在 Mac「日历」中建立一个名为「POSS 预约」的 **iCloud** 日历，并在 iPhone 上启用同一 Apple 账户的 iCloud 日历。`calendar_sync.py` 从 GitHub 默认分支和本机 `state.json` 读取已确认的 `booked` 记录；`unknown` 和失败记录不会进入日历。按账号及球场生成唯一标记，重复同步不会创建重复日程。新抢到的预约会把活动、场馆、球场与账号保存在 `state.json`，旧记录尽可能从当前配置补全名称。
+
+先运行 `.venv/bin/python calendar_sync.py --dry-run` 预览，再运行 `.venv/bin/python calendar_sync.py` 写入。macOS 首次操作日历时可能要求允许自动化访问；允许后可用 `.venv/bin/python -u calendar_sync.py --watch` 每三分钟检查一次。在这台 Mac 上已安装独立的登录后台服务 `com.oxidaner.poss-calendar`；运行日志位于 `dumps/calendar-sync.log`。Mac 需保持开机、联网并登录用户账户；无需新增 GitHub Secret。
+
 回归测试：`.venv/bin/python -m unittest discover -s tests -q`。

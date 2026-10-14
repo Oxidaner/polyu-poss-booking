@@ -711,6 +711,18 @@ def run_parallel_group(targets, config, state, args):
                                 save_state(state)
             entry.update(status=status, stage=stage, reason_code=reason, message=message)
             entry["court_id"] = current_id
+            booking = None
+            if status == "booked":
+                booking = {
+                    "account_id": account_id,
+                    "activity": selection.activity_name,
+                    "center": outcome.center or selection.center_name,
+                    "facility": outcome.facility or selection.facility_name or current_id,
+                    "facility_id": current_id,
+                    "date": selection.date,
+                    "start": selection.start,
+                    "end": selection.end,
+                }
             if status == "failed":
                 entry["attempt_failures"].append({
                     "stage": stage, "reason_code": reason, "court_id": current_id,
@@ -736,6 +748,7 @@ def run_parallel_group(targets, config, state, args):
                                 "at": int(time.time()), "status": status,
                                 "target": current_key, "reason_code": reason,
                                 "stage": stage, "run_id": run_id, "account_id": account_id,
+                                **({"booking": booking} if booking else {}),
                             }
                         else:
                             campaigns.pop(current_key, None)
@@ -764,6 +777,7 @@ def run_parallel_group(targets, config, state, args):
                                 "at": int(time.time()), "status": status,
                                 "target": current_key, "reason_code": reason,
                                 "stage": stage, "run_id": run_id, "account_id": account_id,
+                                **({"booking": booking} if booking else {}),
                             }
                         if status == "booked" or final_uncertain:
                             account_activities[activity_key] = {
@@ -775,6 +789,7 @@ def run_parallel_group(targets, config, state, args):
                             "at": int(time.time()), "status": status,
                             "reason_code": reason, "stage": stage, "run_id": run_id,
                             "account_id": account_id,
+                            **({"booking": booking} if booking else {}),
                         }
                         save_state(state)
                 completed = dict(entry, events=list(entry["events"]))

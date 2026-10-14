@@ -627,6 +627,11 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertEqual(1, len(submitted))
         self.assertEqual(1, len(state["campaigns"]))
         self.assertEqual({"booked"}, {item["status"] for item in state["processed"].values()})
+        confirmed = next(iter(state["processed"].values()))["booking"]
+        self.assertEqual("Badminton", confirmed["activity"])
+        self.assertIn(confirmed["center"], {"Kwong", "Shaw", "Shaw Practice Hall"})
+        self.assertEqual("2026-10-16", confirmed["date"])
+        self.assertEqual("1", confirmed["account_id"])
 
     def test_two_accounts_each_book_one_per_activity_without_sharing_courts(self):
         badminton = ALTERNATIVES[0]
