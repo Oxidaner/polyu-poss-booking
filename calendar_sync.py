@@ -66,7 +66,8 @@ on run argv
         set matchingCalendars to every calendar whose name is calendarName
         if (count of matchingCalendars) is not 1 then error "需要一个名为 " & calendarName & " 的日历（且名称唯一）"
         tell item 1 of matchingCalendars
-            repeat with oldEvent in (every event)
+            repeat with eventIndex from (count of every event) to 1 by -1
+                set oldEvent to event eventIndex
                 set oldDescription to description of oldEvent
                 if oldDescription contains "POSS-ID:" and (start date of oldEvent) >= (current date) then
                     set keepEvent to false
