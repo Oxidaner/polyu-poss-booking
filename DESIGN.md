@@ -1,63 +1,38 @@
-# POSS 蹲位器 设计方案 v1.0（已定稿）
+# POSS 抢位台界面设计
 
-> 状态：**已确认**。2026-09-14 grill 会话定稿，等待 timetable.json 真实样本后实施。
+参考 [VoltAgent/awesome-design-md 的 IBM DESIGN.md](https://github.com/VoltAgent/awesome-design-md/blob/main/design-md/ibm/DESIGN.md)，将其中的 Carbon 风格用于本地预约操作台。原先关于“只提醒、不代抢”的产品方案已归档到 `docs/legacy-2026-09-14-design.md`；当前抢位行为以程序和 README 为准。
 
-## 1. 目标
+## 方向
 
-监控 PolyU POSS 体育馆预订系统，一旦目标时段出现空位（有人取消），第一时间
-微信推送 + 邮件提醒用户手动去抢。**只提醒，不代抢**（用户已明确选择）。
+这是一个需要迅速读懂目标、账号、放位和执行状态的工具。用清晰的网格、方角、细线、浅灰表面和有限的蓝色引导操作。保留高密度信息，不把预订流程藏进多步向导。内容、控件和反馈都用简体中文；场馆名称和 POSS 的原始分类名称按接口显示。
 
-## 2. 已确认的全部决策
+## 视觉变量
 
-| 决策点 | 结论 |
-|---|---|
-| 部署平台 | GitHub Actions，Private 仓库，cron 每 5 分钟 |
-| 提醒渠道 | 微信推送（PushPlus 或 Server酱）+ SMTP 邮件，双通道 |
-| 认证 | **自动登录**：NetID + NetPassword 存 GitHub Secrets |
-| MFA | 无（登录仅账号密码，已实测登录表单 + 用户确认） |
-| 动作 | 只提醒，用户手动抢位 |
-| 监控范围 | X123（ctrId=151）+ X202（ctrId=152）两馆都盯 |
-| 目标时段 | **周二 12:30–18:00；周三/四/五 14:30–18:00** |
-| 轮询节奏 | 先 5 分钟，观察空位存活时间后再决定是否本地加速 |
-| 凭据安全 | NetPassword 仅存 Secrets，代码/日志不落明文 |
+| 用途 | 值 |
+| --- | --- |
+| 文字 | `#161616`，次级 `#525252` |
+| 画布 / 浅色表面 | `#ffffff` / `#f4f4f4` |
+| 分隔线 | `#e0e0e0` |
+| 主要操作、选中、焦点 | `#0f62fe`，悬停 `#0050e6` |
+| 成功 / 警告 / 失败 | `#24a148` / `#f1c21b` / `#da1e28` |
+| 字体 | IBM Plex Sans（若本机可用），Avenir Next、苹方和系统中文字体回退 |
+| 栅格 | 4px 基数；常用间距 8、12、16、24、32、48px |
+| 形状 | 容器、按钮、输入框默认方角；不用投影或装饰性渐变 |
 
-## 3. 已实测的事实（2026-09-14 探测）
+字号以 14–16px 的正文为基础，页面标题用轻字重，数字和放位时间清楚突出。成功、失败和等待状态必须同时有文字，不能只靠颜色。
 
-- 数据接口（GET，两馆各一次）：
-  ```
-  https://www40.polyu.edu.hk/starspossfbstud/secure/ui_make_book/timetable.json
-    ?CSRFToken=<token>&fbUserId=657032&bookType=INDV&dataSetId=18
-    &actvId=101&searchDate=&ctrId={151|152}&facilityId=&showCourtAreaDetails=true
-  ```
-- 裸访问 → 302 → 登录页。必须携带有效会话。
-- `/starspossfbstud/` 登录请求 301 两跳兜回 `/poss/` 统一登录页：**POSS 家族共用登录入口**。
-- 登录表单：`POST /poss/j_security_check`
-  字段：`j_username`、`j_password`、`otheruser=N`、`buttonAction=loginButton`、
-  `CSRFToken`（登录页每次加载生成，需先 GET 页面提取）
-- 表单层无 MFA 字段；会话 Cookie 为 F5 BIG-IP `TS01*` 系列 + 登录后会话标识。
+## 信息结构
 
-## 4. 架构与流程
+1. 顶部概览：目标数、下一次放位、已配置账号；状态由页面实际数据更新。
+2. 并行目标：按日期与 Activity 分组，逐行显示时段、场馆、Area、费用、分配账号。保存与清空按钮固定在组外，变更后明确提示尚未保存。
+3. 课程选择和官方时间表：四级 POSS 选择器；时间表可以横向滚动，首列与日期行保持可见。不可用但存在的时段仍允许加入未来目标。
+4. 账号、运行状态、单笔测试和 GitHub 同步：各占独立区域，危险操作有确认，结果在原处和全局反馈中可见。
+5. 左侧目录供桌面快速跳转；窄屏变为横向可滚动导航，不遮挡表单。
 
-```
-GitHub Actions (cron */5, Private repo, secrets: NetID/NetPassword/推送token/SMTP)
-  └─ monitor.py
-       ├─ ① GET /poss/secure/login/loginhome.do → 提取 CSRFToken + 种 TS cookie
-       ├─ ② POST /poss/j_security_check (NetID/NetPassword) → 建立会话
-       ├─ ③ 打开预订页提取接口用的 CSRFToken
-       ├─ ④ GET timetable.json ×2 (ctrId=151, 152)
-       ├─ ⑤ parse: 提取每个时段剩余名额
-       ├─ ⑥ 过滤: 只保留 周二12:30-18:00 / 周三四五14:30-18:00 的时段
-       ├─ ⑦ 与 state.json(回写仓库) 对比 → 新空位 → 推送+邮件
-       └─ ⑧ 容错: 登录失败/302/解析异常 → 推送「监控失明」警报，绝不静默失败
-```
+## 交互与适配
 
-- **去重**：名额 0→N 触发；空位持续存在每 30 分钟重提醒（可调）。
-- **状态持久化**：state.json 由 workflow commit 回仓库。
-
-## 5. 待办
-
-1. ⏳ 用户提供 timetable.json 的 Copy as cURL（含登录态）→ 定制解析器 ⑤
-2. 实测确认：/poss/ 会话能否直访 /starspossfbstud/ 接口（疑点，部署时验证）
-3. 实测确认：接口 CSRFToken 的下发位置（疑点，cURL 样本可解答）
-4. 用户注册 PushPlus/Server酱 + 邮箱授权码，配置 Secrets
-5. 部署 + 手动触发一次 workflow 验证全链路
+- 按钮和输入框的焦点可见；触屏主要点击区至少 44px。
+- 桌面按列阅读；窄屏目标行折为时间、场馆、账号三段，不压缩文字。
+- 时间表在手机上保持可横向滚动，不强行缩小所有日期。概览和表单在手机上单列。
+- 反馈分进行中、成功、失败、提示四种，并以文字说明保存或上传是否真正完成。
+- 页面只提供本地配置与操作。更改界面设计不改变预约请求、账号凭据或 GitHub Action 的运行策略。
