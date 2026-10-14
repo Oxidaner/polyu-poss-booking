@@ -39,6 +39,7 @@ PAGE_TIMEOUT = (3.05, 10)
 TIMETABLE_TIMEOUT = (3.05, 8)
 CONFIRMATION_TIMEOUT = (3.05, 45)
 FINAL_TIMEOUT = (3.05, 30)
+RECORD_TIMEOUT = (10, 30)
 
 UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -188,6 +189,100 @@ def html_to_text(value: str) -> str:
     value = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", value or "")
     value = re.sub(r"(?s)<[^>]+>", " ", value)
     return re.sub(r"\s+", " ", html_lib.unescape(value)).strip()
+
+
+def parse_record_page(page: str) -> tuple[list[dict[str, str]], bool]:
+    """Parse one My Record page; reject unknown layouts instead of publishing partial data."""
+    headers = re.findall(r"(?is)<th\b[^>]*>.*?</th>", page)
+    names = [html_to_text(header).lower() for header in headers]
+    if not {"transaction date", "booking", "transaction type"}.issubset(names):
+        raise PossError("My Record 表格结构已变化")
+    next_button = re.search(
+        r"""(?is)<button\b(?=[^>]*\bname\s*=\s*["']next["'])[^>]*>""", page
+    )
+    if not next_button:
+        raise PossError("My Record 缺少分页按钮")
+    has_next = not bool(re.search(r"\bdisabled\b", next_button.group(), re.I))
+    records = []
+    for row in re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", page):
+        cells = re.findall(r"(?is)<td\b[^>]*>.*?</td>", row)
+        if len(cells) < 3:
+            continue
+        kind = html_to_text(cells[2])
+        if not kind.startswith("Individual Booking"):
+            continue
+        spans = re.findall(r"(?is)<span\b[^>]*>.*?</span>", cells[1])
+        if len(spans) < 2:
+            raise PossError("My Record 预约详情缺失")
+        venue = html_to_text(spans[0])
+        slot = html_to_text(spans[1])
+        match = re.fullmatch(
+            r"(\d{1,2} [A-Za-z]{3} \d{4}) \([A-Za-z]{3}\) "
+            r"(\d{1,2}:\d{2} [AP]M) - (\d{1,2}:\d{2} [AP]M)", slot
+        )
+        if not venue or not match or not re.fullmatch(
+            r"Individual Booking(?: Transfer (?:To|From)| Refund"
+            r"(?: \(transferred booking\))?)? "
+            r"\((?:Confirmed|Cancelled|Transfered|Transferred)\)", kind
+        ):
+            raise PossError("My Record 预约日期或状态无法识别")
+        try:
+            day = datetime.strptime(match.group(1), "%d %b %Y").date().isoformat()
+            start = datetime.strptime(match.group(2), "%I:%M %p").strftime("%H:%M")
+            end = datetime.strptime(match.group(3), "%I:%M %p").strftime("%H:%M")
+            transaction_at = datetime.strptime(
+                html_to_text(cells[0]), "%d %b %Y %I:%M %p"
+            ).isoformat()
+        except ValueError as exc:
+            raise PossError("My Record 交易日期无法识别") from exc
+        parts = re.match(r"^(.*?)\s+[A-Z][A-Z0-9() ]{2,}\s+-\s+(.+)$", venue)
+        center, facility = (parts.group(1), parts.group(2)) if parts else (venue, venue)
+        records.append({
+            "date": day, "start": start, "end": end,
+            "venue": venue, "center": center, "facility": facility,
+            "transaction_at": transaction_at,
+            "status": "confirmed" if kind.endswith("(Confirmed)") else "inactive",
+        })
+    return records, has_next
+
+
+def active_record_bookings(pages: list[str]) -> list[dict[str, str]]:
+    """The newest transaction for a court and time determines its active state."""
+    latest: dict[tuple[str, str, str, str], dict[str, str]] = {}
+    for page in pages:
+        records, _ = parse_record_page(page)
+        for row in records:
+            key = (row["date"], row["start"], row["end"], row["venue"].casefold())
+            if key not in latest or row["transaction_at"] > latest[key]["transaction_at"]:
+                latest[key] = row
+    return [
+        {key: value for key, value in row.items() if key not in ("status", "transaction_at")}
+        for row in sorted(latest.values(), key=lambda r: (
+            r["date"], r["start"], r["venue"]
+        ))
+        if row["status"] == "confirmed" and row["date"] >= datetime.now(TZ).date().isoformat()
+    ]
+
+
+def record_page_before(page: str, cutoff: date) -> bool:
+    """POSS lists transactions newest first; older transactions cannot book future slots."""
+    if not {"transaction date", "booking", "transaction type"}.issubset({
+        html_to_text(header).lower()
+        for header in re.findall(r"(?is)<th\b[^>]*>.*?</th>", page)
+    }) or not re.search(r"""(?is)<button\b(?=[^>]*\bname\s*=\s*["']next["'])[^>]*>""", page):
+        raise PossError("My Record 表格或分页结构已变化")
+    timestamps = []
+    for row in re.findall(r"(?is)<tr\b[^>]*>.*?</tr>", page):
+        cells = re.findall(r"(?is)<td\b[^>]*>.*?</td>", row)
+        if len(cells) < 3:
+            continue
+        try:
+            timestamps.append(datetime.strptime(
+                html_to_text(cells[0]), "%d %b %Y %I:%M %p"
+            ).date())
+        except ValueError as exc:
+            raise PossError("My Record 交易日期无法识别") from exc
+    return bool(timestamps) and max(timestamps) < cutoff
 
 
 def parse_deposit_balance(page: str) -> str | None:
@@ -521,6 +616,27 @@ class PossClient:
             response.raise_for_status()
             amount = parse_deposit_balance(response.text)
         return {"amount": amount, "currency": "HKD"} if amount is not None else None
+
+    def record_bookings(self) -> list[dict[str, str]]:
+        """Read pages covering every still-bookable date, failing closed on partial data."""
+        pages = []
+        lead_days = booking_rule_from_message(self.page_html)["leadDays"]
+        cutoff = datetime.now(TZ).date() - timedelta(days=max(15, lead_days + 1))
+        for offset in range(0, 10000, 10):
+            response = self.session.get(
+                MY_RECORD, params={"txFirstRecord": offset, "txMaxResults": 10},
+                timeout=RECORD_TIMEOUT,
+            )
+            if self._is_login_page(response):
+                raise SessionExpired("读取 My Record 时会话已失效")
+            response.raise_for_status()
+            if record_page_before(response.text, cutoff):
+                return active_record_bookings(pages)
+            _, has_next = parse_record_page(response.text)
+            pages.append(response.text)
+            if not has_next:
+                return active_record_bookings(pages)
+        raise PossError("My Record 超过 1000 页，拒绝发布不完整列表")
 
     def _post_timetable(self, values: dict[str, Any]) -> dict[str, Any]:
         response = self.session.post(

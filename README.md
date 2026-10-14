@@ -53,8 +53,8 @@ UI 每约 3 秒刷新一次逐目标的预检状态、已确认/待确认球场�
 
 ## Apple 日历同步
 
-在 Mac「日历」中建立一个名为「POSS 预约」的 **iCloud** 日历，并在 iPhone 上启用同一 Apple 账户的 iCloud 日历。`calendar_sync.py` 从 GitHub 默认分支和本机 `state.json` 读取已确认的 `booked` 记录；`unknown` 和失败记录不会进入日历。按账号及球场生成唯一标记，重复同步不会创建重复日程。新抢到的预约会把活动、场馆、球场与账号保存在 `state.json`，旧记录尽可能从当前配置补全名称。
+在 Mac「日历」中建立一个名为「POSS 预约」的 **iCloud** 日历，并在 iPhone 上启用同一 Apple 账户的 iCloud 日历。GitHub Action 每天抢位步骤结束后分别登录各账号，分页读取 POSS `My Record`，将当前有效的未来预约写入仓库的 `bookings.json`（包含账号、场馆、球场、日期、时段和核实时间）。取消与转让的旧预约不计入有效列表；账号读取失败时保留上次记录并标记错误，不用不完整结果覆盖。Action 失败的原因可在运行日志查看，列表中不会写入密码或 Cookie。
 
-先运行 `.venv/bin/python calendar_sync.py --dry-run` 预览，再运行 `.venv/bin/python calendar_sync.py` 写入。macOS 首次操作日历时可能要求允许自动化访问；允许后可用 `.venv/bin/python -u calendar_sync.py --watch` 每三分钟检查一次。在这台 Mac 上已安装独立的登录后台服务 `com.oxidaner.poss-calendar`；运行日志位于 `dumps/calendar-sync.log`。Mac 需保持开机、联网并登录用户账户；无需新增 GitHub Secret。
+`calendar_sync.py` 每天 09:00（当前 Mac 时区为香港同区时间）只从 GitHub 的 `bookings.json` 同步**账号 1**到专用日历；账号 2 不进入日历。账号 1 当天抓取失败时不更改日历。脚本会复用已有预约事件，删除已取消、已转让以及先前误同步的账号 2 未来事件；过去的事件保留。先运行 `.venv/bin/python calendar_sync.py --dry-run` 预览，再运行 `.venv/bin/python calendar_sync.py` 写入。macOS 首次操作日历可能要求允许自动化访问。后台任务配置见 `com.oxidaner.poss-calendar.plist`，日志位于 `dumps/calendar-sync.log`。Mac 需保持开机、联网并登录用户账户；无需新增 GitHub Secret。若 GitHub Action 在 09:00 后才完成，本次同步使用仓库上次核实的列表，次日再更新。
 
 回归测试：`.venv/bin/python -m unittest discover -s tests -q`。

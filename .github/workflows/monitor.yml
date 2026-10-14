@@ -50,6 +50,15 @@ jobs:
           done
           python -u monitor.py --wait --today-only
 
+      - name: Refresh confirmed bookings from POSS
+        if: always()
+        env:
+          POSS_NETID: ${{ secrets.POSS_NETID }}
+          POSS_PASSWORD: ${{ secrets.POSS_PASSWORD }}
+          POSS_NETID_2: ${{ secrets.POSS_NETID_2 }}
+          POSS_PASSWORD_2: ${{ secrets.POSS_PASSWORD_2 }}
+        run: python -u record_sync.py
+
       # 保存结构化抢位诊断日志，不包含凭据或原始结果页。
       - name: Upload booking diagnostics
         if: always()
@@ -66,6 +75,7 @@ jobs:
           git config user.name "poss-bot"
           git config user.email "actions@github.com"
           if [ -f state.json ]; then git add state.json; fi
+          if [ -f bookings.json ]; then git add bookings.json; fi
           if git diff --cached --quiet; then
             echo "状态无变化，跳过提交"
           else

@@ -8,7 +8,6 @@ import json
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,7 +16,6 @@ ROOT = Path(__file__).resolve().parent
 HONG_KONG = ZoneInfo("Asia/Hong_Kong")
 CALENDAR_NAME = "POSS 预约"
 
-# The marker lives in Calendar, so restarts and local state resets cannot duplicate events.
 ADD_EVENT = """
 on run argv
     set calendarName to item 1 of argv
@@ -35,6 +33,12 @@ on run argv
             if (count of (every event whose description contains eventMarker)) > 0 then
                 return "exists"
             end if
+            repeat with oldEvent in (every event whose start date is startDate)
+                if (end date of oldEvent is endDate) and (description of oldEvent contains "账号：1") and (summary of oldEvent contains item 16 of argv) then
+                    set description of oldEvent to (description of oldEvent) & return & eventMarker
+                    return "adopted"
+                end if
+            end repeat
             make new event with properties {summary:eventTitle, start date:startDate, end date:endDate, location:eventLocation, description:eventDescription}
         end tell
     end tell
@@ -52,6 +56,35 @@ on makeDate(parts)
 end makeDate
 """
 
+PRUNE_EVENTS = """
+on run argv
+    set calendarName to item 1 of argv
+    set validMarkers to {}
+    if (count of argv) > 1 then set validMarkers to items 2 thru -1 of argv
+    set removed to 0
+    tell application "Calendar"
+        set matchingCalendars to every calendar whose name is calendarName
+        if (count of matchingCalendars) is not 1 then error "需要一个名为 " & calendarName & " 的日历（且名称唯一）"
+        tell item 1 of matchingCalendars
+            repeat with oldEvent in (every event)
+                set oldDescription to description of oldEvent
+                if oldDescription contains "POSS-ID:" and (start date of oldEvent) >= (current date) then
+                    set keepEvent to false
+                    repeat with marker in validMarkers
+                        if oldDescription contains (contents of marker) then set keepEvent to true
+                    end repeat
+                    if not keepEvent then
+                        delete oldEvent
+                        set removed to removed + 1
+                    end if
+                end if
+            end repeat
+        end tell
+    end tell
+    return removed
+end run
+"""
+
 
 def git(*args: str) -> str:
     result = subprocess.run(
@@ -63,66 +96,22 @@ def git(*args: str) -> str:
     return result.stdout.strip()
 
 
-def remote_data() -> tuple[dict, dict]:
+def remote_data() -> dict:
     git("fetch", "--quiet", "origin", "main")
     revision = git("rev-parse", "refs/remotes/origin/main")
-    config = json.loads(git("show", f"{revision}:config.json"))
-    try:
-        state = json.loads(git("show", f"{revision}:state.json"))
-    except RuntimeError as exc:
-        if "does not exist in" not in str(exc) and "exists on disk, but not in" not in str(exc):
-            raise
-        state = {}
-    return state, config
+    return json.loads(git("show", f"{revision}:bookings.json"))
 
 
-def _target_details(parts: list[str], config: dict) -> tuple[str, str, str]:
-    fallback = ("", "", "")
-    for target in config.get("booking", {}).get("targets", []):
-        identity = [
-            str(target.get("datasetId") or "18"), str(target.get("activityId") or ""),
-            str(target.get("centerId") or ""), str(target.get("facilityId") or ""),
-            str(target.get("date") or ""), str(target.get("from") or target.get("start") or ""),
-            str(target.get("to") or target.get("end") or ""), str(target.get("bookType") or "INDV"),
-        ]
-        labels = (str(target.get("activity") or target.get("activityName") or ""),
-                  str(target.get("center") or target.get("centerName") or ""),
-                  str(target.get("facility") or target.get("facilityName") or ""))
-        if identity == parts[:8]:
-            return labels
-        if identity[:3] == parts[:3]:
-            fallback = labels
-    return fallback
-
-
-def confirmed_bookings(state: dict, config: dict) -> dict[str, dict]:
+def confirmed_bookings(snapshot: dict) -> dict[str, dict]:
     bookings = {}
-    for section in ("processed", "campaigns"):
-        for key, row in state.get(section, {}).items():
-            if row.get("status") != "booked":
-                continue
-            target_key = row.get("target") or key
-            parts = target_key.split("|")
-            if len(parts) not in (8, 9):
-                continue
-            account = str(row.get("account_id") or row.get("booking", {}).get("account_id") or "1")
-            marker = "POSS-ID:" + hashlib.sha256(
-                f"{account}|{target_key}".encode("utf-8")
-            ).hexdigest()[:24]
-            activity, center, facility = _target_details(parts, config)
-            snapshot = row.get("booking") or {}
-            court = parts[8].removeprefix("court:") if len(parts) == 9 else parts[3]
-            bookings[marker] = {
-                "marker": marker,
-                "account": account,
-                "activity": snapshot.get("activity") or activity or f"Activity {parts[1]}",
-                "center": snapshot.get("center") or center or f"Center {parts[2]}",
-                "facility": snapshot.get("facility") or facility or court,
-                "court_id": snapshot.get("facility_id") or court,
-                "date": snapshot.get("date") or parts[4],
-                "start": snapshot.get("start") or parts[5],
-                "end": snapshot.get("end") or parts[6],
-            }
+    account = snapshot.get("accounts", {}).get("1", {})
+    if account.get("status") != "ok":
+        raise ValueError("账号 1 的 My Record 尚未成功完成整页核实")
+    for row in account["bookings"]:
+        marker = "POSS-ID:" + hashlib.sha256(
+            f"1|{row['date']}|{row['start']}|{row['end']}|{row['venue'].casefold()}".encode()
+        ).hexdigest()[:24]
+        bookings[marker] = {**row, "marker": marker, "account": "1"}
     return bookings
 
 
@@ -137,16 +126,15 @@ def event_args(booking: dict, calendar_name: str) -> list[str]:
         end += timedelta(days=1)
     local_start = start.astimezone()
     local_end = end.astimezone()
-    description = (f"POSS 已确认预约\n账号：{booking['account']}\n"
-                   f"球场编号：{booking['court_id']}\n{booking['marker']}")
+    description = f"POSS 已确认预约\n账号：1\n{booking['marker']}"
     return [
-        calendar_name, f"{booking['activity']} · {booking['center']} · {booking['facility']}",
+        calendar_name, f"POSS · {booking['venue']}",
         booking["center"], description,
         *[str(value) for value in (local_start.year, local_start.month, local_start.day,
                                    local_start.hour, local_start.minute)],
         *[str(value) for value in (local_end.year, local_end.month, local_end.day,
                                    local_end.hour, local_end.minute)],
-        booking["marker"],
+        booking["marker"], booking["facility"],
     ]
 
 
@@ -160,43 +148,41 @@ def add_event(booking: dict, calendar_name: str) -> str:
     return result.stdout.strip().splitlines()[-1]
 
 
+def prune_events(calendar_name: str, markers: list[str]) -> int:
+    result = subprocess.run(
+        ["osascript", "-", calendar_name, *markers],
+        input=PRUNE_EVENTS, capture_output=True, text=True, timeout=90,
+    )
+    if result.returncode:
+        raise RuntimeError((result.stderr or result.stdout).strip())
+    return int(result.stdout.strip().splitlines()[-1])
+
+
 def sync_once(calendar_name: str, dry_run: bool = False) -> None:
-    state, config = remote_data()
-    bookings = {}
-    local_state = ROOT / "state.json"
-    if local_state.exists():
-        with local_state.open(encoding="utf-8") as handle:
-            bookings.update(confirmed_bookings(json.load(handle), config))
-    bookings.update(confirmed_bookings(state, config))
+    bookings = confirmed_bookings(remote_data())
     if not bookings:
-        print("没有已确认预约", flush=True)
+        print("账号 1 当前没有待同步的有效预约", flush=True)
     for booking in bookings.values():
         if dry_run:
             print(f"待同步：{booking['date']} {booking['start']}-{booking['end']} "
-                  f"{booking['activity']} {booking['center']} "
-                  f"{booking['facility']} · 账号 {booking['account']}", flush=True)
+                  f"{booking['venue']} · 账号 1", flush=True)
         else:
             result = add_event(booking, calendar_name)
-            print(f"{result}: {booking['date']} {booking['activity']} "
-                  f"{booking['center']} · 账号 {booking['account']}", flush=True)
+            print(f"{result}: {booking['date']} {booking['venue']} · 账号 1", flush=True)
+    if not dry_run:
+        print(f"移除 {prune_events(calendar_name, list(bookings))} 条过期日历预约", flush=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="将 POSS 已确认预约同步到 Mac 日历")
     parser.add_argument("--calendar", default=CALENDAR_NAME, help="已创建的 iCloud 日历名称")
-    parser.add_argument("--watch", action="store_true", help="每三分钟同步一次")
     parser.add_argument("--dry-run", action="store_true", help="只显示待同步的预约")
     args = parser.parse_args()
-    while True:
-        try:
-            sync_once(args.calendar, args.dry_run)
-        except (OSError, RuntimeError, ValueError, KeyError) as exc:
-            print(f"日历同步失败：{exc}", file=sys.stderr, flush=True)
-            if not args.watch:
-                raise SystemExit(1) from exc
-        if not args.watch:
-            break
-        time.sleep(180)
+    try:
+        sync_once(args.calendar, args.dry_run)
+    except (OSError, RuntimeError, ValueError, KeyError) as exc:
+        print(f"日历同步失败：{exc}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

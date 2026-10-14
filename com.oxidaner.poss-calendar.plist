@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.oxidaner.poss-calendar</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/oxidaner/polyu/polyu_poss/.venv/bin/python</string>
+        <string>-u</string>
+        <string>/Users/oxidaner/polyu/polyu_poss/calendar_sync.py</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardErrorPath</key>
+    <string>/Users/oxidaner/polyu/polyu_poss/dumps/calendar-sync.log</string>
+    <key>StandardOutPath</key>
+    <string>/Users/oxidaner/polyu/polyu_poss/dumps/calendar-sync.log</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/oxidaner/polyu/polyu_poss</string>
+</dict>
+</plist>
