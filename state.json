@@ -67,6 +67,36 @@
       "status": "failed",
       "reason_code": "missed_release_window",
       "stage": "schedule"
+    },
+    "18|101|151||2026-10-22|15:30|16:30|INDV": {
+      "at": 1792039502,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
+    },
+    "18|2|1||2026-10-22|14:30|15:30|INDV": {
+      "at": 1792039502,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
+    },
+    "18|2|1||2026-10-22|15:30|16:30|INDV": {
+      "at": 1792039502,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
+    },
+    "18|2|1||2026-10-22|16:30|17:30|INDV": {
+      "at": 1792039502,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
+    },
+    "18|2|3||2026-10-22|13:30|14:30|INDV": {
+      "at": 1792039502,
+      "status": "failed",
+      "reason_code": "missed_release_window",
+      "stage": "schedule"
     }
   },
   "campaigns": {
