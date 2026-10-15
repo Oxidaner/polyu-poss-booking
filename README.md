@@ -31,6 +31,17 @@ python3 -m venv .venv
 
 代码推送后，到 `Actions → POSS Booking Backup → Run workflow` 手动启动。手动和定时运行都读取默认分支上的 `config.json`，登录预热、等待当天放位时间并执行抢位；运行结束后上传诊断日志，把 `state.json` 写回仓库，以便下一次运行避开已处理的目标。每次改目标日期，先确认它的放位日尚未过去，再推送更新后的 `config.json`。如当天没有放位目标，程序会直接结束；若启动时已超过放位宽限时间，则记录未发送请求的原因。
 
+## Cloudflare 免费定时触发
+
+`cloudflare/worker.mjs` 只在 Cron 事件中调用 GitHub `workflow_dispatch`；不接收网页请求，也不接触 POSS 密码。`cloudflare/wrangler.jsonc` 按 UTC 每天 00:15（香港时间 08:15）触发。它绕过 GitHub 的 `schedule` 事件，但 GitHub Runner 仍可能排队。Cloudflare Workers Free 提供 Cron Triggers；仓库私有，GitHub Actions 的运行分钟数仍计入账户额度。
+
+1. 在 GitHub `Settings → Developer settings → Personal access tokens → Fine-grained tokens` 创建令牌，仅授权 `Oxidaner/polyu-poss-booking`，Repository permissions 中只将 `Actions` 设为 `Read and write`。记录到期日并在到期前更换；过期后 Worker 会记录 GitHub API 错误。令牌只输入到 Cloudflare secret，不写入仓库或本地文件。
+2. 在 Cloudflare 免费账户登录 Wrangler：`npx --yes wrangler@4.151.0 login`。在项目根目录运行 `npx --yes wrangler@4.151.0 deploy --config cloudflare/wrangler.jsonc`。首次部署会创建 Worker，Cron 配置可能需要最多 15 分钟传播。
+3. 运行 `npx --yes wrangler@4.151.0 secret put GITHUB_DISPATCH_TOKEN --config cloudflare/wrangler.jsonc`，在隐藏输入提示中粘贴令牌。不要通过命令参数、`wrangler.jsonc` 或 `config.json` 保存令牌。
+4. 在 Cloudflare Worker 的 Cron Triggers 页面确认 `15 0 * * *` 已启用。在下一个放位日，确认 08:15 左右出现 `workflow_dispatch` 的 Actions 运行，且在 08:30 前看到 POSS 登录成功。验证通过后，再删除 `.github/workflows/monitor.yml` 里的 GitHub `schedule`，保留手动 `workflow_dispatch` 作为备用。
+
+若目标日期的放位日不是当天，`--today-only` 会直接跳过；外部触发不会自动把目标日期顺延。两边同时自动启动时，工作流并发组会顺序执行，但第二个运行可能在放位后才报告错过窗口。
+
 ## 放位时的流程
 
 1. 提前登录并保持会话；距离放位约 3 分钟和约 1 分钟时刷新连接。预热 TLS/网络错误按 30 秒重试，不退出等待进程。
