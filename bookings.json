@@ -3,24 +3,8 @@
   "accounts": {
     "1": {
       "status": "ok",
-      "checked_at": "2026-10-15T12:45:06+08:00",
+      "checked_at": "2026-10-16T12:36:16+08:00",
       "bookings": [
-        {
-          "date": "2026-10-15",
-          "start": "13:30",
-          "end": "14:30",
-          "venue": "Shaw Sports Complex BMT05 - Badminton Court No. 5",
-          "center": "Shaw Sports Complex",
-          "facility": "Badminton Court No. 5"
-        },
-        {
-          "date": "2026-10-16",
-          "start": "16:30",
-          "end": "17:30",
-          "venue": "Block X - X123 Fitness Room XFIT (X123) - X123 Fitness Room",
-          "center": "Block X - X123 Fitness Room",
-          "facility": "X123 Fitness Room"
-        },
         {
           "date": "2026-10-19",
           "start": "15:30",
@@ -57,16 +41,8 @@
     },
     "2": {
       "status": "ok",
-      "checked_at": "2026-10-15T12:45:12+08:00",
+      "checked_at": "2026-10-16T12:36:22+08:00",
       "bookings": [
-        {
-          "date": "2026-10-17",
-          "start": "17:30",
-          "end": "18:30",
-          "venue": "Block X - X123 Fitness Room XFIT (X123) - X123 Fitness Room",
-          "center": "Block X - X123 Fitness Room",
-          "facility": "X123 Fitness Room"
-        },
         {
           "date": "2026-10-19",
           "start": "11:30",
