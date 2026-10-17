@@ -1,10 +1,7 @@
 name: POSS Booking Backup
 
 on:
-  schedule:
-    # 香港时间 08:20，给启动、登录和预检留出时间；GitHub 不保证准时启动。
-    - cron: "20 0 * * *"
-  workflow_dispatch: # 手动启动也执行今天的等待放位和抢位流程。
+  workflow_dispatch: # Cloudflare Cron 和手动启动都执行今天的等待放位和抢位流程。
 
 permissions:
   contents: write # 保存跨次运行的预订状态

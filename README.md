@@ -25,11 +25,11 @@ python3 -m venv .venv
 
 ## GitHub Actions 运行方式
 
-先建立**私有** GitHub 仓库，再把当前代码和未来日期的 `config.json` 推送到默认分支。不要上传 `.env`、`state.json` 或 `dumps/`；本地已有的预订状态不会自动同步到 GitHub。当前工作流 `.github/workflows/monitor.yml` 每天香港时间 08:20 尝试启动，在云端登录、预检并等到 08:30 放位；GitHub 的定时任务可能延迟，不能保证准点。不要让本地程序和云端工作流同时抢同一组账号与目标，因为两边无法共享球场占用状态。
+先建立**私有** GitHub 仓库，再把当前代码和未来日期的 `config.json` 推送到默认分支。不要上传 `.env`、`state.json` 或 `dumps/`；本地已有的预订状态不会自动同步到 GitHub。Cloudflare Cron 在约定时间通过 `workflow_dispatch` 启动 `.github/workflows/monitor.yml`，在云端登录、预检并等待放位；工作流不再使用 GitHub 的 `schedule`。不要让本地程序和云端工作流同时抢同一组账号与目标，因为两边无法共享球场占用状态。
 
 在仓库 `Settings → Secrets and variables → Actions → Repository secrets` 中分别添加 `POSS_NETID`、`POSS_PASSWORD`、`POSS_NETID_2`、`POSS_PASSWORD_2`。若需要通知，再添加相应的 `PUSHPLUS_TOKEN`、`SERVERCHAN_KEY` 或邮件凭据。密码从本机 `.env` 逐项复制到 GitHub Secret，不要放进代码或 `config.json`。
 
-代码推送后，到 `Actions → POSS Booking Backup → Run workflow` 手动启动。手动和定时运行都读取默认分支上的 `config.json`，登录预热、等待当天放位时间并执行抢位；运行结束后上传诊断日志，把 `state.json` 写回仓库，以便下一次运行避开已处理的目标。每次改目标日期，先确认它的放位日尚未过去，再推送更新后的 `config.json`。如当天没有放位目标，程序会直接结束；若启动时已超过放位宽限时间，则记录未发送请求的原因。
+Cloudflare Cron 会自动触发；需要即时执行时，也可以到 `Actions → POSS Booking Backup → Run workflow` 手动启动。两种运行都读取默认分支上的 `config.json`，登录预热、等待当天放位时间并执行抢位；运行结束后上传诊断日志，把 `state.json` 写回仓库，以便下一次运行避开已处理的目标。每次改目标日期，先确认它的放位日尚未过去，再推送更新后的 `config.json`。如当天没有放位目标，程序会直接结束；若启动时已超过放位宽限时间，则记录未发送请求的原因。
 
 ## Cloudflare 免费定时触发
 
@@ -38,9 +38,9 @@ python3 -m venv .venv
 1. 在 GitHub `Settings → Developer settings → Personal access tokens → Fine-grained tokens` 创建令牌，仅授权 `Oxidaner/polyu-poss-booking`，Repository permissions 中只将 `Actions` 设为 `Read and write`。记录到期日并在到期前更换；过期后 Worker 会记录 GitHub API 错误。令牌只输入到 Cloudflare secret，不写入仓库或本地文件。
 2. 在 Cloudflare 免费账户登录 Wrangler：`npx --yes wrangler@4.151.0 login`。在项目根目录运行 `npx --yes wrangler@4.151.0 deploy --config cloudflare/wrangler.jsonc`。首次部署会创建 Worker，Cron 配置可能需要最多 15 分钟传播。
 3. 运行 `npx --yes wrangler@4.151.0 secret put GITHUB_DISPATCH_TOKEN --config cloudflare/wrangler.jsonc`，在隐藏输入提示中粘贴令牌。不要通过命令参数、`wrangler.jsonc` 或 `config.json` 保存令牌。
-4. 在 Cloudflare Worker 的 Cron Triggers 页面确认 `15 0 * * *` 已启用。在下一个放位日，确认 08:15 左右出现 `workflow_dispatch` 的 Actions 运行，且在 08:30 前看到 POSS 登录成功。验证通过后，再删除 `.github/workflows/monitor.yml` 里的 GitHub `schedule`，保留手动 `workflow_dispatch` 作为备用。
+4. 在 Cloudflare Worker 的 Cron Triggers 页面确认 `15 0 * * *` 已启用。在下一个放位日，确认 08:15 左右出现 `workflow_dispatch` 的 Actions 运行，且在 08:30 前看到 POSS 登录成功。GitHub 工作流仅保留 `workflow_dispatch`，手动启动仍可作为备用。
 
-若目标日期的放位日不是当天，`--today-only` 会直接跳过；外部触发不会自动把目标日期顺延。两边同时自动启动时，工作流并发组会顺序执行，但第二个运行可能在放位后才报告错过窗口。
+若目标日期的放位日不是当天，`--today-only` 会直接跳过；外部触发不会自动把目标日期顺延。若手动重复启动，工作流并发组会顺序执行，但第二个运行可能在放位后才报告错过窗口。
 
 ## 放位时的流程
 
