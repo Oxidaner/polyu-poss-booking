@@ -61,6 +61,7 @@ python3 -m venv .venv
 UI 每约 3 秒刷新一次逐目标的预检状态、已确认/待确认球场数、失败阶段及请求耗时。统计来自本次运行的结构化日志；若程序尚未启动或放位日已过，会分别显示待启动或放位已过。
 
 `no_vacancy` 表示查询时无可订球场，不足以单独证明被抢先；`read_timeout` 表示响应等待超时；`slot_taken` 表示 POSS 明确拒绝某块球场；`unknown` 表示请求可能已被处理，需到 POSS 的 `My Record` 核查。日志不会写入密码、Cookie、CSRF 或完整结果页。
+HTTP 拒绝或结果不明时，可在对应事件中查看 `response_hint`（固定词匹配，`unclassified` 表示无法识别）、`content_type`、`body_bytes`、`body_sha256` 和 `redirect_target`；跳转后的结果页另记 `result_page`。相同页面指纹有助于比较多账号是否遇到同一种响应，但不能单凭指纹断定拒绝原因。日志不记录响应原文、完整 URL 或跳转参数。
 
 ## Apple 日历同步
 

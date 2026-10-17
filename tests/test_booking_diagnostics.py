@@ -1501,6 +1501,30 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertEqual(4, raised.exception.retry_after)
         self.assertEqual(1, c.session.posts)
 
+    def test_rejected_response_logs_safe_evidence_at_timetable_and_first_step(self):
+        cases = (
+            ("timetable", 403, "Access denied", "access_denied"),
+            ("first_step", 403, "Access denied", "access_denied"),
+            ("first_step", 500, "Internal Server Error", "server_busy"),
+        )
+        for stage, status, message, hint in cases:
+            with self.subTest(stage=stage, status=status):
+                private_text = f"<html>{message} user=private-netid token=private-token</html>"
+                response = Response(status, private_text)
+                response.headers["Content-Type"] = "text/html; charset=UTF-8"
+                c = client(responses=[response])
+                if stage == "timetable":
+                    c.timetable = lambda *_args: c._post_timetable({"searchDate": ""})
+                with self.assertRaises(BookingAttemptError) as raised:
+                    c.book(SELECTION)
+                event = next(e for e in raised.exception.events if e["stage"] == stage
+                             and "http_status" in e)
+                self.assertEqual(status, event["http_status"])
+                self.assertEqual(hint, event["response_hint"])
+                self.assertEqual("text/html", event["content_type"])
+                self.assertEqual(16, len(event["body_sha256"]))
+                self.assertNotIn("private-", json.dumps(raised.exception.events))
+
     def test_timetable_rate_limit_uses_server_wait(self):
         c = client(responses=[Response(429, retry_after="7")])
         with self.assertRaises(TimetableError) as raised:
@@ -1638,6 +1662,30 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertEqual("unknown", outcome.status)
         self.assertEqual("result_http_error", outcome.reason_code)
         self.assertEqual(2, c.session.posts)
+
+    def test_unknown_final_redirect_logs_result_fingerprint_without_url_or_body(self):
+        confirmation = (
+            '<form action="make_book_submit.do" method="post">'
+            '<input name="boMakeBookFacilities[0].facilityId" value="1601">'
+            '<input name="CSRFToken" value="next-token"></form>'
+        )
+        c = client(responses=[
+            Response(200, confirmation),
+            Response(302, location="make_book_result.do?token=private-token"),
+            Response(200, "<html>Unclear result for private-netid</html>"),
+        ])
+        c._record_contains_booking = lambda *_args: False
+        with patch("poss_client.time.sleep"):
+            outcome = c.book(SELECTION)
+        self.assertEqual("unknown", outcome.status)
+        final = next(e for e in outcome.events if e["stage"] == "final_submit"
+                     and "http_status" in e)
+        result = next(e for e in outcome.events if e["stage"] == "result_page")
+        self.assertEqual("booking_result", final["redirect_target"])
+        self.assertEqual(200, result["http_status"])
+        self.assertEqual("unclassified", result["response_hint"])
+        self.assertEqual(16, len(result["body_sha256"]))
+        self.assertNotIn("private-", json.dumps(outcome.events))
 
     def test_first_step_timeout_is_not_assumed_to_be_a_safe_retry(self):
         c = client(responses=[requests.ReadTimeout("secret=abc")])

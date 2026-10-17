@@ -9,6 +9,7 @@ JSON keys or empty HTML selects.
 
 from __future__ import annotations
 
+import hashlib
 import html as html_lib
 import json
 import os
@@ -20,7 +21,7 @@ from decimal import Decimal
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from typing import Any, Callable
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
 
@@ -62,10 +63,12 @@ class SessionExpired(PossError):
 
 class TimetableError(PossError):
     def __init__(self, message: str, http_status: int | None = None,
-                 retry_after: float | None = None):
+                 retry_after: float | None = None,
+                 response_info: dict[str, Any] | None = None):
         super().__init__(message)
         self.http_status = http_status
         self.retry_after = retry_after
+        self.response_info = response_info or {}
 
 
 class BookingError(PossError):
@@ -189,6 +192,44 @@ def html_to_text(value: str) -> str:
     value = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", value or "")
     value = re.sub(r"(?s)<[^>]+>", " ", value)
     return re.sub(r"\s+", " ", html_lib.unescape(value)).strip()
+
+
+def response_diagnostics(response) -> dict[str, Any]:
+    """Keep response evidence without recording private page text or URLs."""
+    text = response.text or ""
+    body = text.encode("utf-8", errors="replace")
+    visible = html_to_text(text).lower()
+    hints = (
+        ("rate_limit", ("too many requests", "rate limit", "request limit")),
+        ("access_denied", ("access denied", "you have been blocked", "forbidden")),
+        ("server_busy", ("service unavailable", "server is busy", "internal server error")),
+        ("session_expired", ("session expired", "please log in", "please login")),
+        ("slot_taken", ("already been booked", "not available", "名額已滿", "額滿")),
+    )
+    hint = next((name for name, phrases in hints
+                 if any(phrase in visible for phrase in phrases)), "unclassified")
+    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+    info = {
+        "body_bytes": len(body),
+        "body_sha256": hashlib.sha256(body).hexdigest()[:16] if body else None,
+        "content_type": content_type if content_type in (
+            "text/html", "text/plain", "application/json",
+        ) else "other",
+        "response_hint": hint,
+    }
+    if response.status_code in (301, 302, 303, 307, 308):
+        location = response.headers.get("Location")
+        if not location:
+            target = "missing"
+        else:
+            parsed = urlparse(urljoin(BASE, location))
+            path = parsed.path.lower()
+            target = ("external" if parsed.hostname != urlparse(BASE).hostname
+                      else "login" if "login" in path
+                      else "booking_result" if "result" in path
+                      else "booking" if "make_book" in path else "other")
+        info["redirect_target"] = target
+    return info
 
 
 def parse_record_page(page: str) -> tuple[list[dict[str, str]], bool]:
@@ -659,6 +700,7 @@ class PossClient:
                 http_status=response.status_code,
                 retry_after=retry_after_seconds(response.headers.get("Retry-After"))
                 if response.status_code in (429, 503) else None,
+                response_info=response_diagnostics(response),
             )
         try:
             return response.json()
@@ -999,7 +1041,9 @@ class PossClient:
                                        selection.center_id, selection.facility_id, selection.book_type)
             except (PossError, requests.RequestException) as exc:
                 record("timetable", started, error=type(exc).__name__,
-                       http_status=getattr(exc, "http_status", None))
+                       http_status=getattr(exc, "http_status", None),
+                       retry_after_s=getattr(exc, "retry_after", None),
+                       **getattr(exc, "response_info", {}))
                 raise
             record("timetable", started, columns=len(table["columns"]))
             started = time.monotonic()
@@ -1074,7 +1118,8 @@ class PossClient:
             record("first_step", started, error=type(exc).__name__)
             raise
         record("first_step", started, http_status=first.status_code,
-               redirected=first.status_code in (301, 302, 303, 307, 308))
+               redirected=first.status_code in (301, 302, 303, 307, 308),
+               **response_diagnostics(first))
         if self._is_login_page(first):
             raise SessionExpired("第一步预订被重定向到登录页")
         if first.status_code in (301, 302, 303, 307, 308):
@@ -1135,7 +1180,8 @@ class PossClient:
             record("final_submit", started, error=type(exc).__name__)
             raise
         record("final_submit", started, http_status=final.status_code,
-               redirected=final.status_code in (301, 302, 303, 307, 308))
+               redirected=final.status_code in (301, 302, 303, 307, 308),
+               **response_diagnostics(final))
         if self._is_login_page(final):
             raise SessionExpired("最终提交被重定向到登录页")
         outcome.stage = "final_submit"
@@ -1159,6 +1205,10 @@ class PossClient:
                 )
             result = self.session.get(urljoin(submit_url, location),
                                       headers={"Referer": submit_url}, timeout=PAGE_TIMEOUT)
+        if result is not final:
+            events.append({"at": datetime.now(TZ).isoformat(timespec="milliseconds"),
+                           "stage": "result_page", "http_status": result.status_code,
+                           **response_diagnostics(result)})
         text = result.text or ""
         visible = html_to_text(text)
         lower = visible.lower()
