@@ -972,18 +972,14 @@ class PossClient:
             if outcome.status == "unknown" and any(
                 event.get("stage") == "final_submit" for event in events
             ):
-                if self._reconcile_record(selection, events):
+                if outcome.reason_code == "unknown_result":
+                    outcome.status = "failed"
+                    outcome.message = "结果页无法识别；按失败继续其他目标，未在抢位路径等待 My Record"
+                    events.append({"stage": "reconcile_record", "state": "skipped",
+                                   "reason": "unknown_result"})
+                elif self._reconcile_record(selection, events):
                     outcome.status, outcome.reason_code = "booked", "confirmed"
                     outcome.message, outcome.verified = "My Record 已确认这笔订单", True
-                elif outcome.reason_code == "unknown_result":
-                    checks = [event for event in events
-                              if event.get("stage") == "reconcile_record"]
-                    outcome.status = "failed"
-                    outcome.message = (
-                        "结果页无法识别，My Record 核查失败；按失败继续其他目标"
-                        if any("error" in check for check in checks)
-                        else "结果页无法识别，My Record 三次未发现订单；继续其他目标"
-                    )
             return outcome
         except BookingAttemptError:
             raise

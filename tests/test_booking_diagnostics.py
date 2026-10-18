@@ -1725,7 +1725,7 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertTrue(result.verified)
         self.assertEqual(2, c.session.posts)
 
-    def test_unrecognized_result_is_failed_after_record_checks_with_safe_clues(self):
+    def test_unrecognized_result_releases_other_targets_without_record_wait(self):
         confirmation = (
             '<form action="make_book_submit.do" method="post">'
             '<input name="boMakeBookFacilities[0].facilityId" value="1601">'
@@ -1733,36 +1733,20 @@ class BookingDiagnosticsTest(unittest.TestCase):
         )
         denial = '<html><div>Exceeded the maximum number of bookings</div>' + confirmation
         c = client(responses=[Response(200, confirmation), Response(200, denial)])
-        c._record_contains_booking = lambda *_args: False
-        with patch("poss_client.time.sleep"):
-            result = c.book(SELECTION)
+        def must_not_check_record(*_args):
+            raise AssertionError("unknown_result must not block other final submits")
+        c._record_contains_booking = must_not_check_record
+        result = c.book(SELECTION)
         self.assertEqual("failed", result.status)
         self.assertEqual("unknown_result", result.reason_code)
-        self.assertEqual(3, len([e for e in result.events
-                                 if e["stage"] == "reconcile_record"]))
+        self.assertEqual([{"stage": "reconcile_record", "state": "skipped",
+                           "reason": "unknown_result"}],
+                         [e for e in result.events if e["stage"] == "reconcile_record"])
         detail = next(e for e in result.events if e["stage"] == "final_submit"
                       and "http_status" in e)
         self.assertEqual("booking_limit", detail["response_hint"])
         self.assertTrue(detail["confirmation_form"])
         self.assertNotIn("Exceeded the maximum", json.dumps(result.events))
-
-    def test_unrecognized_result_with_failed_record_checks_continues(self):
-        confirmation = (
-            '<form action="make_book_submit.do" method="post">'
-            '<input name="boMakeBookFacilities[0].facilityId" value="1601"></form>'
-        )
-        c = client(responses=[Response(200, confirmation),
-                              Response(200, "<html>Unclear result</html>")])
-        def unavailable(*_args):
-            raise requests.ReadTimeout()
-        c._record_contains_booking = unavailable
-        with patch("poss_client.time.sleep"):
-            result = c.book(SELECTION)
-        self.assertEqual("failed", result.status)
-        self.assertEqual("unknown_result", result.reason_code)
-        self.assertEqual(3, len([e for e in result.events
-                                 if e["stage"] == "reconcile_record" and e["error"] == "ReadTimeout"]))
-        self.assertEqual(2, c.session.posts)
 
     def test_final_http_error_is_not_treated_as_definitive_rejection(self):
         confirmation = (
