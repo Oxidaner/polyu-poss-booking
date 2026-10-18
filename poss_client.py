@@ -204,6 +204,10 @@ def response_diagnostics(response) -> dict[str, Any]:
         ("access_denied", ("access denied", "you have been blocked", "forbidden")),
         ("server_busy", ("service unavailable", "server is busy", "internal server error")),
         ("session_expired", ("session expired", "please log in", "please login")),
+        ("booking_limit", ("maximum number of bookings", "booking quota",
+                           "booking limit", "too many bookings", "預訂次數")),
+        ("insufficient_balance", ("insufficient balance", "insufficient deposit",
+                                  "not enough deposit", "餘額不足", "余额不足")),
         ("slot_taken", ("already been booked", "not available", "名額已滿", "額滿")),
     )
     hint = next((name for name, phrases in hints
@@ -216,6 +220,7 @@ def response_diagnostics(response) -> dict[str, Any]:
             "text/html", "text/plain", "application/json",
         ) else "other",
         "response_hint": hint,
+        "confirmation_form": "boMakeBookFacilities[0].facilityId" in text,
     }
     if response.status_code in (301, 302, 303, 307, 308):
         location = response.headers.get("Location")
@@ -966,9 +971,19 @@ class PossClient:
             )
             if outcome.status == "unknown" and any(
                 event.get("stage") == "final_submit" for event in events
-            ) and self._reconcile_record(selection, events):
-                outcome.status, outcome.reason_code = "booked", "confirmed"
-                outcome.message, outcome.verified = "My Record 已确认这笔订单", True
+            ):
+                if self._reconcile_record(selection, events):
+                    outcome.status, outcome.reason_code = "booked", "confirmed"
+                    outcome.message, outcome.verified = "My Record 已确认这笔订单", True
+                elif outcome.reason_code == "unknown_result":
+                    checks = [event for event in events
+                              if event.get("stage") == "reconcile_record"]
+                    outcome.status = "failed"
+                    outcome.message = (
+                        "结果页无法识别，My Record 核查失败；按失败继续其他目标"
+                        if any("error" in check for check in checks)
+                        else "结果页无法识别，My Record 三次未发现订单；继续其他目标"
+                    )
             return outcome
         except BookingAttemptError:
             raise

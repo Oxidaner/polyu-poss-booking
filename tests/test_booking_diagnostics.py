@@ -252,6 +252,84 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertEqual({"unknown", "booked"},
                          {item["status"] for item in state["campaigns"].values()})
 
+    def test_unrecognized_result_keeps_other_badminton_targets_running(self):
+        first = {**ALTERNATIVES[0], "facilityId": "court-a"}
+        second = {**ALTERNATIVES[1], "facilityId": "court-b"}
+        cfg = {"booking": {"enabled": True, "targets": [first, second],
+                           "burst_seconds": 0, "retry_interval": 3}}
+        state, reports, snapshots = {"processed": {}}, [], []
+        first_started = threading.Event()
+
+        class FakeClient:
+            def book(self, selection, on_court_selected=None, on_final_submit=None,
+                     **_kwargs):
+                court = "court-a" if selection.center_id == "3" else "court-b"
+                on_court_selected(court)
+                if court == "court-b":
+                    self_assert = first_started.wait(timeout=2)
+                    if not self_assert:
+                        raise AssertionError("first submit never started")
+                on_final_submit()
+                if court == "court-a":
+                    first_started.set()
+                    return BookingOutcome("failed", "record absent",
+                                          stage="final_submit", reason_code="unknown_result")
+                return BookingOutcome("booked", "confirmed",
+                                      stage="final_submit", reason_code="confirmed")
+
+        with patch.object(monitor, "load_config", return_value=cfg), \
+                patch.object(monitor, "load_state", return_value=state), \
+                patch.object(monitor, "save_state", side_effect=lambda value: snapshots.append(
+                    json.loads(json.dumps(value)))), \
+                patch.object(monitor, "report_attempt", side_effect=reports.append), \
+                patch.object(monitor, "notify"), \
+                patch.object(monitor, "client_from_env", side_effect=lambda *_: FakeClient()):
+            monitor.run(SimpleNamespace(force=True, dry_run=False, wait=False))
+
+        self.assertEqual({"failed", "booked"}, {r["status"] for r in reports})
+        self.assertEqual("booked", state["account_activities"]["1|2026-10-16|18|2"]["status"])
+        self.assertEqual("failed", state["campaigns"][monitor._court_key(first, "court-a")]["status"])
+        self.assertEqual("booked", state["campaigns"][monitor._court_key(second, "court-b")]["status"])
+        self.assertEqual(2, len(state["court_claims"]))
+        self.assertTrue(any(
+            row["status"] == "final_sent"
+            for snapshot in snapshots for row in snapshot["campaigns"].values()
+        ))
+
+    def test_previous_unknown_result_does_not_block_other_target_on_restart(self):
+        first = {**ALTERNATIVES[0], "facilityId": "court-a"}
+        second = {**ALTERNATIVES[1], "facilityId": "court-b"}
+        cfg = {"booking": {"enabled": True, "targets": [first, second],
+                           "burst_seconds": 0}}
+        first_key = monitor._court_key(first, "court-a")
+        state = {
+            "processed": {first_key: {"status": "unknown", "stage": "final_submit",
+                                     "reason_code": "unknown_result", "account_id": "1"}},
+            "account_activities": {"1|2026-10-16|18|2": {
+                "status": "unknown", "court_key": first_key}},
+        }
+        attempted = []
+
+        class FakeClient:
+            def book(self, selection, on_court_selected=None, on_final_submit=None,
+                     **_kwargs):
+                on_court_selected(selection.facility_id)
+                on_final_submit()
+                attempted.append(selection.center_id)
+                return BookingOutcome("booked", "confirmed", reason_code="confirmed")
+
+        with patch.object(monitor, "load_config", return_value=cfg), \
+                patch.object(monitor, "load_state", return_value=state), \
+                patch.object(monitor, "save_state"), \
+                patch.object(monitor, "report_attempt"), \
+                patch.object(monitor, "notify"), \
+                patch.object(monitor, "client_from_env", side_effect=lambda *_: FakeClient()):
+            monitor.run(SimpleNamespace(force=True, dry_run=False, wait=False))
+
+        self.assertEqual(["1"], attempted)
+        self.assertEqual("failed", state["processed"][first_key]["status"])
+        self.assertEqual("booked", state["account_activities"]["1|2026-10-16|18|2"]["status"])
+
     def test_final_submit_gate_is_held_until_first_post_returns(self):
         target = ALTERNATIVES[0]
         cfg = {"booking": {"enabled": True, "targets": [target],
@@ -1647,6 +1725,45 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertTrue(result.verified)
         self.assertEqual(2, c.session.posts)
 
+    def test_unrecognized_result_is_failed_after_record_checks_with_safe_clues(self):
+        confirmation = (
+            '<form action="make_book_submit.do" method="post">'
+            '<input name="boMakeBookFacilities[0].facilityId" value="1601">'
+            '<input name="CSRFToken" value="next-token"></form>'
+        )
+        denial = '<html><div>Exceeded the maximum number of bookings</div>' + confirmation
+        c = client(responses=[Response(200, confirmation), Response(200, denial)])
+        c._record_contains_booking = lambda *_args: False
+        with patch("poss_client.time.sleep"):
+            result = c.book(SELECTION)
+        self.assertEqual("failed", result.status)
+        self.assertEqual("unknown_result", result.reason_code)
+        self.assertEqual(3, len([e for e in result.events
+                                 if e["stage"] == "reconcile_record"]))
+        detail = next(e for e in result.events if e["stage"] == "final_submit"
+                      and "http_status" in e)
+        self.assertEqual("booking_limit", detail["response_hint"])
+        self.assertTrue(detail["confirmation_form"])
+        self.assertNotIn("Exceeded the maximum", json.dumps(result.events))
+
+    def test_unrecognized_result_with_failed_record_checks_continues(self):
+        confirmation = (
+            '<form action="make_book_submit.do" method="post">'
+            '<input name="boMakeBookFacilities[0].facilityId" value="1601"></form>'
+        )
+        c = client(responses=[Response(200, confirmation),
+                              Response(200, "<html>Unclear result</html>")])
+        def unavailable(*_args):
+            raise requests.ReadTimeout()
+        c._record_contains_booking = unavailable
+        with patch("poss_client.time.sleep"):
+            result = c.book(SELECTION)
+        self.assertEqual("failed", result.status)
+        self.assertEqual("unknown_result", result.reason_code)
+        self.assertEqual(3, len([e for e in result.events
+                                 if e["stage"] == "reconcile_record" and e["error"] == "ReadTimeout"]))
+        self.assertEqual(2, c.session.posts)
+
     def test_final_http_error_is_not_treated_as_definitive_rejection(self):
         confirmation = (
             '<form action="make_book_submit.do" method="post">'
@@ -1677,13 +1794,15 @@ class BookingDiagnosticsTest(unittest.TestCase):
         c._record_contains_booking = lambda *_args: False
         with patch("poss_client.time.sleep"):
             outcome = c.book(SELECTION)
-        self.assertEqual("unknown", outcome.status)
+        self.assertEqual("failed", outcome.status)
+        self.assertEqual("unknown_result", outcome.reason_code)
         final = next(e for e in outcome.events if e["stage"] == "final_submit"
                      and "http_status" in e)
         result = next(e for e in outcome.events if e["stage"] == "result_page")
         self.assertEqual("booking_result", final["redirect_target"])
         self.assertEqual(200, result["http_status"])
         self.assertEqual("unclassified", result["response_hint"])
+        self.assertFalse(result["confirmation_form"])
         self.assertEqual(16, len(result["body_sha256"]))
         self.assertNotIn("private-", json.dumps(outcome.events))
 

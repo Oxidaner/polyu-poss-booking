@@ -280,6 +280,7 @@ def run_parallel_group(targets, config, state, args):
         raise PossError("没有配置完整的 POSS 账号")
     account_activities = state.setdefault("account_activities", {})
     claims = state.setdefault("court_claims", {})
+    migrated = False
     for court_key, row in [*campaigns.items(), *processed.items()]:
         if (row.get("status") in ("booked", "final_sent")
                 or row.get("status") == "unknown"
@@ -287,14 +288,21 @@ def run_parallel_group(targets, config, state, args):
             parts = (row.get("target") or court_key).split("|")
             if len(parts) > 4:
                 activity_key = f"{row.get('account_id', '1')}|{parts[4]}|{parts[0]}|{parts[1]}"
-                record = {
-                    "status": "booked" if row["status"] == "booked" else "unknown",
-                    "court_key": court_key,
-                }
-                if row["status"] == "booked":
-                    account_activities[activity_key] = record
+                if row["status"] == "unknown" and row.get("reason_code") == "unknown_result":
+                    row["status"] = "failed"
+                    previous = account_activities.get(activity_key, {})
+                    if previous.get("status") == "unknown" and previous.get("court_key") == court_key:
+                        account_activities.pop(activity_key)
+                    migrated = True
                 else:
-                    account_activities.setdefault(activity_key, record)
+                    record = {
+                        "status": "booked" if row["status"] == "booked" else "unknown",
+                        "court_key": court_key,
+                    }
+                    if row["status"] == "booked":
+                        account_activities[activity_key] = record
+                    else:
+                        account_activities.setdefault(activity_key, record)
                 if len(parts) == 9 and parts[8].startswith("court:"):
                     facility_id = parts[8].removeprefix("court:")
                     claim_key = f"{parts[4]}|{parts[2]}|{facility_id}|{parts[5]}|{parts[6]}"
@@ -303,6 +311,8 @@ def run_parallel_group(targets, config, state, args):
                         "facility_id": facility_id, "start": parts[5], "end": parts[6],
                         "account_id": row.get("account_id", "1"),
                     })
+    if migrated and not args.dry_run:
+        save_state(state)
     pending = [target for target in targets
                if any(account_activities.get(_account_activity(account, target_selection(target)), {}).get(
                    "status") not in ("booked", "unknown")
@@ -743,13 +753,21 @@ def run_parallel_group(targets, config, state, args):
             if claimed:
                 try:
                     with state_lock:
-                        if status in ("booked", "unknown"):
+                        if status in ("booked", "unknown") or (
+                            status == "failed" and reason == "unknown_result"
+                        ):
                             campaigns[current_key] = {
                                 "at": int(time.time()), "status": status,
                                 "target": current_key, "reason_code": reason,
                                 "stage": stage, "run_id": run_id, "account_id": account_id,
                                 **({"booking": booking} if booking else {}),
                             }
+                            if reason == "unknown_result":
+                                processed[current_key] = {
+                                    "at": int(time.time()), "status": "failed",
+                                    "reason_code": reason, "stage": stage,
+                                    "run_id": run_id, "account_id": account_id,
+                                }
                         else:
                             campaigns.pop(current_key, None)
                             if claim_key:
