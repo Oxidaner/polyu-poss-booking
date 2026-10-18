@@ -349,7 +349,6 @@ def run_parallel_group(targets, config, state, args):
 
     stops = {_account_activity(account, target_selection(target)): threading.Event()
              for target in pending for account in _eligible_accounts(target, accounts)}
-    commit_locks = {}
     state_lock = threading.Lock()
     run_id = f"{release.isoformat()}:{os.getpid()}:{time.time_ns()}"
     state["active_run"] = {"id": run_id, "release_at": release.isoformat(),
@@ -590,7 +589,6 @@ def run_parallel_group(targets, config, state, args):
             current_key = _court_key(raw, current_id) if current_id else key
             active_key = ""
             claim_key = ""
-            gate = None
             if not prepared_id:
                 entry["prepared_source"] = "timetable"
 
@@ -634,37 +632,28 @@ def run_parallel_group(targets, config, state, args):
                 }, key, account_id)
 
             def mark_final_sent():
-                nonlocal claimed, gate
+                nonlocal claimed
                 with state_lock:
-                    gate = commit_locks.setdefault(activity_key, threading.Lock())
-                gate.acquire()
-                try:
-                    with state_lock:
-                        already_done = (
-                            account_activities.get(activity_key, {}).get("status")
-                            in ("booked", "unknown")
-                            or
-                            campaigns.get(current_key, {}).get("status")
-                            in ("final_sent", "booked", "unknown")
-                            or processed.get(current_key, {}).get("status")
-                            in ("booked", "unknown")
-                        )
+                    already_done = (
+                        account_activities.get(activity_key, {}).get("status")
+                        in ("booked", "unknown")
+                        or campaigns.get(current_key, {}).get("status")
+                        in ("final_sent", "booked", "unknown")
+                        or processed.get(current_key, {}).get("status")
+                        in ("booked", "unknown")
+                    )
                     if stop.is_set() or already_done:
                         raise BookingAttemptError(
                             "该球场已提交或结果待确认，停止重复提交",
                             "final_submit", "group_stopped", [],
                         )
-                    with state_lock:
-                        campaigns[current_key] = {
-                            "at": int(time.time()), "status": "final_sent",
-                            "target": current_key, "stage": "final_submit",
-                            "run_id": run_id, "account_id": account_id,
-                        }
-                        save_state(state)
+                    campaigns[current_key] = {
+                        "at": int(time.time()), "status": "final_sent",
+                        "target": current_key, "stage": "final_submit",
+                        "run_id": run_id, "account_id": account_id,
+                    }
+                    save_state(state)
                     claimed = True
-                except BaseException:
-                    gate.release()
-                    raise
 
             retry_after = None
             status = "unknown"
@@ -703,13 +692,8 @@ def run_parallel_group(targets, config, state, args):
                     "internal_error", f"{type(exc).__name__}: 抢位流程异常",
                 )
             except BaseException:
-                # The marker is already durable at this point. Stop every
-                # sibling before releasing the gate, even for an unexpected
-                # worker-level abort, so no second final POST can slip through.
                 if claimed:
                     stop.set()
-                    gate.release()
-                    claimed = False
                 raise
             finally:
                 if active_key:
@@ -783,8 +767,6 @@ def run_parallel_group(targets, config, state, args):
                 except OSError:
                     stop.set()
                     raise
-                finally:
-                    gate.release()
             if status == "booked" or final_uncertain:
                 if status == "booked" or final_uncertain:
                     stop.set()

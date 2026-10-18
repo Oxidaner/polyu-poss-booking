@@ -330,7 +330,7 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertEqual("failed", state["processed"][first_key]["status"])
         self.assertEqual("booked", state["account_activities"]["1|2026-10-16|18|2"]["status"])
 
-    def test_final_submit_gate_is_held_until_first_post_returns(self):
+    def test_distinct_courts_can_submit_before_first_result_returns(self):
         target = ALTERNATIVES[0]
         cfg = {"booking": {"enabled": True, "targets": [target],
                            "burst_seconds": 0, "retry_interval": 3}}
@@ -379,12 +379,14 @@ class BookingDiagnosticsTest(unittest.TestCase):
                 args=(SimpleNamespace(force=False, dry_run=False, wait=True),),
             )
             runner.start()
-            self.assertTrue(first_callback.wait(timeout=2))
-            self.assertTrue(second_callback.wait(timeout=2))
-            self.assertFalse(second_posted.wait(timeout=0.1))
-            self.assertEqual([], posts)
-            release_first.set()
-            runner.join(timeout=2)
+            try:
+                self.assertTrue(first_callback.wait(timeout=2))
+                self.assertTrue(second_callback.wait(timeout=2))
+                self.assertTrue(second_posted.wait(timeout=1))
+                self.assertEqual(["court-b"], posts)
+            finally:
+                release_first.set()
+                runner.join(timeout=2)
 
         self.assertFalse(runner.is_alive())
         self.assertEqual({"court-a", "court-b"}, set(posts))
@@ -929,20 +931,25 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertEqual(1, len(notified))
         self.assertIn("Fitness", notified[0])
 
-    def test_two_explicit_areas_same_activity_stop_after_one_booking(self):
+    def test_two_explicit_areas_submit_concurrently_and_server_limits_booking(self):
         targets = [{**ALTERNATIVES[0], "facilityId": court}
                    for court in ("court-a", "court-b")]
         self.assertEqual(2, len(poss_ui.validated_targets(targets)))
         cfg = {"booking": {"enabled": True, "targets": targets, "burst_seconds": 0}}
         state, submitted = {"processed": {}}, []
         barrier = threading.Barrier(2)
+        submitted_barrier = threading.Barrier(2)
 
         class FakeClient:
             def book(self, selection, on_final_submit=None, **_kwargs):
                 barrier.wait(timeout=2)
                 on_final_submit()
                 submitted.append(selection.facility_id)
-                return BookingOutcome("booked", "confirmed", reason_code="confirmed")
+                submitted_barrier.wait(timeout=2)
+                if selection.facility_id == "court-a":
+                    return BookingOutcome("booked", "confirmed", reason_code="confirmed")
+                return BookingOutcome("failed", "booking limit",
+                                      stage="final_submit", reason_code="server_rejected")
 
         with patch.object(monitor, "load_config", return_value=cfg), \
                 patch.object(monitor, "load_state", return_value=state), \
@@ -950,8 +957,8 @@ class BookingDiagnosticsTest(unittest.TestCase):
                 patch.object(monitor, "report_attempt"), \
                 patch.object(monitor, "client_from_env", side_effect=lambda *_: FakeClient()):
             monitor.run(SimpleNamespace(force=True, dry_run=False, wait=False))
-        self.assertEqual(1, len(submitted))
-        self.assertEqual(1, len(state["campaigns"]))
+        self.assertEqual({"court-a", "court-b"}, set(submitted))
+        self.assertEqual("booked", state["account_activities"]["1|2026-10-16|18|2"]["status"])
 
     def test_any_area_books_one_prepared_court_and_restart_does_not_repeat(self):
         target = ALTERNATIVES[0]
