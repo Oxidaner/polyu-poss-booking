@@ -328,7 +328,7 @@ class BookingDiagnosticsTest(unittest.TestCase):
                 patch.object(monitor, "client_from_env", side_effect=lambda *_: FakeClient()):
             monitor.run(SimpleNamespace(force=True, dry_run=False, wait=False))
             monitor.run(SimpleNamespace(force=False, dry_run=False, wait=False))
-        self.assertEqual(["101", "2"], sorted(posts))
+        self.assertEqual(["101", "2", "2", "2"], sorted(posts))
         self.assertTrue(any(
             entry["status"] == "final_sent"
             for snapshot in snapshots for entry in snapshot["campaigns"].values()
@@ -477,6 +477,68 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertEqual(
             "booked", state["campaigns"][monitor._court_key(target, "court-b")]["status"]
         )
+
+    def test_first_attempt_on_other_court_continues_after_account_success(self):
+        first = {**ALTERNATIVES[0], "facilityId": "court-a"}
+        second = {**ALTERNATIVES[1], "facilityId": "court-b"}
+        cfg = {"booking": {"enabled": True, "targets": [first, second],
+                           "burst_seconds": 0, "retry_interval": 3}}
+
+        for pause in ("before_attempt", "before_final", "before_final_unknown"):
+            with self.subTest(pause=pause):
+                state = {"processed": {}}
+                posts = []
+                b_waiting = threading.Event()
+                a_booked = threading.Event()
+
+                class FakeClient:
+                    def book(self, selection, on_court_selected=None,
+                             on_final_submit=None, **_kwargs):
+                        is_second = selection.center_id == second["centerId"]
+                        if is_second and pause.startswith("before_final"):
+                            on_court_selected("court-b")
+                            b_waiting.set()
+                            if not a_booked.wait(timeout=2):
+                                raise AssertionError("A did not finish")
+                        else:
+                            if not is_second and not b_waiting.wait(timeout=2):
+                                raise AssertionError("B did not start")
+                            on_court_selected("court-b" if is_second else "court-a")
+                        on_final_submit()
+                        posts.append(selection.center_id)
+                        if is_second:
+                            if pause == "before_final_unknown":
+                                raise BookingAttemptError(
+                                    "timeout", "final_submit", "read_timeout", [],
+                                    uncertain=True)
+                            return BookingOutcome("failed", "account already booked",
+                                                  stage="final_submit", reason_code="slot_taken")
+                        return BookingOutcome("booked", "confirmed", reason_code="confirmed")
+
+                def warmup(_client, targets, _config, now, *_args, **_kwargs):
+                    if (pause == "before_attempt"
+                            and targets[0]["centerId"] == second["centerId"]):
+                        b_waiting.set()
+                        if not a_booked.wait(timeout=2):
+                            raise AssertionError("A did not finish")
+                    return now
+
+                def report(row):
+                    if row["status"] == "booked":
+                        a_booked.set()
+
+                with patch.object(monitor, "wait_for_nearby_release", side_effect=warmup), \
+                        patch.object(monitor, "client_from_env",
+                                     side_effect=lambda *_a, **_kw: FakeClient()), \
+                        patch.object(monitor, "save_state"), \
+                        patch.object(monitor, "report_attempt", side_effect=report):
+                    monitor.run_parallel_group(
+                        [first, second], cfg, state,
+                        SimpleNamespace(force=True, dry_run=False, wait=False))
+
+                self.assertEqual({"3", "1"}, set(posts))
+                self.assertEqual(
+                    "booked", state["account_activities"]["1|2026-10-16|18|2"]["status"])
 
     def test_definite_rejection_does_not_stop_another_target(self):
         cfg = {"booking": {"enabled": True, "targets": ALTERNATIVES[:2],
@@ -768,7 +830,7 @@ class BookingDiagnosticsTest(unittest.TestCase):
         run_group.assert_called_once()
         self.assertEqual([targets[0]], run_group.call_args.args[0])
 
-    def test_multiple_targets_stop_after_first_booking_for_activity(self):
+    def test_multiple_targets_send_initial_requests_and_keep_one_booking_per_activity(self):
         cfg = {"booking": {"enabled": True, "targets": ALTERNATIVES,
                            "burst_seconds": 0}}
         state = {"processed": {}}
@@ -780,7 +842,10 @@ class BookingDiagnosticsTest(unittest.TestCase):
                 barrier.wait(timeout=2)
                 on_final_submit()
                 submitted.append(selection.center_id)
-                return BookingOutcome("booked", "confirmed", reason_code="confirmed")
+                if selection.center_id == "3":
+                    return BookingOutcome("booked", "confirmed", reason_code="confirmed")
+                return BookingOutcome("failed", "account limit",
+                                      stage="final_submit", reason_code="server_rejected")
 
         with patch.object(monitor, "load_config", return_value=cfg), \
                 patch.object(monitor, "load_state", return_value=state), \
@@ -788,7 +853,7 @@ class BookingDiagnosticsTest(unittest.TestCase):
                 patch.object(monitor, "report_attempt"), \
                 patch.object(monitor, "client_from_env", side_effect=lambda *_: FakeClient()):
             monitor.run(SimpleNamespace(force=True, dry_run=False, wait=False))
-        self.assertEqual(1, len(submitted))
+        self.assertEqual({"3", "1", "51"}, set(submitted))
         self.assertEqual(1, len(state["campaigns"]))
         self.assertEqual({"booked"}, {item["status"] for item in state["processed"].values()})
         confirmed = next(iter(state["processed"].values()))["booking"]
@@ -822,7 +887,10 @@ class BookingDiagnosticsTest(unittest.TestCase):
                 on_court_selected(prepared_facility_id)
                 on_final_submit()
                 posts.append((self.account, selection.activity_id, prepared_facility_id))
-                return BookingOutcome("booked", "confirmed", reason_code="confirmed")
+                if prepared_facility_id in ("bad-a", "bad-b", "fit-a", "fit-b"):
+                    return BookingOutcome("booked", "confirmed", reason_code="confirmed")
+                return BookingOutcome("failed", "account limit",
+                                      stage="final_submit", reason_code="server_rejected")
 
         with patch.object(monitor, "datetime", SimpleNamespace(now=lambda _tz: release)), \
                 patch.object(monitor, "wait_for_nearby_release",
@@ -843,8 +911,8 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertEqual(8, len(clients))
         self.assertEqual({("1", "2"), ("1", "101"), ("2", "2"), ("2", "101")},
                          {(account, activity) for account, activity, _ in posts})
-        self.assertEqual(4, len(posts))
-        self.assertEqual(4, len({court for _, _, court in posts}))
+        self.assertEqual(8, len(posts))
+        self.assertEqual(8, len({court for _, _, court in posts}))
         self.assertEqual({"booked"}, {row["status"] for row in state["account_activities"].values()})
         self.assertEqual(4, len(state["court_claims"]))
 
@@ -1075,8 +1143,8 @@ class BookingDiagnosticsTest(unittest.TestCase):
                 [target], cfg, state, SimpleNamespace(force=False, dry_run=False, wait=True))
             monitor.run_parallel_group(
                 [target], cfg, state, SimpleNamespace(force=False, dry_run=False, wait=True))
-        self.assertEqual(1, len(submitted))
-        self.assertEqual(1, len(state["processed"]))
+        self.assertEqual({"a", "b", "c", "d"}, set(submitted))
+        self.assertEqual(4, len(state["processed"]))
 
     def test_any_area_and_explicit_area_do_not_double_book_same_court(self):
         wildcard = ALTERNATIVES[0]
@@ -1109,8 +1177,7 @@ class BookingDiagnosticsTest(unittest.TestCase):
             monitor.run_parallel_group(
                 [wildcard, explicit], cfg, state,
                 SimpleNamespace(force=False, dry_run=False, wait=True))
-        self.assertEqual(1, len(submitted))
-        self.assertIn(submitted[0], (("", "b"), ("a", "a")))
+        self.assertEqual({("", "b"), ("a", "a")}, set(submitted))
 
     def test_preflight_filters_court_ids_outside_selected_center(self):
         target = ALTERNATIVES[0]

@@ -582,11 +582,10 @@ def run_parallel_group(targets, config, state, args):
             return [entry]
         if not args.force and started < release:
             return []
-        if (not args.force and not args.dry_run and not raw.get("accountId")
-                and account_id != preferred.get(key) and not prepared_ids):
-            if stop.wait(0.35):
-                return []
-        if lanes > 1 and lane > 0 and not prepared_ids:
+        with state_lock:
+            known = state["prepared_courts"].get(key, {})
+            known_ids = known.get("facility_ids", []) if isinstance(known, dict) else []
+        if not prepared_ids and known_ids and not distribute(known_ids):
             entry.update(status="skipped", stage="prepared",
                          reason_code="no_assigned_court",
                          message="该通道没有分配到球场",
@@ -597,7 +596,9 @@ def run_parallel_group(targets, config, state, args):
                 0, (release + timedelta(seconds=burst) - started).total_seconds()
             )
         )
-        while not stop.is_set() and (entry["attempts"] == 0 or time.monotonic() < deadline):
+        while (entry["attempts"] == 0 or not stop.is_set()) and (
+            entry["attempts"] == 0 or time.monotonic() < deadline
+        ):
             with state_lock:
                 done_ids = {
                     court_id for court_id in cached_ids
@@ -682,14 +683,12 @@ def run_parallel_group(targets, config, state, args):
                 nonlocal claimed
                 with state_lock:
                     already_done = (
-                        account_activities.get(activity_key, {}).get("status")
-                        in ("booked", "unknown")
-                        or campaigns.get(current_key, {}).get("status")
+                        campaigns.get(current_key, {}).get("status")
                         in ("final_sent", "booked", "unknown")
                         or processed.get(current_key, {}).get("status")
                         in ("booked", "unknown")
                     )
-                    if stop.is_set() or already_done:
+                    if already_done or (entry["attempts"] > 1 and stop.is_set()):
                         raise BookingAttemptError(
                             "该球场已提交或结果待确认，停止重复提交",
                             "final_submit", "group_stopped", [],
@@ -804,11 +803,13 @@ def run_parallel_group(targets, config, state, args):
                             if claim_key:
                                 claims.pop(claim_key, None)
                         if status == "booked" or final_uncertain:
-                            account_activities[activity_key] = {
-                                "at": int(time.time()),
-                                "status": "booked" if status == "booked" else "unknown",
-                                "court_key": current_key, "run_id": run_id,
-                            }
+                            if (status == "booked" or account_activities.get(
+                                    activity_key, {}).get("status") != "booked"):
+                                account_activities[activity_key] = {
+                                    "at": int(time.time()),
+                                    "status": "booked" if status == "booked" else "unknown",
+                                    "court_key": current_key, "run_id": run_id,
+                                }
                             stop.set()
                         save_state(state)
                 except OSError:
@@ -827,11 +828,13 @@ def run_parallel_group(targets, config, state, args):
                                 **({"booking": booking} if booking else {}),
                             }
                         if status == "booked" or final_uncertain:
-                            account_activities[activity_key] = {
-                                "at": int(time.time()),
-                                "status": "booked" if status == "booked" else "unknown",
-                                "court_key": current_key, "run_id": run_id,
-                            }
+                            if (status == "booked" or account_activities.get(
+                                    activity_key, {}).get("status") != "booked"):
+                                account_activities[activity_key] = {
+                                    "at": int(time.time()),
+                                    "status": "booked" if status == "booked" else "unknown",
+                                    "court_key": current_key, "run_id": run_id,
+                                }
                         processed[current_key] = {
                             "at": int(time.time()), "status": status,
                             "reason_code": reason, "stage": stage, "run_id": run_id,
