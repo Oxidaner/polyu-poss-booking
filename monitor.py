@@ -396,6 +396,52 @@ def run_parallel_group(targets, config, state, args):
             preferred[_target_key(target)] = owner
             load[(group, owner)] = load.get((group, owner), 0) + 1
 
+    candidates_by_target = {}
+    cached_by_target = {}
+    lane_counts = {}
+    for target in pending:
+        key = _target_key(target)
+        selection = target_selection(target)
+        candidates = [account for account in _eligible_accounts(target, accounts)
+                      if account_activities.get(_account_activity(account, selection), {}).get(
+                          "status") not in ("booked", "unknown")]
+        if not target.get("accountId") and preferred.get(key) in candidates:
+            candidates.remove(preferred[key])
+            candidates.insert(0, preferred[key])
+        candidates_by_target[key] = candidates
+        cached = state.get("prepared_courts", {}).get(key, {})
+        ids = cached.get("facility_ids", []) if isinstance(cached, dict) else []
+        excluded = explicit_courts.get(key, set()) if not selection.facility_id else set()
+        cached_by_target[key] = list(dict.fromkeys(
+            str(item) for item in ids if item and str(item) not in excluded
+        ))
+        lane_counts[key] = max(1, (len(cached_by_target[key]) + len(candidates) - 1)
+                               // len(candidates)) if candidates else 1
+
+    schedule_lock = threading.Lock()
+    futures = []
+    extra_pools = []
+
+    def expand_lanes(raw, ids):
+        key = _target_key(raw)
+        candidates = candidates_by_target[key]
+        if not candidates:
+            return 1
+        desired = max(1, (len(ids) + len(candidates) - 1) // len(candidates))
+        with schedule_lock:
+            previous = lane_counts[key]
+            if desired > previous:
+                lane_counts[key] = desired
+                extra = [(raw, account, lane, desired)
+                         for lane in range(previous, desired)
+                         for index, account in enumerate(candidates)
+                         if index + lane * len(candidates) < len(ids)]
+                if extra:
+                    pool = ThreadPoolExecutor(max_workers=len(extra))
+                    extra_pools.append(pool)
+                    futures.extend(pool.submit(worker, *job) for job in extra)
+            return lane_counts[key]
+
     def worker(raw, account_id, lane=0, lanes=1):
         selection = target_selection(raw)
         key = _target_key(raw)
@@ -408,19 +454,14 @@ def run_parallel_group(targets, config, state, args):
             cached_ids = []
         cached_ids = list(dict.fromkeys(str(item) for item in cached_ids if item))
         excluded_explicit = explicit_courts.get(base_key, set()) if not selection.facility_id else set()
-        candidates = _eligible_accounts(raw, accounts)
+        candidates = candidates_by_target[key]
 
         def distribute(ids):
-            ids = [str(item) for item in ids if str(item) and str(item) not in excluded_explicit]
-            if not ids:
-                return []
-            offset = candidates.index(account_id) % len(ids)
-            ordered = ids[offset:] + ids[:offset]
-            if len(ids) <= len(candidates):
-                return ordered if lane == 0 else []
-            if len(ids) >= len(candidates) * lanes:
-                return ids[(candidates.index(account_id) * lanes + lane)::len(candidates) * lanes]
-            return ordered[lane::lanes]
+            ids = list(dict.fromkeys(
+                str(item) for item in ids if item and str(item) not in excluded_explicit
+            ))
+            offset = candidates.index(account_id) + lane * len(candidates)
+            return ids[offset:offset + 1]
 
         prepared_ids = distribute(cached_ids)
         reports = []
@@ -469,6 +510,7 @@ def run_parallel_group(targets, config, state, args):
             )["facility"] is not None]
 
         def prepare(client):
+            nonlocal lanes
             table = client.timetable(
                 selection.dataset_id, selection.activity_id, selection.center_id,
                 selection.facility_id, selection.book_type,
@@ -488,7 +530,12 @@ def run_parallel_group(targets, config, state, args):
                     "facility_ids": ids, "at": int(time.time()),
                 }
                 save_state(state)
+            lanes = expand_lanes(raw, ids)
             prepared_ids[:] = distribute(ids)
+            if lanes > 1:
+                entry["target"] = (f"{selection.activity_name} {selection.center_name} "
+                                   f"{selection.date} {selection.start}-{selection.end} "
+                                   f"Area lane {lane + 1}")
             entry["prepared_source"] = "live"
             readiness("ready", "prepare", "courts_validated", prepared_ids)
             print(f"[warmup] {selection.center_name} {selection.start}-{selection.end} "
@@ -536,13 +583,13 @@ def run_parallel_group(targets, config, state, args):
         if not args.force and started < release:
             return []
         if (not args.force and not args.dry_run and not raw.get("accountId")
-                and account_id != preferred.get(key)):
+                and account_id != preferred.get(key) and not prepared_ids):
             if stop.wait(0.35):
                 return []
         if lanes > 1 and lane > 0 and not prepared_ids:
             entry.update(status="skipped", stage="prepared",
-                         reason_code="no_second_court",
-                         message="本时段没有第二块已预备的球场",
+                         reason_code="no_assigned_court",
+                         message="该通道没有分配到球场",
                          release_lag_ms=round((datetime.now(TZ) - release).total_seconds() * 1000))
             return [entry]
         deadline = time.monotonic() + (
@@ -867,15 +914,32 @@ def run_parallel_group(targets, config, state, args):
     jobs = []
     for account_id in accounts:
         for target in pending:
-            if account_id not in _eligible_accounts(target, accounts):
+            key = _target_key(target)
+            candidates = candidates_by_target[key]
+            if account_id not in candidates:
                 continue
-            if account_activities.get(_account_activity(account_id, target_selection(target)), {}).get(
-                "status") in ("booked", "unknown"):
-                continue
-            lanes = 1 if args.force or target_selection(target).facility_id else 2
-            jobs.extend((target, account_id, lane, lanes) for lane in range(lanes))
+            lanes = lane_counts[key]
+            jobs.append((target, account_id, 0, lanes))
+            jobs.extend((target, account_id, lane, lanes)
+                        for lane in range(1, lanes)
+                        if candidates.index(account_id) + lane * len(candidates)
+                        < len(cached_by_target[key]))
     with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-        results = list(executor.map(lambda job: worker(*job), jobs))
+        with schedule_lock:
+            futures.extend(executor.submit(worker, *job) for job in jobs)
+        results = []
+        seen = set()
+        try:
+            while True:
+                with schedule_lock:
+                    batch = [future for future in futures if future not in seen]
+                    seen.update(batch)
+                if not batch:
+                    break
+                results.extend(future.result() for future in batch)
+        finally:
+            for pool in extra_pools:
+                pool.shutdown(wait=True)
     reports = [report for result in results for report in result]
     for report in reports:
         if report["status"] not in ("booked", "unknown"):

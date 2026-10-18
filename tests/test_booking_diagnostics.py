@@ -216,6 +216,90 @@ class BookingDiagnosticsTest(unittest.TestCase):
         self.assertEqual("booked", next(iter(state["campaigns"].values()))["status"])
         self.assertEqual(1, len([r for r in reports if r["status"] == "booked"]))
 
+    def test_cached_courts_allocate_one_parallel_lane_per_court_across_accounts(self):
+        target = ALTERNATIVES[0]
+        courts = [f"court-{index}" for index in range(7)]
+        cfg = {"booking": {"enabled": True, "targets": [target], "burst_seconds": 0}}
+        release = monitor.release_at(target, cfg)
+        state = {"processed": {}, "prepared_courts": {
+            monitor._target_key(target): {"facility_ids": courts, "at": 1},
+        }}
+        barrier = threading.Barrier(len(courts))
+        submitted = []
+
+        class FakeClient:
+            def __init__(self, account):
+                self.account = account
+
+            def book(self, selection, prepared_facility_id="", on_court_selected=None,
+                     on_final_submit=None, **_kwargs):
+                on_court_selected(prepared_facility_id)
+                on_final_submit()
+                submitted.append((self.account, prepared_facility_id))
+                barrier.wait(timeout=2)
+                return BookingOutcome("failed", "unrecognized", stage="final_submit",
+                                      reason_code="unknown_result")
+
+        with patch.object(monitor, "datetime", SimpleNamespace(now=lambda _tz: release)), \
+                patch.object(monitor, "wait_for_nearby_release",
+                             side_effect=lambda _client, _targets, _cfg, now, *_a, **_kw: now), \
+                patch.object(monitor, "account_ids_from_env", return_value=["1", "2"]), \
+                patch.object(monitor, "client_from_env",
+                             side_effect=lambda *_a, **kw: FakeClient(kw.get("account_id", "1"))), \
+                patch.object(monitor, "save_state"), \
+                patch.object(monitor, "report_attempt"), \
+                patch.object(monitor, "notify"):
+            monitor.run_parallel_group(
+                [target], cfg, state, SimpleNamespace(force=False, dry_run=False, wait=True))
+        self.assertEqual(set(courts), {court for _, court in submitted})
+        self.assertEqual(7, len(submitted))
+        self.assertEqual({4, 3}, {sum(account == slot for account, _ in submitted)
+                                 for slot in ("1", "2")})
+
+    def test_live_preflight_adds_lanes_before_release_without_cached_courts(self):
+        target = ALTERNATIVES[0]
+        courts = [f"live-{index}" for index in range(5)]
+        cfg = {"booking": {"enabled": True, "targets": [target], "burst_seconds": 0}}
+        release = monitor.release_at(target, cfg)
+        state, submitted = {"processed": {}}, []
+        barrier = threading.Barrier(len(courts))
+
+        class FakeClient:
+            def __init__(self, account):
+                self.account = account
+
+            def timetable(self, *_args):
+                return {"columns": [{"slots": [{
+                    "date": target["date"], "start": target["from"], "end": target["to"],
+                    "facilityIds": courts,
+                }]}]}
+
+            def book(self, selection, prepared_facility_id="", on_court_selected=None,
+                     on_final_submit=None, **_kwargs):
+                on_court_selected(prepared_facility_id)
+                on_final_submit()
+                submitted.append((self.account, prepared_facility_id))
+                barrier.wait(timeout=2)
+                return BookingOutcome("failed", "unrecognized", stage="final_submit",
+                                      reason_code="unknown_result")
+
+        def ready(client, _targets, _cfg, now, *_args, on_ready=None, **_kwargs):
+            on_ready(client)
+            return now
+
+        with patch.object(monitor, "datetime", SimpleNamespace(now=lambda _tz: release)), \
+                patch.object(monitor, "wait_for_nearby_release", side_effect=ready), \
+                patch.object(monitor, "account_ids_from_env", return_value=["1", "2"]), \
+                patch.object(monitor, "client_from_env",
+                             side_effect=lambda *_a, **kw: FakeClient(kw.get("account_id", "1"))), \
+                patch.object(monitor, "save_state"), \
+                patch.object(monitor, "report_attempt"), \
+                patch.object(monitor, "notify"):
+            monitor.run_parallel_group(
+                [target], cfg, state, SimpleNamespace(force=False, dry_run=False, wait=True))
+        self.assertEqual(set(courts), {court for _, court in submitted})
+        self.assertEqual(5, len(submitted))
+
     def test_unknown_final_submit_blocks_activity_but_not_other_activity(self):
         fitness = {**ALTERNATIVES[0], "activityId": "101", "activity": "Fitness",
                    "centerId": "152", "center": "X202"}
@@ -835,7 +919,7 @@ class BookingDiagnosticsTest(unittest.TestCase):
                 patch.object(monitor, "notify"):
             monitor.run_parallel_group(
                 targets, cfg, state, SimpleNamespace(force=False, dry_run=False, wait=True))
-        self.assertEqual({("1", "b1"), ("2", "b2")}, set(submitted))
+        self.assertEqual({("2", "b1"), ("1", "b2")}, set(submitted))
 
     def test_assigned_fitness_targets_run_only_for_their_accounts(self):
         targets = [
