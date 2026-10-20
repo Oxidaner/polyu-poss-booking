@@ -783,18 +783,18 @@ PAGE = r'''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>POSS 抢课台</title>
 <link rel="stylesheet" href="/ui.css"></head><body><div class="app-layout">
-<aside class="side" aria-label="页面导航"><div class="side-brand"><span class="mark">P</span><span><strong>POSS</strong><small>Booking console</small></span></div><nav class="side-nav" aria-label="快捷跳转"><a href="#queue"><span>01</span>并行目标</a><a href="#local"><span>02</span>本地运行</a><a href="#courses"><span>03</span>课程选择</a><a href="#timetable"><span>04</span>官方时间表</a><a href="#accounts"><span>05</span>账号与设置</a><a href="#manual"><span>06</span>单笔测试</a><a href="#github"><span>07</span>GitHub 同步</a></nav><div class="side-foot">本地管理界面<br>修改配置后再上传 GitHub</div></aside>
+<aside class="side" aria-label="页面导航"><div class="side-brand"><span class="mark">P</span><span><strong>POSS</strong><small>Booking console</small></span></div><nav class="side-nav" aria-label="快捷跳转"><a href="#queue"><span>01</span>并行目标</a><a href="#courses"><span>02</span>课程选择</a><a href="#timetable"><span>03</span>官方时间表</a><a href="#accounts"><span>04</span>账号与设置</a><a href="#github"><span>05</span>GitHub 同步</a><a href="#local"><span>06</span>本地运行</a><a href="#manual"><span>07</span>单笔测试</a></nav><div class="side-foot">本地管理界面<br>修改配置后再上传 GitHub</div></aside>
 <main class="shell">
 <header class="top"><div class="title"><span class="eyebrow">预约管理 / POSS</span><h1>抢位控制台</h1><p>多账号、多场馆并行管理 · 每个账号按 Activity 抢到一块即停止</p></div><div id="status" class="status">正在初始化</div></header>
 <section class="overview" aria-label="当前配置概览"><div class="overview-item"><span>已选目标</span><strong id="overviewTargets">0</strong><small>当前页面的目标</small></div><div class="overview-item"><span>下一次放位</span><strong id="overviewRelease">—</strong><small>香港时间</small></div><div class="overview-item"><span>已配置账号</span><strong id="overviewAccounts">0</strong><small>抢位账号</small></div></section>
 <section class="card target-section" id="queue"><div class="target-head"><div><div class="target-kicker">预约队列</div><h2>并行抢位目标</h2><p id="targetSummary">0 个目标</p></div><div class="target-actions"><button class="btn danger" id="clear">清空目标</button><button class="btn primary" id="save">保存目标</button></div></div><div id="targets" class="targets"></div><div class="target-note"><strong>分配规则</strong><span>不指定账号时自动分配；同一账号在同一天的同一种 Activity 抢到一块即停止。</span></div></section>
-<section class="card" id="local"><div class="head"><h2>本地并行抢位</h2><div class="grow"></div><span id="runnerStatus" class="status">检查中</span></div><div class="testbar"><button class="btn primary" id="startRunner">启动本地程序并等待放位</button><span id="runnerInfo">保存目标后启动；程序会在后台运行，关闭网页也会继续。</span></div><div id="runnerProgress" class="progressgrid"></div></section>
 <section class="card" id="courses"><div class="head"><h2>选择课程</h2><div class="grow"></div><button class="btn" id="reload">重新读取</button><button class="btn" id="login">重新登录</button></div><div class="toolbar">
 <div class="field"><label>Facility / Category</label><select id="dataset"></select></div><div class="field"><label>Activity 活动</label><select id="activity"></select></div><div class="field"><label>Center 中心</label><select id="center"></select></div><div class="field"><label>Area 场地</label><select id="facility"></select></div><div class="action"><button class="btn primary" id="read">读取官方时间表</button></div></div><div class="message" id="notice">正在读取 POSS 的真实选项树…</div></section>
 <section class="card" id="timetable"><div class="head"><h2>官方可订时间表</h2><div class="grow"></div><span id="caption" class="status">未读取</span></div><div class="gridbox"><div id="grid" class="empty">先选择 Activity 和 Center</div></div><div class="legend"><span><i class="dot" style="background:var(--gray)"></i>不可用</span><span><i class="dot" style="background:var(--pink)"></i>免费 / 可退押金</span><span><i class="dot" style="background:var(--blue)"></i>收费</span><span>数字 = POSS 真实可用 Area 数量</span><span>灰色目标也可以保存，等放位日再抢</span></div></section>
 <section class="card" id="accounts"><div class="head"><h2>账号与自动抢位</h2><div class="grow"></div><span id="account" class="status">检查中</span><button class="btn" id="addAccount">添加账号</button><button class="btn" id="verifyAccounts">验证账号并刷新余额</button></div><div id="accountRows"></div><div class="settings"><div class="field"><label>提前天数</label><input id="lead" type="number" min="0" max="30"></div><div class="field"><label>放位时刻</label><input id="trigger" type="time"></div></div><div style="margin-top:13px"><button class="btn primary" id="saveSettings">保存账号与设置</button></div><div class="message">保存后会逐个验证账号登录并读取 POSS 的 Deposit Balance。余额旁显示上次读取时间，可点击刷新；余额未知不会显示为 0。密码只存本机 `.env`，留空表示不改。先保存账号，再给目标指定账号；未指定的目标由程序自动分配。手动单笔测试使用目标指定账号；自动分配目标默认使用账号 1。</div></section>
-<section class="card" id="manual"><div class="head"><h2>单笔下单验证</h2><div class="grow"></div></div><div class="testbar"><strong>手动测试只对下方选中的一笔目标执行。</strong><select id="manualTarget" aria-label="选择手动测试目标"></select><button class="btn" id="preview">预览请求（不下单）</button><button class="btn danger" id="test">真实下单测试</button></div><div class="message" id="result">自动并行抢位由本地 monitor.py 程序执行；此处只验证单个目标。</div></section>
 <section class="card" id="github"><div class="head"><h2>GitHub 同步</h2><div class="grow"></div><span id="githubStatus" class="status">检查中</span></div><div class="settings"><div class="field git-remote"><label>GitHub remote（只需首次配置）</label><input id="gitRemote" placeholder="git@github.com:user/repo.git"></div><div class="field"><label>当前分支</label><input id="gitBranch" readonly></div></div><div class="testbar" style="margin-top:13px"><button class="btn" id="saveGitRemote">保存 remote</button><button class="btn primary" id="pushGitConfig">一键上传 config.json</button></div><div class="message" id="githubMessage">只会提交和推送 config.json，不会上传 `.env`、密码或其他未提交代码。Git push 使用本机已有的 SSH key 或 Git credential。</div></section>
+<section class="card" id="local"><div class="head"><h2>本地并行抢位</h2><div class="grow"></div><span id="runnerStatus" class="status">检查中</span></div><div class="testbar"><button class="btn primary" id="startRunner">启动本地程序并等待放位</button><span id="runnerInfo">保存目标后启动；程序会在后台运行，关闭网页也会继续。</span></div><div id="runnerProgress" class="progressgrid"></div></section>
+<section class="card" id="manual"><div class="head"><h2>单笔下单验证</h2><div class="grow"></div></div><div class="testbar"><strong>手动测试只对下方选中的一笔目标执行。</strong><select id="manualTarget" aria-label="选择手动测试目标"></select><button class="btn" id="preview">预览请求（不下单）</button><button class="btn danger" id="test">真实下单测试</button></div><div class="message" id="result">自动并行抢位由本地 monitor.py 程序执行；此处只验证单个目标。</div></section>
 </main></div><div id="feedback" class="feedback" role="status" aria-live="polite" hidden></div><script>
 const $=s=>document.querySelector(s);let META=null,TABLE=null,SELECTED=new Map(),CONFIG=null,ACCOUNTS=[],runnerStarting=false;
 const DOW=['日','一','二','三','四','五','六'];
@@ -974,16 +974,17 @@ $('#saveGitRemote').onclick=async()=>{
   finally{button.disabled=false}
 };
 $('#pushGitConfig').onclick=async()=>{
-  if(!confirm('只提交 config.json 并推送到当前分支，确认继续？')){feedback('已取消上传 config.json','info');return}
-  const button=$('#pushGitConfig');button.disabled=true;$('#githubMessage').textContent='正在提交并推送 config.json…';feedback('提交并推送 config.json','busy');
-  let uploaded=false;
+  if(!confirm('先保存页面上的并行目标，再上传 config.json 到当前分支，确认继续？')){feedback('已取消上传 config.json','info');return}
+  const button=$('#pushGitConfig');button.disabled=true;$('#githubMessage').textContent='正在保存目标并上传 config.json…';feedback('保存目标并上传 config.json','busy');
+  let saved=false,uploaded=false;
   try{
+    await saveTargets();saved=true;
     const r=await post('/api/github/push',{});
     uploaded=true;
     $('#githubMessage').textContent=r.github.message;$('#githubMessage').className='message';
     feedback(r.github.message,r.github.pushed?'ok':'info');
     await loadGitHubStatus();
-  }catch(e){$('#githubMessage').textContent=e.message;$('#githubMessage').className='message error';feedback((uploaded?'上传请求已完成，但状态刷新失败：':'上传未确认：')+e.message,'err')}
+  }catch(e){$('#githubMessage').textContent=e.message;$('#githubMessage').className='message error';feedback((uploaded?'上传请求已完成，但状态刷新失败：':saved?'目标已保存，但上传未确认：':'目标保存失败，未上传：')+e.message,'err')}
   finally{button.disabled=false}
 };
 $('#dataset').onchange=()=>{renderSelectors();TABLE=null;renderGrid()};
