@@ -3,16 +3,8 @@
   "accounts": {
     "1": {
       "status": "ok",
-      "checked_at": "2026-10-20T08:32:03+08:00",
+      "checked_at": "2026-10-21T08:30:54+08:00",
       "bookings": [
-        {
-          "date": "2026-10-20",
-          "start": "13:30",
-          "end": "14:30",
-          "venue": "Block X - X123 Fitness Room XFIT (X123) - X123 Fitness Room",
-          "center": "Block X - X123 Fitness Room",
-          "facility": "X123 Fitness Room"
-        },
         {
           "date": "2026-10-21",
           "start": "13:30",
@@ -44,21 +36,21 @@
           "venue": "Shaw Sports Complex BMT06 - Badminton Court No. 6",
           "center": "Shaw Sports Complex",
           "facility": "Badminton Court No. 6"
+        },
+        {
+          "date": "2026-10-28",
+          "start": "16:30",
+          "end": "17:30",
+          "venue": "Shaw Sports Complex BMT05 - Badminton Court No. 5",
+          "center": "Shaw Sports Complex",
+          "facility": "Badminton Court No. 5"
         }
       ]
     },
     "2": {
       "status": "ok",
-      "checked_at": "2026-10-20T08:32:09+08:00",
+      "checked_at": "2026-10-21T08:31:09+08:00",
       "bookings": [
-        {
-          "date": "2026-10-24",
-          "start": "16:30",
-          "end": "17:30",
-          "venue": "Shaw Sports Complex BMT06 - Badminton Court No. 6",
-          "center": "Shaw Sports Complex",
-          "facility": "Badminton Court No. 6"
-        },
         {
           "date": "2026-10-25",
           "start": "15:30",
@@ -82,6 +74,14 @@
           "venue": "Shaw Sports Complex BMT04 - Badminton Court No. 4",
           "center": "Shaw Sports Complex",
           "facility": "Badminton Court No. 4"
+        },
+        {
+          "date": "2026-10-28",
+          "start": "18:30",
+          "end": "19:30",
+          "venue": "Kwong On Jubilee Sports Centre BMT11 - Badminton Court No. 11",
+          "center": "Kwong On Jubilee Sports Centre",
+          "facility": "Badminton Court No. 11"
         }
       ]
     }
