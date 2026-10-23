@@ -31,23 +31,78 @@
 
 ## GitHub Actions + Cloudflare 自动部署
 
-云端分两部分：Cloudflare Worker 每天香港时间 **08:15** 请求 GitHub `workflow_dispatch`；GitHub Actions 读取默认分支的 `config.json`，登录、预检并等到 **08:30** 放位。Cloudflare Worker 不运行 Python 抢位程序，GitHub 工作流也没有 `schedule` 定时触发。
+**运行链路：**Cloudflare Worker 每天 **00:15 UTC / 香港 08:15** 调用 GitHub 的 `workflow_dispatch`；GitHub Actions 读取 `main` 上的 `config.json`，登录并等待香港 **08:30** 放位。Worker 只负责启动 Actions，不运行 Python 抢位程序；工作流本身没有 `schedule`。下面的图片来自实际页面（2026-10-23），只展示入口和配置名称，不包含密码或 Token 值。界面文案以后可能变化。
 
-1. 将代码和未来日期的 `config.json` 放入**私有** GitHub 仓库的 `main` 分支。本地 UI 的「一键上传 config.json」只上传目标配置；源码、README 和工作流的修改仍需用 Git 提交推送。不要上传 `.env`、本地 `state.json`、`bookings.json` 或 `dumps/`。云端工作流会自己生成并写回 `state.json` 和 `bookings.json`；后者含预约详情，所以仓库必须保持私有。
-2. 在 GitHub 仓库 `Settings → Secrets and variables → Actions → Repository secrets` 添加 `POSS_NETID`、`POSS_PASSWORD`、`POSS_NETID_2`、`POSS_PASSWORD_2`（当前工作流启动前会检查这四项）。按需添加 `PUSHPLUS_TOKEN`、`SERVERCHAN_KEY`、`SMTP_HOST`、`SMTP_USER`、`SMTP_PASS`、`MAIL_TO`；邮件端口可设为仓库变量 `SMTP_PORT`。工作流已设置 `contents: write`，内置的 `GITHUB_TOKEN` 会写回状态。账号密码只放 Secrets，不能放在 `config.json`。
-3. 在 GitHub 创建一个限定为**这个仓库**的 fine-grained personal access token，仓库权限给 `Actions: Read and write`。这是 Cloudflare 调用 `workflow_dispatch` 的凭据，和上一步的 POSS 账号 Secrets 是两套不同凭据。GitHub API 允许用工作流文件名 `monitor.yml` 触发，要求工作流支持 `workflow_dispatch` 和指定分支 `main`。
-4. 在 Cloudflare Workers 中首次打开 Workers 页面，完成账号的 `workers.dev` 子域初始化。在**项目根目录**登录并部署现有的 `cloudflare/worker.mjs`：
+### 首次配置（按顺序）
+
+1. **确认仓库和目标日期。**打开 GitHub 仓库的 `Code` 页面，确认分支为 `main`，可看到 `.github/workflows/monitor.yml`、`cloudflare/` 和 `config.json`。在本地 UI 选好**未来日期**的目标，保存并上传 `config.json`；先计算放位日：目标日期减去 `booking.lead_days`（默认 7 天）。如果放位日已经过去，云端不会替你补抢。
+
+   ![GitHub 仓库主页，显示 main 分支和项目文件](docs/images/deploy/01-github-repo.jpg)
+
+   **当前仓库显示为 Public**，且 `bookings.json` 会包含预约详情。建议先在仓库 `Settings → General → Danger Zone → Change repository visibility` 改为 Private；若要继续公开仓库，请先自行处理已有的公开预约信息。不要把 `.env`、密码或本地 `dumps/` 上传到仓库。云端运行会写回 `state.json` 和 `bookings.json`，不要用本地旧文件覆盖它们。
+
+   ![GitHub 设置显示仓库当前为 Public，以及 Change visibility 入口](docs/images/deploy/01b-github-visibility.jpg)
+
+2. **设置 GitHub 上的 POSS 账号。**进入仓库 `Settings → Secrets and variables → Actions`，在 `Repository secrets` 点 `New repository secret`。当前工作流要求分别添加 `POSS_NETID`、`POSS_PASSWORD`、`POSS_NETID_2`、`POSS_PASSWORD_2`；名称必须完全一致。每个 Secret 单独添加：`Name` 填名称，`Secret` 填相应账号/密码，点 `Add secret`。之后列表只显示名称，不能读回值；改密码时编辑对应 Secret。
+
+   ![GitHub Actions 的四个 Repository secrets 名称](docs/images/deploy/02-github-secrets.jpg)
+
+   ![New repository secret 表单示例，Secret 值保持空白](docs/images/deploy/03-github-new-secret.jpg)
+
+   通知可选：`PUSHPLUS_TOKEN`、`SERVERCHAN_KEY`、`SMTP_HOST`、`SMTP_USER`、`SMTP_PASS`、`MAIL_TO` 放在 Secrets，`SMTP_PORT` 放在 `Repository variables`。本地 UI 保存的 `.env` 不会自动同步到 GitHub。工作流自身已声明 `contents: write`，用运行时内置的 `GITHUB_TOKEN` 写回状态；这**不是**下一步发给 Cloudflare 的 Token。
+
+3. **单独创建 Cloudflare 用的 GitHub Token。**在 GitHub 个人 `Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token`：选自己的账号为 `Resource owner`，设置可辨认的名称和到期时间；`Repository access` 选 `Only select repositories` 并选择 `polyu-poss-booking`；在 `Repository permissions` 将 `Actions` 设为 `Read and write`，然后生成并**只在创建时**保存 Token。GitHub 可能要求重新验证身份，因此此处没有实际账号的 Token 表单截图；按 [GitHub 创建 fine-grained token 的官方步骤](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#creating-a-fine-grained-personal-access-token) 操作即可。不要把 Token 发到聊天、写入 README、提交到仓库，或误填进 GitHub 的 POSS Secrets。这个 Token 仅用于 Worker 调用 GitHub 的 [workflow dispatch API](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)。
+
+4. **首次初始化 Cloudflare Workers。**登录 Cloudflare，进入 `Workers & Pages`，首次打开时按页面提示创建 `workers.dev` 子域（后面仍不会给本 Worker 开通公开 HTTP 地址）。如果部署报 `10063` / `You need a workers.dev subdomain`，先完成这一步，再重新部署；已上传代码不等于 Cron 已配置成功。
+
+   ![Cloudflare Workers & Pages 页面中的 Worker 列表](docs/images/deploy/06-cloudflare-workers.jpg)
+
+5. **在 Mac 上部署 Worker 和定时规则。**需要 Node.js/npm；在本项目根目录运行以下命令。`login` 会引导浏览器授权，`deploy` 使用仓库的 `cloudflare/worker.mjs` 和 `cloudflare/wrangler.jsonc`，部署名为 `poss-booking-dispatcher` 的 Worker。
 
    ```bash
    npx --yes wrangler@4.151.0 login
    npx --yes wrangler@4.151.0 deploy --config cloudflare/wrangler.jsonc
+   ```
+
+   部署后在 `Workers & Pages` 能看到 `poss-booking-dispatcher`（见上图）。配置中只有 `scheduled()` 处理器，`workers_dev: false`，不提供公开 HTTP 路由。不要只在 Cloudflare 网页新建一个不同名字的 Worker；本教程部署的是仓库中现成的 Worker。
+
+6. **给 Worker 配置 GitHub Token。**在同一个项目根目录运行：
+
+   ```bash
    npx --yes wrangler@4.151.0 secret put GITHUB_DISPATCH_TOKEN --config cloudflare/wrangler.jsonc
    ```
 
-   把第 3 步的 token 输入最后一条命令的交互提示，不要写进源码或 `wrangler.jsonc`。Worker 只有 `scheduled()` 处理器，`workers_dev` 设为 `false`，不提供公开 HTTP 路由。Cron `15 0 * * *` 使用 **UTC**，对应香港时间每天 08:15。Cloudflare 新增或修改 Cron 后可能需要最多约 15 分钟传播；部署后在 Workers 的 Triggers 查看是否只有这一个 Cron，并确认 secret `GITHUB_DISPATCH_TOKEN` 已配置。不要重复建立另一个每日触发器。
-5. 在 GitHub `Actions → POSS Booking Backup` 查看运行。需要验证链路时可手动 `Run workflow`，但该工作流使用 `--today-only`，如果今天不是配置目标的放位日，会正常结束且不下单。正常放位日检查 Cloudflare Logs 是否记录 `GitHub workflow dispatch accepted`，随后检查 GitHub run 是否从 `workflow_dispatch` 启动；GitHub 的 `Wait for release and book` 步骤会显示预热与抢位结果，`poss-dumps` artifact 保存 14 天，可下载查看 `booking_attempts.jsonl`。若启动延迟到宽限期后，会记录 `missed_release_window`；不要把“已触发”当作“已抢到”。
+   根据终端提示输入第 3 步生成的 Token；输入不会写入源码。也可在 Cloudflare `poss-booking-dispatcher → Settings → Variables and Secrets → Add variable` 中选择**生产**、类型**密钥/Secret**、名称 `GITHUB_DISPATCH_TOKEN`，填入 Token 后保存部署。二选一即可，不需重复设置。
 
-以后改日期或场地：在 UI 添加/移除目标，确认列表后点击「一键上传 config.json」；若提示与远端相同，请先核对列表是否真的变化、是否只改了上方下拉框。Cloudflare Worker 不需要为每次配置变化重新部署，下一次触发读取 GitHub `main` 的最新配置。若修改 `cloudflare/worker.mjs` 或 `cloudflare/wrangler.jsonc`，需要重新运行上述 `wrangler deploy` 命令；单纯把源码推到 GitHub 不会更新已部署的 Worker。
+   ![Cloudflare 新增 Worker Secret 的空白值表单示例](docs/images/deploy/07b-cloudflare-secret-form.jpg)
+
+   ![Cloudflare 生产环境已有 GITHUB_DISPATCH_TOKEN，值显示为加密](docs/images/deploy/07-cloudflare-secret.jpg)
+
+7. **核对 Cron 和日志开关。**打开该 Worker 的 `Settings → Triggers/触发事件`，确认只有一个 Cron：`15 0 * * *`，即每天 **00:15 UTC / 香港 08:15**。Cloudflare 新增或修改 Cron 后可能需最多约 15 分钟传播；因此应在放位日前部署并验证。Cron 由 `wrangler.jsonc` 管理，修改时间时改文件再重新 `deploy`，不要在网页另加一个重复的触发器。
+
+   ![Cloudflare 触发事件中的每日 00:15 UTC Cron](docs/images/deploy/08b-cloudflare-cron.jpg)
+
+   当前 Worker 的 `Settings → Observability` 中 **Workers 日志处于关闭状态**。需要在 Cloudflare 查看 `GitHub workflow dispatch accepted` 或 HTTP 错误时，可自行启用日志；未开启时先以 GitHub Actions 的运行记录核对是否触发，不要以“Cloudflare 看不到日志”直接断定没有执行。
+
+   ![Cloudflare Workers 日志开关当前为关闭状态](docs/images/deploy/08-cloudflare-logs.jpg)
+
+8. **检查 GitHub 是否启动。**进入仓库 `Actions → POSS Booking Backup`，在放位日约香港 08:15 应出现新运行。页面的 `Manually run by <账号>` 是 `workflow_dispatch` 事件的显示方式；由 Cloudflare API 触发时也可能这样显示，**不代表有人手动点击**。`Run workflow` 按钮可用于排查触发链路，但工作流运行 `monitor.py --wait --today-only`：如果当天不是目标的放位日，程序会正常结束，不会试下单。
+
+   ![GitHub Actions 工作流列表及 Run workflow 入口](docs/images/deploy/09-github-actions-runs.jpg)
+
+9. **区分运行完成与抢位成功。**点开本次运行：先看 `Summary` 的启动时间，再进入 `monitor`，展开 `Wait for release and book` 检查预热、放位时间和每个目标的结果。绿色 `Success` 只表示工作流执行完成，不等于预约成功；若启动太晚，日志会出现 `missed_release_window`。`Refresh confirmed bookings from POSS` 会复查账号的 `My Record`，`Commit state` 会提交云端状态。
+
+   ![GitHub 运行概要中的时间、状态和任务](docs/images/deploy/10-github-run-summary.jpg)
+
+   ![monitor 任务的抢位、复查、上传诊断和状态提交步骤](docs/images/deploy/10b-github-job-steps.jpg)
+
+10. **下载失败原因。**在该运行的 `Summary` 底部找到 `Artifacts → poss-dumps` 下载（工作流保存 14 天），解压查看 `booking_attempts.jsonl`，逐球场确认有没有发出第一步请求、最终提交，以及 HTTP 状态、耗时和失败阶段。最终是否约上以 POSS `My Record` 的记录为准。
+
+    ![GitHub 运行概要底部的 poss-dumps 诊断附件](docs/images/deploy/10c-github-artifact.jpg)
+
+### 后续只改日期或场地
+
+在本地 UI 移除旧目标、点击新日期的时间表时段加入目标，确认目标列表无误后点「一键上传 config.json」。它只上传配置，不会重新部署 Worker，也不会立即启动一次抢位；**下次 Cloudflare Cron** 会触发 Actions 读取 `main` 的最新配置。若提示与远端相同，先核对是否真的增删了目标，而不只是改了上方筛选下拉框。首次部署之外，只有修改 `cloudflare/worker.mjs` 或 `cloudflare/wrangler.jsonc` 才需要重新执行 `wrangler deploy`；修改 Python/工作流需正常提交推送到 GitHub，不需要重部署 Worker。
 
 ## 放位时的流程
 
