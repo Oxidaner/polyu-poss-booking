@@ -41,6 +41,7 @@ from poss_client import (
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.environ.get("POSS_CONFIG_FILE", os.path.join(ROOT, "config.json"))
 TZ = timezone(timedelta(hours=8))
+LOCAL_ONLY = False
 
 _lock = threading.RLock()
 _runner_lock = threading.Lock()
@@ -428,12 +429,19 @@ def runner_status() -> dict:
     try:
         with open(RUNNER_PID_FILE, encoding="utf-8") as handle:
             pid = int(handle.read().strip())
-        os.kill(pid, 0)
-        command = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
-            capture_output=True, text=True, timeout=3,
-        )
-        running = command.returncode == 0 and os.path.join(ROOT, "monitor.py") in command.stdout
+        if os.name == "nt":
+            command = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=3,
+            )
+            running = str(pid) in command.stdout.split()
+        else:
+            os.kill(pid, 0)
+            command = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=3,
+            )
+            running = command.returncode == 0 and os.path.join(ROOT, "monitor.py") in command.stdout
     except (OSError, ValueError, subprocess.SubprocessError):
         pid, running = 0, False
     return {"running": running, "pid": pid if running else None,
@@ -615,16 +623,28 @@ def start_runner() -> dict:
         for target in targets:
             monitor._eligible_accounts(target, [row["id"] for row in accounts["accounts"]])
         os.makedirs(os.path.dirname(RUNNER_LOG_FILE), exist_ok=True)
-        python = os.path.join(ROOT, ".venv", "bin", "python")
+        python = os.path.join(
+            ROOT, ".venv", "Scripts" if os.name == "nt" else "bin",
+            "python.exe" if os.name == "nt" else "python",
+        )
         if not os.path.exists(python):
             python = sys.executable
         with open(RUNNER_LOG_FILE, "a", encoding="utf-8") as log:
             log.write(f"[ui] {now.isoformat(timespec='seconds')} 启动本地并行抢位\n")
             log.flush()
+            runner_options = {
+                "cwd": ROOT,
+                "stdin": subprocess.DEVNULL,
+                "stdout": log,
+                "stderr": subprocess.STDOUT,
+            }
+            if os.name == "nt":
+                runner_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                runner_options["start_new_session"] = True
             runner = subprocess.Popen(
                 [python, "-u", os.path.join(ROOT, "monitor.py"), "--wait"],
-                cwd=ROOT, stdin=subprocess.DEVNULL, stdout=log,
-                stderr=subprocess.STDOUT, start_new_session=True,
+                **runner_options,
             )
             if shutil.which("caffeinate"):
                 subprocess.Popen(
@@ -667,7 +687,7 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(urlparse(self.path).query)
         try:
             if path in ("/", "/index.html"):
-                body = PAGE.encode("utf-8")
+                body = render_page().encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
@@ -796,7 +816,7 @@ PAGE = r'''<!doctype html>
 <section class="card" id="local"><div class="head"><h2>本地并行抢位</h2><div class="grow"></div><span id="runnerStatus" class="status">检查中</span></div><div class="testbar"><button class="btn primary" id="startRunner">启动本地程序并等待放位</button><span id="runnerInfo">保存目标后启动；程序会在后台运行，关闭网页也会继续。</span></div><div id="runnerProgress" class="progressgrid"></div></section>
 <section class="card" id="manual"><div class="head"><h2>单笔下单验证</h2><div class="grow"></div></div><div class="testbar"><strong>手动测试只对下方选中的一笔目标执行。</strong><select id="manualTarget" aria-label="选择手动测试目标"></select><button class="btn" id="preview">预览请求（不下单）</button><button class="btn danger" id="test">真实下单测试</button></div><div class="message" id="result">自动并行抢位由本地 monitor.py 程序执行；此处只验证单个目标。</div></section>
 </main></div><div id="feedback" class="feedback" role="status" aria-live="polite" hidden></div><script>
-const $=s=>document.querySelector(s);let META=null,TABLE=null,SELECTED=new Map(),CONFIG=null,ACCOUNTS=[],runnerStarting=false;
+const LOCAL_ONLY=__LOCAL_ONLY__, $=s=>document.querySelector(s);let META=null,TABLE=null,SELECTED=new Map(),CONFIG=null,ACCOUNTS=[],runnerStarting=false;
 const DOW=['日','一','二','三','四','五','六'];
 function say(text,kind=''){const e=$('#status');e.textContent=text;e.className='status '+kind}
 function note(text,error=false){$('#notice').textContent=text;$('#notice').className='message'+(error?' error':'')}
@@ -1036,16 +1056,33 @@ $('#saveSettings').onclick=async()=>{
     feedback(`${accountsSaved?settingsSaved?'账号与设置已保存':'账号已保存，但设置未保存':'保存账号失败'}：${e.message}`,'err');
   }finally{button.disabled=false}
 };
-(async()=>{try{await loadConfig();await loadAccount();await loadGitHubStatus();await loadRunnerStatus();if(!$('#account').classList.contains('err'))await loadMeta();else note('请先填写账号和密码，再点击保存账号与设置')}catch(e){note(e.message,true)}})();
+(async()=>{try{await loadConfig();await loadAccount();if(!LOCAL_ONLY)await loadGitHubStatus();await loadRunnerStatus();if(!$('#account').classList.contains('err'))await loadMeta();else note('请先填写账号和密码，再点击保存账号与设置')}catch(e){note(e.message,true)}})();
 setInterval(loadRunnerStatus, 3000);
 </script></body></html>'''
 
 
+def render_page() -> str:
+    page = PAGE.replace("__LOCAL_ONLY__", "true" if LOCAL_ONLY else "false")
+    if LOCAL_ONLY:
+        page = page.replace("<body>", '<body class="local-only">')
+        page = page.replace(
+            "修改配置后再上传 GitHub",
+            "本地管理界面 · 配置保存在本机",
+        )
+    return page
+
+
 def main():
+    global LOCAL_ONLY
     parser = argparse.ArgumentParser(description="POSS 抢课台")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument(
+        "--local-only", action="store_true",
+        help="隐藏配置同步入口，仅使用本地配置和抢位程序",
+    )
     args = parser.parse_args()
+    LOCAL_ONLY = args.local_only
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     url = f"http://127.0.0.1:{args.port}/"
     print(f"[poss-ui] {url}")

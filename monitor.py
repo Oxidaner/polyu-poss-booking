@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import os
 import random
@@ -17,6 +16,11 @@ from email.header import Header
 from email.mime.text import MIMEText
 
 import requests
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from poss_client import (
     BookingAttemptError, PossError, Selection, SessionExpired, booking_release_at,
@@ -1006,6 +1010,32 @@ def main():
                         help="只处理今天放位的目标，供每日云端运行使用")
     args = parser.parse_args()
     os.makedirs(os.path.join(ROOT, "dumps"), exist_ok=True)
+    if os.name == "nt":
+        lock_path = os.path.join(ROOT, "dumps", "booking-runner.lock")
+        with open(lock_path, "a+b") as lock:
+            lock.seek(0, os.SEEK_END)
+            if lock.tell() == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                print("本地抢位程序已在运行，跳过重复实例", flush=True)
+                return
+            pid_path = os.path.join(ROOT, "dumps", "booking-local.pid")
+            with open(pid_path, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}\n")
+            try:
+                run(args)
+            finally:
+                try:
+                    os.unlink(pid_path)
+                except FileNotFoundError:
+                    pass
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        return
     with open(os.path.join(ROOT, "dumps", "booking-runner.lock"), "a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

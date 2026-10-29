@@ -29,6 +29,37 @@
 
 `.env` 保存登录和通知凭据，不能提交到仓库；`config.json` 保存目标和放位设置。UI 的「真实下单测试」只针对手动选中的单笔目标，和自动并行抢位是两种独立操作。可以通过本地 `monitor.py` 或 GitHub Actions 运行自动抢位，避免两端同时抢同一组账号与目标。
 
+## Windows 本地部署
+
+Windows 版直接在这台电脑上管理账号、读取 POSS 和运行本地抢位程序。无需安装 Git、Node.js 或其他服务；除已安装的 **Python 3.14** 外，所需 Python 依赖由安装脚本自动准备。
+
+### 安装与启动
+
+1. 将**完整项目文件夹**放到固定位置，例如 `D:\poss-booking`。不要只复制 `.py` 文件；`config.json`、`ui.css` 和其余项目文件都要保留。
+2. 双击项目根目录的 `install_windows.cmd`。脚本会检查 Python 3.14、创建独立的 `.venv` 并安装依赖。安装过程需要联网，结束前不要关闭窗口。
+3. 安装完成后双击 `start_windows.cmd`。程序会启动本地管理页面并尝试打开浏览器；如未自动打开，请访问 `http://127.0.0.1:8765/`。启动窗口保持打开。
+
+### 配置并抢位
+
+1. 在「账号与自动抢位」添加账号及密码并保存。程序会逐个验证账号登录并读取余额；账号密码只保存到项目目录的 `.env`。
+2. 在「选择课程」中选好 Activity 和 Center，读取官方时间表，再点击目标时段加入「并行抢位目标」。确认日期、场馆、Area 和时段无误后，点击「保存目标」。
+3. 点击「启动本地程序并等待放位」。抢位程序会在后台运行；关闭浏览器页面不会停止它。放位前保持电脑开机、联网，并保持 `start_windows.cmd` 窗口打开。
+4. 当前启动方式只使用本机的 `config.json` 和账号，不显示配置同步入口，也不会由 UI 上传配置。
+
+### 停止与日志
+
+- 停止管理页面：切换到 `start_windows.cmd` 窗口，按 `Ctrl+C`。
+- 停止后台抢位程序：双击 `stop_windows.cmd`。仅关闭浏览器或管理页面不会结束后台程序。
+- 抢位诊断日志位于 `dumps\booking_attempts.jsonl`；后台进程日志位于 `dumps\booking-local.log`。
+
+### 常见问题
+
+- **找不到 Python 3.14：**重新安装 Python 3.14，并在安装器中勾选 `Add python.exe to PATH`；再运行 `install_windows.cmd`。
+- **安装依赖失败：**确认网络可访问 Python 包服务，然后重新运行 `install_windows.cmd`；它会复用已创建的 `.venv`。
+- **网页无法打开：**确认启动窗口仍在运行，并访问 `http://127.0.0.1:8765/`。如果端口已被占用，关闭占用该端口的程序后重试。
+- **连接 POSS 时提示无法连接代理：**如果代理软件已关闭，检查 Windows 环境变量是否还配置了失效的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或对应的小写变量。可在 PowerShell 用 `Get-ChildItem Env:*proxy*` 查看当前终端代理变量；仅当不需要代理时，再用 `Remove-Item Env:HTTP_PROXY,Env:HTTPS_PROXY,Env:ALL_PROXY,Env:http_proxy,Env:https_proxy,Env:all_proxy -ErrorAction SilentlyContinue` 清除当前 PowerShell 会话中的设置，然后从该窗口重新启动程序。
+- **确认抢位结果：**先查看 `dumps\booking_attempts.jsonl` 中对应日期和目标的阶段、HTTP 状态与结果，再到 POSS 的 `My Record` 核实最终预约。
+
 ## GitHub Actions + Cloudflare 自动部署
 
 **运行链路：**Cloudflare Worker 每天 **00:15 UTC / 香港 08:15** 调用 GitHub 的 `workflow_dispatch`；GitHub Actions 读取 `main` 上的 `config.json`，登录并等待香港 **08:30** 放位。Worker 只负责启动 Actions，不运行 Python 抢位程序；工作流本身没有 `schedule`。下面的图片来自实际页面（2026-10-23），只展示入口和配置名称，不包含密码或 Token 值。界面文案以后可能变化。
