@@ -3,24 +3,8 @@
   "accounts": {
     "1": {
       "status": "ok",
-      "checked_at": "2026-10-29T08:30:31+08:00",
+      "checked_at": "2026-10-30T08:30:38+08:00",
       "bookings": [
-        {
-          "date": "2026-10-29",
-          "start": "16:30",
-          "end": "17:30",
-          "venue": "Block X - X202 Fitness Room XFIT (X202) - X202 Fitness Room",
-          "center": "Block X - X202 Fitness Room",
-          "facility": "X202 Fitness Room"
-        },
-        {
-          "date": "2026-10-29",
-          "start": "17:30",
-          "end": "18:30",
-          "venue": "Kwong On Jubilee Sports Centre BMT10 - Badminton Court No. 10",
-          "center": "Kwong On Jubilee Sports Centre",
-          "facility": "Badminton Court No. 10"
-        },
         {
           "date": "2026-11-03",
           "start": "17:30",
@@ -49,7 +33,7 @@
     },
     "2": {
       "status": "ok",
-      "checked_at": "2026-10-29T08:31:02+08:00",
+      "checked_at": "2026-10-30T08:30:47+08:00",
       "bookings": [
         {
           "date": "2026-10-31",
