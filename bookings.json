@@ -3,7 +3,7 @@
   "accounts": {
     "1": {
       "status": "ok",
-      "checked_at": "2026-11-01T08:15:29+08:00",
+      "checked_at": "2026-11-02T08:15:24+08:00",
       "bookings": [
         {
           "date": "2026-11-05",
@@ -17,16 +17,8 @@
     },
     "2": {
       "status": "ok",
-      "checked_at": "2026-11-01T08:15:34+08:00",
+      "checked_at": "2026-11-02T08:15:30+08:00",
       "bookings": [
-        {
-          "date": "2026-11-01",
-          "start": "14:30",
-          "end": "15:30",
-          "venue": "Shaw Sports Complex BMT06 - Badminton Court No. 6",
-          "center": "Shaw Sports Complex",
-          "facility": "Badminton Court No. 6"
-        },
         {
           "date": "2026-11-04",
           "start": "15:30",
@@ -34,6 +26,14 @@
           "venue": "Kwong On Jubilee Sports Centre BMT10 - Badminton Court No. 10",
           "center": "Kwong On Jubilee Sports Centre",
           "facility": "Badminton Court No. 10"
+        },
+        {
+          "date": "2026-11-08",
+          "start": "17:30",
+          "end": "18:30",
+          "venue": "Shaw Sports Complex - Sports Practice Hall BMT07 - Badminton Court No. 7",
+          "center": "Shaw Sports Complex - Sports Practice Hall",
+          "facility": "Badminton Court No. 7"
         }
       ]
     }
