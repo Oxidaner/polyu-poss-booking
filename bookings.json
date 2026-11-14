@@ -3,61 +3,28 @@
   "accounts": {
     "1": {
       "status": "ok",
-      "checked_at": "2026-11-13T08:15:23+08:00",
-      "bookings": [
-        {
-          "date": "2026-11-13",
-          "start": "16:30",
-          "end": "17:30",
-          "venue": "Kwong On Jubilee Sports Centre BMT09 - Badminton Court No. 9",
-          "center": "Kwong On Jubilee Sports Centre",
-          "facility": "Badminton Court No. 9"
-        }
-      ]
+      "checked_at": "2026-11-14T08:15:24+08:00",
+      "bookings": []
     },
     "2": {
       "status": "ok",
-      "checked_at": "2026-11-13T08:15:27+08:00",
+      "checked_at": "2026-11-14T08:15:28+08:00",
       "bookings": [
-        {
-          "date": "2026-11-15",
-          "start": "20:30",
-          "end": "21:30",
-          "venue": "Kwong On Jubilee Sports Centre BMT12 - Badminton Court No. 12",
-          "center": "Kwong On Jubilee Sports Centre",
-          "facility": "Badminton Court No. 12"
-        },
-        {
-          "date": "2026-11-16",
-          "start": "11:30",
-          "end": "12:30",
-          "venue": "Shaw Sports Complex - Sports Practice Hall BMT07 - Badminton Court No. 7",
-          "center": "Shaw Sports Complex - Sports Practice Hall",
-          "facility": "Badminton Court No. 7"
-        },
-        {
-          "date": "2026-11-17",
-          "start": "11:30",
-          "end": "12:30",
-          "venue": "Kwong On Jubilee Sports Centre BMT12 - Badminton Court No. 12",
-          "center": "Kwong On Jubilee Sports Centre",
-          "facility": "Badminton Court No. 12"
-        },
         {
           "date": "2026-11-18",
           "start": "14:30",
           "end": "15:30",
-          "venue": "Kwong On Jubilee Sports Centre BMT10 - Badminton Court No. 10",
+          "venue": "Kwong On Jubilee Sports Centre BMT12 - Badminton Court No. 12",
           "center": "Kwong On Jubilee Sports Centre",
-          "facility": "Badminton Court No. 10"
+          "facility": "Badminton Court No. 12"
         },
         {
-          "date": "2026-11-19",
-          "start": "14:30",
-          "end": "15:30",
-          "venue": "Kwong On Jubilee Sports Centre BMT11 - Badminton Court No. 11",
-          "center": "Kwong On Jubilee Sports Centre",
-          "facility": "Badminton Court No. 11"
+          "date": "2026-11-20",
+          "start": "17:30",
+          "end": "18:30",
+          "venue": "Shaw Sports Complex BMT04 - Badminton Court No. 4",
+          "center": "Shaw Sports Complex",
+          "facility": "Badminton Court No. 4"
         }
       ]
     }
