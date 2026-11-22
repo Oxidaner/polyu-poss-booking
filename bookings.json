@@ -3,21 +3,13 @@
   "accounts": {
     "1": {
       "status": "ok",
-      "checked_at": "2026-11-21T08:15:35+08:00",
+      "checked_at": "2026-11-22T08:15:24+08:00",
       "bookings": []
     },
     "2": {
       "status": "ok",
-      "checked_at": "2026-11-21T08:15:42+08:00",
+      "checked_at": "2026-11-22T08:15:30+08:00",
       "bookings": [
-        {
-          "date": "2026-11-21",
-          "start": "16:30",
-          "end": "17:30",
-          "venue": "Kwong On Jubilee Sports Centre BMT12 - Badminton Court No. 12",
-          "center": "Kwong On Jubilee Sports Centre",
-          "facility": "Badminton Court No. 12"
-        },
         {
           "date": "2026-11-22",
           "start": "14:30",
