@@ -3,13 +3,21 @@
   "accounts": {
     "1": {
       "status": "ok",
-      "checked_at": "2026-11-23T08:15:25+08:00",
+      "checked_at": "2026-11-24T08:15:37+08:00",
       "bookings": []
     },
     "2": {
       "status": "ok",
-      "checked_at": "2026-11-23T08:15:29+08:00",
+      "checked_at": "2026-11-24T08:15:40+08:00",
       "bookings": [
+        {
+          "date": "2026-11-25",
+          "start": "09:30",
+          "end": "10:30",
+          "venue": "Shaw Sports Complex SFIT - Fitness Room",
+          "center": "Shaw Sports Complex",
+          "facility": "Fitness Room"
+        },
         {
           "date": "2026-11-25",
           "start": "11:30",
