@@ -3,29 +3,13 @@
   "accounts": {
     "1": {
       "status": "ok",
-      "checked_at": "2026-11-25T08:15:23+08:00",
+      "checked_at": "2026-11-26T08:15:29+08:00",
       "bookings": []
     },
     "2": {
       "status": "ok",
-      "checked_at": "2026-11-25T08:15:26+08:00",
+      "checked_at": "2026-11-26T08:15:32+08:00",
       "bookings": [
-        {
-          "date": "2026-11-25",
-          "start": "09:30",
-          "end": "10:30",
-          "venue": "Shaw Sports Complex SFIT - Fitness Room",
-          "center": "Shaw Sports Complex",
-          "facility": "Fitness Room"
-        },
-        {
-          "date": "2026-11-25",
-          "start": "11:30",
-          "end": "12:30",
-          "venue": "Block X Sports Centre BMT14 - Badminton Court No.14",
-          "center": "Block X Sports Centre",
-          "facility": "Badminton Court No.14"
-        },
         {
           "date": "2026-11-27",
           "start": "14:30",
